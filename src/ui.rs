@@ -80,11 +80,20 @@ fn draw_die(buf: &mut ratatui::buffer::Buffer, inner: Rect, die: &Die) {
     let bx = (inner.x + die.x.round() as u16).clamp(inner.x, max_x);
     let by = (inner.y + die.y.round() as u16).clamp(inner.y, max_y);
 
-    let color = die_color(die.color_idx);
-    let style = if die.settled {
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    // A dropped die (kept == false) is still thrown and animated, but rendered
+    // greyed-and-dimmed so you can watch e.g. advantage discard the lower d20.
+    let style = if !die.kept {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else if die.settled {
+        Style::default()
+            .fg(die_color(die.color_idx))
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(color).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(die_color(die.color_idx))
+            .add_modifier(Modifier::DIM)
     };
 
     let rows = die_shape(die.sides, die.shown);
@@ -184,11 +193,21 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
             chips.push(Span::raw(" "));
         }
         let val = if settled { die.final_value } else { die.shown };
-        let mut style = Style::default().fg(die_color(die.color_idx));
-        if settled {
-            style = style.add_modifier(Modifier::BOLD);
+        if die.kept {
+            let mut style = Style::default().fg(die_color(die.color_idx));
+            if settled {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            chips.push(Span::styled(format!("[{val}]"), style));
+        } else {
+            // Dropped die: greyed and dimmed so it reads as discarded.
+            chips.push(Span::styled(
+                format!("[{val}]"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ));
         }
-        chips.push(Span::styled(format!("[{val}]"), style));
     }
     if app.modifier != 0 {
         let sign = if app.modifier > 0 { "+" } else { "−" };
@@ -230,7 +249,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
         Span::raw(" quit   try: "),
         Span::styled(
-            "3d6 · d6+d8 · d6d10 · d6,d12 · 2d20-1",
+            "3d6 · 2d20kh1 · 4d6dl1 · 3d6! · 4d6*2",
             Style::default().fg(Color::DarkGray),
         ),
     ]);

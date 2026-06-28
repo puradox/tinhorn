@@ -113,10 +113,13 @@ mod tests {
     #[test]
     #[ignore]
     fn snapshot() {
-        let mut app = App::new("d4+d6+d8+d10+d12+d20".to_string());
+        // Override the expression with SNAP=... to eyeball other rolls.
+        let expr = std::env::var("SNAP").unwrap_or_else(|_| "d4+d6+d8+d10+d12+d20".to_string());
+        let mut app = App::new(expr);
         let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
-        for _ in 0..6000 {
+        // Generous budget: an exploding chain settles dice one at a time.
+        for _ in 0..40000 {
             app.update(1.0 / 60.0);
             terminal.draw(|f| ui::render(f, &mut app)).unwrap();
             if app.all_settled() {
@@ -133,6 +136,42 @@ mod tests {
             }
             eprintln!("{line}");
         }
+    }
+
+    #[test]
+    fn advantage_renders_the_dropped_die_dimmed() {
+        use ratatui::style::Color;
+
+        let mut app = App::new("2d20kh1".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        for _ in 0..6000 {
+            app.update(1.0 / 60.0);
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            if app.all_settled() {
+                break;
+            }
+        }
+        assert!(app.all_settled());
+
+        // Both d20s are still on screen (the dropped one isn't hidden)...
+        let dropped = app.dice.iter().filter(|d| !d.kept).count();
+        assert_eq!(dropped, 1, "advantage should drop exactly one die");
+
+        // ...and the dropped die's face value is painted in the dropped-die
+        // colour (DarkGray). The borders are also DarkGray, so key off a die
+        // glyph: the dropped d20's value digits drawn in that colour.
+        let dropped_val = app.dice.iter().find(|d| !d.kept).unwrap().final_value;
+        let first_digit = dropped_val.to_string().chars().next().unwrap().to_string();
+        let buf = terminal.backend().buffer();
+        let has_dimmed_face = buf
+            .content()
+            .iter()
+            .any(|c| c.fg == Color::DarkGray && c.symbol() == first_digit);
+        assert!(
+            has_dimmed_face,
+            "dropped die's face was not rendered in its dimmed colour"
+        );
     }
 
     #[test]

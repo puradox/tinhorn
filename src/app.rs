@@ -3,7 +3,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::parse::{self, Roll};
+use crate::parse::{self, DiceTerm, Roll, TermMod};
 
 /// Width / height of a die "box" in terminal cells: ┌───┐ / │ N │ / └───┘
 pub const DIE_W: f32 = 6.0;
@@ -26,6 +26,7 @@ const TOPPLE_FACTOR: f32 = 1.4; // how strongly an off-centre landing rolls a di
 const TOPPLE_MAX: f32 = 20.0; // cap on a single topple kick so a hard slam can't fling a die away
 const MIN_SLIDE_VX: f32 = 2.5; // sideways speed below this is killed on contact so piles settle
 const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long settles in place no matter what
+const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so the pool can't run away
 
 /// One die in flight.
 pub struct Die {
@@ -38,6 +39,20 @@ pub struct Die {
     pub vy: f32,
     pub settled: bool,
     pub color_idx: usize,
+    /// Which dice term this die belongs to. Dice in the same term share a `mult`
+    /// and are kept/dropped together; the total is summed per term.
+    pub term_idx: usize,
+    /// Per-term multiplier applied to this term's kept sum (1 when no `*N`).
+    pub mult: i32,
+    /// `false` for a die that was thrown and animated but dropped by keep/drop —
+    /// it still bounces and settles, but is rendered dimmed and left out of the total.
+    pub kept: bool,
+    /// The explode condition inherited from this die's term, if it explodes.
+    /// When such a die settles on a matching face it spawns one more die — so
+    /// explosions unfold *during* the animation rather than all up front.
+    explode: Option<parse::Compare>,
+    /// Set once a die has had its chance to explode, so it can't spawn twice.
+    exploded: bool,
     tumble_acc: f32,
     still_for: f32, // seconds spent slow-but-unsettled; triggers the stuck fallback
     age: f32,       // seconds since thrown; a hard cap so nothing tumbles forever
@@ -52,6 +67,10 @@ pub struct App {
     pub arena_h: f32,
     pub spawned: bool,
     needs_spawn: bool,
+    /// Count of dice an exploding term has spawned so far this roll, indexed by
+    /// term. Explosions happen over the course of the animation, so the cap has
+    /// to be enforced across frames rather than in one up-front loop.
+    explosions: Vec<usize>,
     rng: StdRng,
 }
 
@@ -66,6 +85,7 @@ impl App {
             arena_h: 0.0,
             spawned: false,
             needs_spawn: false,
+            explosions: Vec::new(),
             rng: StdRng::from_entropy(),
         };
         if !initial.trim().is_empty() {
@@ -79,36 +99,83 @@ impl App {
     /// Actual spawn positions are assigned later, once the arena size is known.
     pub fn roll(&mut self) {
         match parse::parse(&self.input) {
-            Ok(Roll { dice, modifier }) => {
+            Ok(Roll { terms, modifier }) => {
                 self.error = None;
                 self.modifier = modifier;
-                self.dice = dice
-                    .iter()
-                    .enumerate()
-                    .map(|(i, spec)| {
-                        let final_value = self.rng.gen_range(1..=spec.sides);
-                        Die {
-                            sides: spec.sides,
-                            final_value,
-                            shown: self.rng.gen_range(1..=spec.sides),
-                            x: 0.0,
-                            y: 0.0,
-                            vx: 0.0,
-                            vy: 0.0,
-                            settled: false,
-                            color_idx: i,
-                            tumble_acc: 0.0,
-                            still_for: 0.0,
-                            age: 0.0,
-                        }
-                    })
-                    .collect();
+                self.explosions = vec![0; terms.len()];
+                let mut dice: Vec<Die> = Vec::new();
+                for (ti, term) in terms.iter().enumerate() {
+                    self.roll_term(ti, term, &mut dice);
+                }
+                self.dice = dice;
                 self.spawned = false;
                 self.needs_spawn = true;
             }
             Err(e) => {
                 self.error = Some(e);
             }
+        }
+    }
+
+    /// Roll one dice term's *base* pool and append it to `out`. Keep/drop and
+    /// multiply are applied here; exploding is deferred to the animation — each
+    /// die carries its term's explode condition and spawns a sibling when it
+    /// settles on a matching face (see [`Self::settle_supported`]), so the chain
+    /// unfolds on screen instead of all at once. Every die ever thrown stays in
+    /// the pool; `kept`/`mult` decide what reaches the total. `color_idx`
+    /// continues across terms so each die gets its own palette colour.
+    fn roll_term(&mut self, term_idx: usize, term: &DiceTerm, out: &mut Vec<Die>) {
+        let start = out.len();
+        let base_color = start;
+        let explode = explode_condition(term);
+
+        // Base pool, each tagged with the term's explode condition.
+        for _ in 0..term.count {
+            let color = base_color + (out.len() - start);
+            out.push(self.new_die(term.sides, term_idx, color, explode));
+        }
+
+        // Keep/drop flags discarded dice out of the total. It runs on the base
+        // pool only: dice that explode later always count, which keeps the live
+        // total monotonic as the chain unfolds (a dropped die never un-drops).
+        apply_keep_drop(&mut out[start..], term);
+
+        // Multiply tags every die in the term — including ones spawned later,
+        // which inherit `mult` from this same term via the settle-time spawn.
+        let mult = term_multiplier(term);
+        for die in &mut out[start..] {
+            die.mult = mult;
+        }
+    }
+
+    /// Build one freshly-rolled die (value decided up front; the animation just
+    /// reveals it). `kept`/`mult` default to "counts at face value"; `explode`
+    /// is the term's condition so the die can spawn a sibling when it settles.
+    fn new_die(
+        &mut self,
+        sides: u32,
+        term_idx: usize,
+        color_idx: usize,
+        explode: Option<parse::Compare>,
+    ) -> Die {
+        Die {
+            sides,
+            final_value: self.rng.gen_range(1..=sides),
+            shown: self.rng.gen_range(1..=sides),
+            x: 0.0,
+            y: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            settled: false,
+            color_idx,
+            term_idx,
+            mult: 1,
+            kept: true,
+            explode,
+            exploded: false,
+            tumble_acc: 0.0,
+            still_for: 0.0,
+            age: 0.0,
         }
     }
 
@@ -251,6 +318,11 @@ impl App {
             .map(|d| (d.x, d.y))
             .collect();
 
+        // Explosions discovered this frame: a die that settles on a matching face
+        // spawns one more. Collected here and tossed in after the loop so we don't
+        // grow `self.dice` (and shift `resting`) mid-iteration.
+        let mut to_explode: Vec<(u32, usize, i32, parse::Compare)> = Vec::new();
+
         for i in 0..self.dice.len() {
             if self.dice[i].settled {
                 continue;
@@ -322,7 +394,42 @@ impl App {
             die.vx = 0.0;
             die.vy = 0.0;
             resting.push((rest_x, rest_y));
+
+            // Exploding: a die that comes to rest on a face meeting its condition
+            // spawns one more die — but only once, and only while its term is
+            // under the cap. The new die is built and tossed after the loop.
+            if !die.exploded {
+                die.exploded = true;
+                if let Some(cmp) = die.explode {
+                    let term = die.term_idx;
+                    if cmp.matches(die.final_value) && self.explosions[term] < MAX_EXPLOSIONS {
+                        self.explosions[term] += 1;
+                        to_explode.push((die.sides, term, die.mult, cmp));
+                    }
+                }
+            }
         }
+
+        // Toss any dice the just-settled dice exploded into. They drop from the
+        // top with a random velocity, exactly like the opening throw, and carry
+        // their term's multiplier and explode condition so chains keep going.
+        for (sides, term_idx, mult, cmp) in to_explode {
+            let color = self.dice.len();
+            let mut die = self.new_die(sides, term_idx, color, Some(cmp));
+            die.mult = mult;
+            self.launch(&mut die, maxx, maxy);
+            self.dice.push(die);
+        }
+    }
+
+    /// Toss a single die from a random spot near the top, like the opening
+    /// throw. Used for explosion spawns that appear mid-animation.
+    fn launch(&mut self, die: &mut Die, maxx: f32, maxy: f32) {
+        die.x = self.rng.gen_range(0.0..=maxx.max(0.01));
+        die.y = self.rng.gen_range(0.0..=(maxy * 0.35).max(0.01));
+        die.vx = self.rng.gen_range(-42.0..=42.0);
+        die.vy = self.rng.gen_range(-22.0..=18.0);
+        die.settled = false;
     }
 
     pub fn all_settled(&self) -> bool {
@@ -331,12 +438,87 @@ impl App {
 
     /// Final total (only meaningful once settled, but always well-defined).
     pub fn total(&self) -> i32 {
-        self.dice.iter().map(|d| d.final_value as i32).sum::<i32>() + self.modifier
+        self.summed(|d| d.final_value as i32)
     }
 
     /// Running total of whatever faces are currently showing.
     pub fn live_total(&self) -> i32 {
-        self.dice.iter().map(|d| d.shown as i32).sum::<i32>() + self.modifier
+        self.summed(|d| d.shown as i32)
+    }
+
+    /// Sum each term's kept dice (via `value`), scale by the term's multiplier,
+    /// and add the flat modifier once. Dropped dice (`!kept`) contribute nothing.
+    /// A per-term multiplier means the total can't be a flat sum over all dice —
+    /// a `×2` term's dice must be summed and *then* doubled, so we group by term.
+    fn summed(&self, value: impl Fn(&Die) -> i32) -> i32 {
+        let mut sum = 0i32;
+        let mut i = 0;
+        while i < self.dice.len() {
+            let term = self.dice[i].term_idx;
+            let mult = self.dice[i].mult;
+            let mut term_sum = 0i32;
+            while i < self.dice.len() && self.dice[i].term_idx == term {
+                if self.dice[i].kept {
+                    term_sum += value(&self.dice[i]);
+                }
+                i += 1;
+            }
+            sum += term_sum * mult;
+        }
+        sum + self.modifier
+    }
+}
+
+/// The explode condition for a term, if it has one. A bare `!` (no comparison)
+/// means "explode on the max face", resolved here against the die's sides.
+fn explode_condition(term: &DiceTerm) -> Option<parse::Compare> {
+    term.mods.iter().find_map(|m| match m {
+        TermMod::Explode(Some(c)) => Some(*c),
+        TermMod::Explode(None) => Some(parse::Compare::Eq(term.sides)),
+        _ => None,
+    })
+}
+
+/// The product of all `*N` multipliers on a term (1 if none — the empty product).
+fn term_multiplier(term: &DiceTerm) -> i32 {
+    term.mods
+        .iter()
+        .filter_map(|m| match m {
+            TermMod::Mul(n) => Some(*n),
+            _ => None,
+        })
+        .product()
+}
+
+/// Flag dice out of a term's pool per its keep/drop modifiers. Operates on the
+/// dice's `final_value` (the result is decided up front), so the displayed
+/// running total already reflects the discard the whole way down. Multiple
+/// keep/drop mods compose: each one further narrows what's already kept.
+fn apply_keep_drop(dice: &mut [Die], term: &DiceTerm) {
+    for m in &term.mods {
+        let (keep_high, n) = match *m {
+            TermMod::KeepHigh(n) => (true, n as usize),
+            TermMod::DropLow(n) => (true, dice.len().saturating_sub(n as usize)),
+            TermMod::KeepLow(n) => (false, n as usize),
+            TermMod::DropHigh(n) => (false, dice.len().saturating_sub(n as usize)),
+            _ => continue,
+        };
+        keep_n(dice, n, keep_high);
+    }
+}
+
+/// Keep exactly `n` of the currently-kept dice — the highest `n` if `high`, the
+/// lowest `n` otherwise — flagging the rest out. Ties break by position, which
+/// is fine: equal faces are interchangeable for the total.
+fn keep_n(dice: &mut [Die], n: usize, high: bool) {
+    // Indices of dice still in play, ordered by value (desc to keep-high).
+    let mut live: Vec<usize> = (0..dice.len()).filter(|&i| dice[i].kept).collect();
+    live.sort_by_key(|&i| dice[i].final_value);
+    if high {
+        live.reverse();
+    }
+    for &i in live.iter().skip(n) {
+        dice[i].kept = false;
     }
 }
 
@@ -465,6 +647,204 @@ mod tests {
             }
         }
         None
+    }
+
+    /// A deterministic App for testing roll semantics: same input, same RNG,
+    /// same dice every time. The arena is sized so dice can settle.
+    fn seeded(input: &str, seed: u64) -> App {
+        let mut app = App {
+            input: input.to_string(),
+            dice: Vec::new(),
+            modifier: 0,
+            error: None,
+            arena_w: 60.0,
+            arena_h: 20.0,
+            spawned: false,
+            needs_spawn: false,
+            explosions: Vec::new(),
+            rng: StdRng::seed_from_u64(seed),
+        };
+        app.roll();
+        app
+    }
+
+    #[test]
+    fn advantage_keeps_the_higher_die() {
+        // Try a spread of seeds; for every one, the kept d20 is the larger.
+        for seed in 0..50 {
+            let app = seeded("2d20kh1", seed);
+            assert_eq!(app.dice.len(), 2, "both dice are still thrown");
+            let kept: Vec<&Die> = app.dice.iter().filter(|d| d.kept).collect();
+            assert_eq!(kept.len(), 1, "advantage keeps exactly one");
+            let dropped = app.dice.iter().find(|d| !d.kept).unwrap();
+            assert!(
+                kept[0].final_value >= dropped.final_value,
+                "kept {} < dropped {}",
+                kept[0].final_value,
+                dropped.final_value
+            );
+            // The total is just the kept die.
+            assert_eq!(app.total(), kept[0].final_value as i32);
+        }
+    }
+
+    #[test]
+    fn disadvantage_keeps_the_lower_die() {
+        for seed in 0..50 {
+            let app = seeded("2d20kl1", seed);
+            let kept = app.dice.iter().find(|d| d.kept).unwrap();
+            let dropped = app.dice.iter().find(|d| !d.kept).unwrap();
+            assert!(kept.final_value <= dropped.final_value);
+        }
+    }
+
+    #[test]
+    fn drop_lowest_sums_the_top_three() {
+        for seed in 0..50 {
+            let app = seeded("4d6dl1", seed);
+            assert_eq!(app.dice.len(), 4);
+            let mut vals: Vec<u32> = app.dice.iter().map(|d| d.final_value).collect();
+            vals.sort_unstable();
+            let expected: i32 = vals[1..].iter().map(|&v| v as i32).sum(); // top 3
+            assert_eq!(app.total(), expected);
+            // Exactly the single lowest die is dropped.
+            assert_eq!(app.dice.iter().filter(|d| !d.kept).count(), 1);
+        }
+    }
+
+    #[test]
+    fn exploding_happens_during_the_animation_not_up_front() {
+        // roll() builds only the base pool — no dice are pre-spawned...
+        for seed in 0..30 {
+            let app = seeded("6d6!", seed);
+            assert_eq!(app.dice.len(), 6, "seed {seed}: roll() pre-spawned dice");
+        }
+        // ...and the pool only grows once the simulation runs and a max settles.
+        // Find a seed whose base roll contains a six, then prove it grows.
+        let mut grew = false;
+        for seed in 0..200 {
+            let mut app = seeded("6d6!", seed);
+            let base_max = app.dice.iter().filter(|d| d.final_value == 6).count();
+            settle(&mut app, 20000).expect("exploding pool never settled");
+            if base_max > 0 {
+                assert!(
+                    app.dice.len() > 6,
+                    "seed {seed}: base roll had a six but pool never grew"
+                );
+                grew = true;
+                break;
+            }
+        }
+        assert!(grew, "no seed in range rolled a six to explode");
+    }
+
+    #[test]
+    fn every_settled_max_die_spawned_exactly_one_more() {
+        // The defining invariant of the settle-time mechanic: once everything is
+        // at rest, the number of dice that rolled a matching face equals the base
+        // pool plus the number of explosions (each max spawns exactly one), up to
+        // the per-term cap.
+        for seed in 0..30 {
+            let mut app = seeded("6d6!", seed);
+            settle(&mut app, 20000).expect("never settled");
+            let sixes = app.dice.iter().filter(|d| d.final_value == 6).count();
+            let spawned = app.dice.len() - 6;
+            // Every six spawned a die unless the term hit the cap.
+            assert_eq!(
+                spawned,
+                sixes.min(MAX_EXPLOSIONS),
+                "seed {seed}: {sixes} sixes but {spawned} spawned"
+            );
+            // Once settled, every die has had (and used up) its one explosion chance.
+            assert!(app.dice.iter().all(|d| d.exploded), "a settled die never got its explosion check");
+        }
+    }
+
+    #[test]
+    fn frequent_explosions_hit_the_cap_and_still_converge() {
+        // d3 exploding on >1 fires roughly two times in three, so a chain races
+        // to the per-term cap. It must still terminate and stay in the arena.
+        for seed in 0..20 {
+            let mut app = seeded("4d3!>1", seed);
+            let (maxx, maxy) = app.max_xy();
+            settle(&mut app, 40000).expect("capped explosion chain never settled");
+            assert!(app.dice.len() <= 4 + MAX_EXPLOSIONS, "blew past the cap");
+            for d in &app.dice {
+                assert!(d.x >= -0.01 && d.x <= maxx + 0.01);
+                assert!(d.y >= -0.01 && d.y <= maxy + 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn exploding_stays_capped_and_total_is_the_full_sum() {
+        for seed in 0..30 {
+            let mut app = seeded("6d6!", seed);
+            settle(&mut app, 20000).expect("never settled");
+            assert!(
+                app.dice.len() <= 6 + MAX_EXPLOSIONS,
+                "explosion count is capped"
+            );
+            // `!` keeps everything, so the total is just the sum of every die.
+            let expected: i32 = app.dice.iter().map(|d| d.final_value as i32).sum();
+            assert_eq!(app.total(), expected);
+        }
+    }
+
+    #[test]
+    fn multiply_scales_only_its_term() {
+        for seed in 0..50 {
+            let app = seeded("3d6*2+d8", seed);
+            // Term 0 is the three d6 (×2); term 1 is the lone d8 (×1).
+            let t0: i32 = app
+                .dice
+                .iter()
+                .filter(|d| d.term_idx == 0)
+                .map(|d| d.final_value as i32)
+                .sum();
+            let t1: i32 = app
+                .dice
+                .iter()
+                .filter(|d| d.term_idx == 1)
+                .map(|d| d.final_value as i32)
+                .sum();
+            assert_eq!(app.total(), t0 * 2 + t1);
+        }
+    }
+
+    #[test]
+    fn live_total_excludes_dropped_dice_mid_roll() {
+        // Before settling, the running total already ignores the dropped die.
+        let app = seeded("2d20kh1", 7);
+        let kept = app.dice.iter().find(|d| d.kept).unwrap();
+        // live_total uses `shown`, but dropped dice never contribute regardless.
+        let by_hand: i32 = app
+            .dice
+            .iter()
+            .filter(|d| d.kept)
+            .map(|d| d.shown as i32)
+            .sum();
+        assert_eq!(app.live_total(), by_hand);
+        let _ = kept; // (named for clarity)
+    }
+
+    #[test]
+    fn exploding_pool_still_converges_and_stays_in_arena() {
+        let mut app = seeded("6d6!", 3);
+        let (maxx, maxy) = app.max_xy();
+        let mut settled = false;
+        for _ in 0..12000 {
+            app.update(1.0 / 60.0);
+            for d in &app.dice {
+                assert!(d.x >= -0.001 && d.x <= maxx + 0.001);
+                assert!(d.y >= -0.001 && d.y <= maxy + 0.001);
+            }
+            if app.all_settled() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "exploding pool never settled");
     }
 
     #[test]
