@@ -66,6 +66,9 @@ pub struct App {
     pub arena_w: f32,
     pub arena_h: f32,
     pub spawned: bool,
+    /// When true the help overlay is shown; toggled with `?`. The simulation
+    /// keeps running underneath so the dice are still mid-roll when it closes.
+    pub show_help: bool,
     needs_spawn: bool,
     /// Count of dice an exploding term has spawned so far this roll, indexed by
     /// term. Explosions happen over the course of the animation, so the cap has
@@ -84,6 +87,7 @@ impl App {
             arena_w: 0.0,
             arena_h: 0.0,
             spawned: false,
+            show_help: false,
             needs_spawn: false,
             explosions: Vec::new(),
             rng: StdRng::from_entropy(),
@@ -660,6 +664,7 @@ mod tests {
             arena_w: 60.0,
             arena_h: 20.0,
             spawned: false,
+            show_help: false,
             needs_spawn: false,
             explosions: Vec::new(),
             rng: StdRng::seed_from_u64(seed),

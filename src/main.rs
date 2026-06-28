@@ -46,9 +46,28 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                // Ctrl-C always quits, even from the help overlay.
+                if ctrl && key.code == KeyCode::Char('c') {
+                    break;
+                }
+
+                // While the help overlay is up it captures input: any of
+                // ?/Esc/q closes it, everything else is ignored so the user
+                // can't blindly edit the hidden expression.
+                if app.show_help {
+                    match key.code {
+                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                            app.show_help = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
+                    KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Esc => break,
-                    KeyCode::Char('c') if ctrl => break,
                     KeyCode::Enter => app.roll(),
                     KeyCode::Backspace => {
                         app.input.pop();
@@ -172,6 +191,40 @@ mod tests {
             has_dimmed_face,
             "dropped die's face was not rendered in its dimmed colour"
         );
+    }
+
+    #[test]
+    fn help_overlay_shows_the_notation_when_toggled() {
+        let mut app = App::new("3d6".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(72, 28)).unwrap();
+
+        // Closed by default: the panel title isn't on screen.
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(!flatten(&terminal).contains("dice notation"));
+
+        // Open it (what pressing `?` does) and the syntax table appears.
+        app.show_help = true;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let screen = flatten(&terminal);
+        assert!(screen.contains("dice notation"), "help title missing");
+        assert!(screen.contains("advantage"), "keep/drop section missing");
+        assert!(screen.contains("explode"), "exploding section missing");
+        assert!(screen.contains("to close"), "dismiss hint missing");
+
+        // Close it again.
+        app.show_help = false;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(!flatten(&terminal).contains("dice notation"));
+    }
+
+    #[test]
+    fn help_overlay_fits_a_short_terminal_without_panicking() {
+        // A frame too short to hold the whole panel must still render (trimmed).
+        let mut app = App::new("3d6".to_string());
+        app.show_help = true;
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(flatten(&terminal).contains("notation"), "panel did not render");
     }
 
     #[test]

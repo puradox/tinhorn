@@ -38,8 +38,9 @@ cargo run --release -- "d6+d8" # quote anything with shell-special chars
 | Key            | Action                              |
 | -------------- | ----------------------------------- |
 | `Enter`        | roll / re-roll the current dice     |
+| `?`            | toggle the dice-notation help overlay |
 | type / `Backspace` | edit the dice expression        |
-| `Esc` / `Ctrl-C` | quit                              |
+| `Esc` / `Ctrl-C` | quit (`Esc` closes help first)    |
 
 ## Dice notation
 

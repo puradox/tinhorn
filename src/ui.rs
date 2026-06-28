@@ -1,9 +1,9 @@
 //! All ratatui rendering lives here.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, Die, DIE_H, DIE_W};
@@ -38,6 +38,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_results(frame, app, chunks[1]);
     render_input(frame, app, chunks[2]);
     render_help(frame, chunks[3]);
+
+    // The help overlay floats on top of everything when toggled with `?`.
+    if app.show_help {
+        render_help_overlay(frame, area);
+    }
 }
 
 fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -242,11 +247,14 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
+    let key = |k| Span::styled(k, Style::default().fg(Color::Cyan).bold());
     let help = Line::from(vec![
         Span::styled(" › ", Style::default().fg(Color::Cyan)),
-        Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
+        key("Enter"),
         Span::raw(" roll  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+        key("?"),
+        Span::raw(" help  "),
+        key("Esc"),
         Span::raw(" quit   try: "),
         Span::styled(
             "3d6 · 2d20kh1 · 4d6dl1 · 3d6! · 4d6*2",
@@ -254,6 +262,103 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ),
     ]);
     frame.render_widget(Paragraph::new(help), area);
+}
+
+/// One row of the syntax table in the help overlay: an example on the left and
+/// its meaning on the right.
+fn syntax_row<'a>(example: &'a str, meaning: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{example:<11}"), Style::default().fg(Color::Cyan)),
+        Span::styled(meaning, Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// A centred, bordered panel listing the dice notation, drawn over the rest of
+/// the UI when `?` is pressed. `area` is the full frame.
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let heading = |text| {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))
+    };
+
+    let mut lines = vec![
+        heading("Dice"),
+        syntax_row("3d6", "three six-sided dice"),
+        syntax_row("d20", "one die (count defaults to 1)"),
+        syntax_row("d6+d8", "combine different dice"),
+        syntax_row("2d20-1", "add or subtract a flat modifier"),
+        Line::raw(""),
+        heading("Keep / drop"),
+        syntax_row("2d20kh1", "advantage — keep the highest 1"),
+        syntax_row("2d20kl1", "disadvantage — keep the lowest 1"),
+        syntax_row("4d6dl1", "drop the lowest 1 (ability scores)"),
+        syntax_row("4d6dh1", "drop the highest 1"),
+        Line::raw(""),
+        heading("Exploding"),
+        syntax_row("3d6!", "a max face rolls another die"),
+        syntax_row("d10!>8", "explode on any face over 8"),
+        syntax_row("d6!=6", "explode on exactly 6"),
+        Line::raw(""),
+        heading("Multiply"),
+        syntax_row("4d6*2", "double this term's sum"),
+        syntax_row("4d6!kh3*2", "modifiers stack, left to right"),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Separators: +  -  ,  space  or just write dice next to each other.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  press ? · Esc · q to close",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+
+    // Size the panel to its content, capped to the available frame.
+    let content_h = lines.len() as u16;
+    let inner_w = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0) as u16;
+    let panel_w = (inner_w + 4).min(area.width); // +4 for borders + side padding
+    let panel_h = (content_h + 2).min(area.height); // +2 for top/bottom border
+
+    let rect = centered(panel_w, panel_h, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1))
+        .title(" 🎲  dice notation ".bold());
+
+    // If the frame is too short to show everything, trim from the bottom so the
+    // panel never overflows its border.
+    let max_lines = block.inner(rect).height as usize;
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+    }
+
+    let para = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Left);
+
+    frame.render_widget(Clear, rect); // blank whatever's behind the panel
+    frame.render_widget(para, rect);
+}
+
+/// A `w`×`h` rectangle centred inside `area` (clamped to fit).
+fn centered(w: u16, h: u16, area: Rect) -> Rect {
+    let [row] = Layout::vertical([Constraint::Length(h)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [cell] = Layout::horizontal([Constraint::Length(w)])
+        .flex(Flex::Center)
+        .areas(row);
+    cell
 }
 
 /// The editable dice expression, with a block cursor.
