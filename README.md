@@ -2,23 +2,28 @@
 
 A terminal dice roller. Type dice in common notation and watch them bounce
 around the screen, tumbling through random faces until they settle and the
-total is tallied. Built in Rust with [ratatui](https://ratatui.rs).
+total is tallied. Each die is drawn as the 2D silhouette of its polyhedron.
+Built in Rust with [ratatui](https://ratatui.rs).
 
 ```
 ┌ 🎲  roll — settled ───────────────────────────────────────────────────┐
 │                                                                       │
-│                                                                       │
-│                                        ┌───┐┌───┐       ┌───┐         │
-│                                        │ 8 ││ 5 │       │ 5 │         │
-│                                        └───┘└───┘       └───┘         │
+│        ╱╲       ┌────┐     ╱╲      ╱‾‾╲     ╱╲       ╱‾‾╲              │
+│       ╱  ╲      │    │    ╱  ╲    ╱    ╲   ╱  ╲     │ 18 │             │
+│      ╱ 4  ╲     │ 6  │    ╲2 ╱    ╲ 10 ╱  │ 11 │    │    │             │
+│      ‾‾‾‾‾‾     └────┘     ╲╱       ╲╱    └────┘     ╲__╱              │
 └───────────────────────────────────────────────────────────────────────┘
 ┌ result ───────────────────────────────────────────────────────────────┐
-│[8] [5] [5]                                                            │
-│  Σ total  18                                                          │
+│[4] [6] [2] [10] [11] [18]                                             │
+│  Σ total  51                                                          │
 └───────────────────────────────────────────────────────────────────────┘
-dice ▸ d20+d6+d6█
+dice ▸ d4+d6+d8+d10+d12+d20█
  › Enter roll  Esc quit   try: 3d6 · d6+d8 · d6d10 · d6,d12 · 2d20-1
 ```
+
+Shapes by die: **d4** triangle · **d6** square · **d8** diamond ·
+**d10** kite · **d12** pentagon · **d20** hexagon. Other sizes fall back to a
+plain box.
 
 ## Run
 
@@ -60,15 +65,24 @@ Three small modules behind a 60 fps event loop:
 
 - **`parse`** — a hand-written parser that turns notation into a `Roll`
   (a flat list of individual dice plus an integer modifier). Pure and unit-tested.
-- **`app`** — the state plus a tiny physics simulation. Each die is a box with
-  position/velocity; the engine applies gravity, bounces off the four walls with
-  restitution, rubs off speed with floor friction and air drag, and tumbles its
-  visible face every 50 ms while airborne. When a die is slow and resting on the
-  floor it *snaps to its pre-rolled value* and locks. The roll result is decided
-  up front by the RNG — the animation is just showing it off — so the displayed
-  total always matches the real total.
-- **`ui`** — ratatui rendering: a bordered arena into which die boxes are
-  painted cell-by-cell at their float positions, a result panel with per-die
+- **`app`** — the state plus a tiny physics simulation. Each die is an
+  axis-aligned box with position/velocity; the engine applies gravity, bounces
+  off the four walls with restitution, rubs off speed with floor friction and air
+  drag, and tumbles its visible face every 50 ms while airborne. Dice also
+  collide with **each other** — a per-frame AABB separation pass pushes
+  overlapping pairs apart, so they bounce off one another. A die that lands
+  off-centre on another converts part of the impact into sideways motion and
+  *rolls off the edge*, so dice spread out instead of balancing in neat columns;
+  when the arena is too narrow to spread they pile into stacks instead.
+  A die comes to rest when it's slow and *supported* (by the floor or by a
+  settled die beneath it), snapping flush onto its support and locking to its
+  pre-rolled value; a die wedged in an over-tall stack that the arena can't hold
+  settles in place after a short timeout so the simulation always converges. The
+  result is decided up front by the RNG — the animation just shows it off — so
+  the displayed total always matches the real total.
+- **`ui`** — ratatui rendering: a bordered arena into which each die is painted
+  cell-by-cell at its float position as the 2D silhouette of its polyhedron
+  (`die_shape` maps sides → a 6×4 ASCII template), a result panel with per-die
   colour-coded chips and the running/final sum, an editable input line, and a
   help bar.
 
@@ -85,5 +99,6 @@ cargo test snapshot -- --ignored --nocapture  # print a rendered frame
 
 The suite covers notation parsing, that dice always converge to rest (with a
 hard frame cap so a non-converging bug fails instead of hanging), that they
-never escape the arena, and that the UI renders a full roll without panicking
-(via ratatui's `TestBackend`).
+never escape the arena, that a crowded pool settles without any two dice
+overlapping, and that the UI renders a full roll without panicking (via
+ratatui's `TestBackend`).

@@ -104,8 +104,8 @@ mod tests {
         let screen = flatten(&terminal);
         assert!(screen.contains("roll"), "missing title");
         assert!(screen.contains("total"), "missing total label");
-        // The settled die boxes should be on screen.
-        assert!(screen.contains("┌───┐"), "no die boxes rendered");
+        // The settled d6 squares should be on screen.
+        assert!(screen.contains("┌────┐"), "no die boxes rendered");
     }
 
     /// Not a real assertion — prints a rendered frame so you can eyeball the
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     #[ignore]
     fn snapshot() {
-        let mut app = App::new("d20+d6+d6".to_string());
+        let mut app = App::new("d4+d6+d8+d10+d12+d20".to_string());
         let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         for _ in 0..6000 {

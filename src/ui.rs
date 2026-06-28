@@ -70,7 +70,9 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Paint a single die box into the buffer at its current position.
+/// Paint a single die into the buffer at its current position, drawn as the
+/// 2D silhouette of the matching polyhedron (triangle for d4, square for d6,
+/// diamond for d8, kite for d10, pentagon for d12, hexagon for d20).
 fn draw_die(buf: &mut ratatui::buffer::Buffer, inner: Rect, die: &Die) {
     let max_x = inner.right().saturating_sub(DIE_W as u16);
     let max_y = inner.bottom().saturating_sub(DIE_H as u16);
@@ -85,14 +87,65 @@ fn draw_die(buf: &mut ratatui::buffer::Buffer, inner: Rect, die: &Die) {
         Style::default().fg(color).add_modifier(Modifier::DIM)
     };
 
-    let face = format!("{:^3}", die.shown);
-    let top = "┌───┐";
-    let mid = format!("│{face}│");
-    let bot = "└───┘";
+    let rows = die_shape(die.sides, die.shown);
+    for (i, row) in rows.iter().enumerate() {
+        buf.set_string(bx, by + i as u16, row, style);
+    }
+}
 
-    buf.set_string(bx, by, top, style);
-    buf.set_string(bx, by + 1, &mid, style);
-    buf.set_string(bx, by + 2, bot, style);
+/// The four-row, six-cell-wide ASCII silhouette for a die of `sides`, with its
+/// face value laid into the body. Non-standard dice fall back to a plain box.
+fn die_shape(sides: u32, value: u32) -> [String; 4] {
+    // Standard polyhedral faces top out at 20, so a 2-wide slot is enough; the
+    // fallback box is given a 4-wide slot for the occasional d100 etc.
+    let v = format!("{value:^2}");
+    match sides {
+        4 => [
+            "  ╱╲  ".into(),
+            " ╱  ╲ ".into(),
+            format!("╱ {v} ╲"),
+            "‾‾‾‾‾‾".into(),
+        ],
+        6 => [
+            "┌────┐".into(),
+            "│    │".into(),
+            format!("│ {v} │"),
+            "└────┘".into(),
+        ],
+        8 => [
+            "  ╱╲  ".into(),
+            " ╱  ╲ ".into(),
+            format!(" ╲{v}╱ "),
+            "  ╲╱  ".into(),
+        ],
+        10 => [
+            " ╱‾‾╲ ".into(),
+            "╱    ╲".into(),
+            format!("╲ {v} ╱"),
+            "  ╲╱  ".into(),
+        ],
+        12 => [
+            "  ╱╲  ".into(),
+            " ╱  ╲ ".into(),
+            format!("│ {v} │"),
+            "└────┘".into(),
+        ],
+        20 => [
+            " ╱‾‾╲ ".into(),
+            format!("│ {v} │"),
+            "│    │".into(),
+            " ╲__╱ ".into(),
+        ],
+        _ => {
+            let v = format!("{value:^4}");
+            [
+                "┌────┐".into(),
+                "│    │".into(),
+                format!("│{v}│"),
+                "└────┘".into(),
+            ]
+        }
+    }
 }
 
 fn render_results(frame: &mut Frame, app: &App, area: Rect) {
