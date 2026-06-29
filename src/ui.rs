@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Die, DIE_H, DIE_W};
+use crate::app::{App, Die, Pane, Stats, DIE_H, DIE_W};
 
 /// Per-die colour palette; dice cycle through it by index.
 const PALETTE: [Color; 8] = [
@@ -39,9 +39,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_input(frame, app, chunks[2]);
     render_help(frame, chunks[3]);
 
-    // The help overlay floats on top of everything when toggled with `?`.
-    if app.show_help {
-        render_help_overlay(frame, area);
+    // A pop-out pane floats on top of everything when one is toggled open.
+    match app.pane {
+        Pane::None => {}
+        Pane::Help => render_help_overlay(frame, area),
+        Pane::History => render_history_overlay(frame, app, area),
+        Pane::Stats => render_stats_overlay(frame, app, area),
     }
 }
 
@@ -254,12 +257,12 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Span::raw(" roll  "),
         key("?"),
         Span::raw(" help  "),
+        key("h"),
+        Span::raw(" history  "),
+        key("s"),
+        Span::raw(" stats  "),
         key("Esc"),
-        Span::raw(" quit   try: "),
-        Span::styled(
-            "3d6 · 2d20kh1 · 4d6dl1 · 3d6! · 4d6*2",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::raw(" quit"),
     ]);
     frame.render_widget(Paragraph::new(help), area);
 }
@@ -274,17 +277,53 @@ fn syntax_row<'a>(example: &'a str, meaning: &'a str) -> Line<'a> {
     ])
 }
 
-/// A centred, bordered panel listing the dice notation, drawn over the rest of
-/// the UI when `?` is pressed. `area` is the full frame.
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
-    let heading = |text| {
-        Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ))
-    };
+/// A bold yellow section heading line for the overlays.
+fn heading(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        text.into(),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    ))
+}
 
-    let mut lines = vec![
+/// The italic dim "press … to close" footer shared by every pane.
+fn close_hint() -> Line<'static> {
+    Line::from(Span::styled(
+        "  Esc · q to close",
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// Draw a centred, bordered panel of `lines` titled `title` over the UI. Sizes
+/// itself to its content (capped to the frame), blanks what's behind it, and
+/// trims overflow from the bottom so it never spills past its border. Shared by
+/// all three pop-out panes.
+fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line>) {
+    let content_h = lines.len() as u16;
+    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let panel_w = (inner_w + 4).min(area.width); // +4 for borders + side padding
+    let panel_h = (content_h + 2).min(area.height); // +2 for top/bottom border
+
+    let rect = centered(panel_w, panel_h, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(1))
+        .title(title.to_string().bold());
+
+    let max_lines = block.inner(rect).height as usize;
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+    }
+
+    let para = Paragraph::new(lines).block(block).alignment(Alignment::Left);
+    frame.render_widget(Clear, rect); // blank whatever's behind the panel
+    frame.render_widget(para, rect);
+}
+
+/// The dice-notation reference, drawn over the UI when `?` is pressed.
+fn render_help_overlay(frame: &mut Frame, area: Rect) {
+    let lines = vec![
         heading("Dice"),
         syntax_row("3d6", "three six-sided dice"),
         syntax_row("d20", "one die (count defaults to 1)"),
@@ -311,43 +350,133 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::raw(""),
-        Line::from(Span::styled(
-            "  press ? · Esc · q to close",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )),
+        close_hint(),
     ];
+    overlay_panel(frame, area, " 🎲  dice notation ", lines);
+}
 
-    // Size the panel to its content, capped to the available frame.
-    let content_h = lines.len() as u16;
-    let inner_w = lines
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(0) as u16;
-    let panel_w = (inner_w + 4).min(area.width); // +4 for borders + side padding
-    let panel_h = (content_h + 2).min(area.height); // +2 for top/bottom border
+/// The roll-history pane: recent rolls, newest first.
+fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
 
-    let rect = centered(panel_w, panel_h, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .padding(Padding::horizontal(1))
-        .title(" 🎲  dice notation ".bold());
-
-    // If the frame is too short to show everything, trim from the bottom so the
-    // panel never overflows its border.
-    let max_lines = block.inner(rect).height as usize;
-    if lines.len() > max_lines {
-        lines.truncate(max_lines);
+    if app.history.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no rolls yet — press Enter to roll some dice",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Newest first; show at most what the frame can hold.
+        let shown = (area.height as usize).saturating_sub(4).max(1);
+        let skipped = app.history.len().saturating_sub(shown);
+        for (n, e) in app.history.iter().rev().take(shown).enumerate() {
+            let idx = app.history.len() - n; // 1-based, counting from the newest
+            let faces = e
+                .values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {idx:>3}. "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<12}", e.expr), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("[{faces}]  "), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("= {}", e.total),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        if skipped > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … and {skipped} older"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
-    let para = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left);
+    lines.push(Line::raw(""));
+    lines.push(close_hint());
+    overlay_panel(frame, area, " 🎲  history ", lines);
+}
 
-    frame.render_widget(Clear, rect); // blank whatever's behind the panel
-    frame.render_widget(para, rect);
+/// The statistics pane: theoretical odds for the current expression plus a
+/// summary of the rolls actually made this session.
+fn render_stats_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = match app.stats() {
+        Ok(s) => stats_lines(&s),
+        Err(e) => vec![
+            Line::from(Span::styled(
+                "  can't compute stats — the expression doesn't parse:",
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(Span::styled(
+                format!("  {e}"),
+                Style::default().fg(Color::Red),
+            )),
+            Line::raw(""),
+            close_hint(),
+        ],
+    };
+    overlay_panel(frame, area, " 🎲  statistics ", lines);
+}
+
+/// Lay out the statistics into display lines: a header, the theoretical
+/// min/max/mean, a small distribution curve, and the session summary.
+fn stats_lines(s: &Stats) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        heading(format!("Odds for  {}", s.expr)),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("min {}   max {}   avg {:.1}", s.min, s.max, s.mean),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!("  (estimated from {} samples)", s.samples),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+    ];
+
+    // A little horizontal distribution: one bar per bucket, scaled to the peak.
+    if !s.dist.is_empty() {
+        let peak = s.dist.iter().map(|b| b.fraction).fold(0.0_f64, f64::max).max(1e-9);
+        for b in &s.dist {
+            let filled = (b.fraction / peak * 18.0).round() as usize;
+            let bar: String = "█".repeat(filled);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:>4} ", b.total), Style::default().fg(Color::DarkGray)),
+                Span::styled(bar, Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {:>4.1}%", b.fraction * 100.0),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // Session summary for this exact expression.
+    lines.push(heading("This session"));
+    if s.session.count == 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  no rolls of {} yet ({} rolls total)", s.expr, s.total_rolls),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} rolls   low {}   high {}   mean {:.1}",
+                s.session.count, s.session.min, s.session.max, s.session.mean
+            ),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(close_hint());
+    lines
 }
 
 /// A `w`×`h` rectangle centred inside `area` (clamped to fit).

@@ -39,8 +39,22 @@ cargo run --release -- "d6+d8" # quote anything with shell-special chars
 | -------------- | ----------------------------------- |
 | `Enter`        | roll / re-roll the current dice     |
 | `?`            | toggle the dice-notation help overlay |
+| `h`            | toggle the roll-history pane        |
+| `s`            | toggle the statistics pane          |
 | type / `Backspace` | edit the dice expression        |
-| `Esc` / `Ctrl-C` | quit (`Esc` closes help first)    |
+| `Esc` / `Ctrl-C` | quit (`Esc` closes an open pane first) |
+
+The three pop-out panes (`?` / `h` / `s`) float over the running animation —
+the dice keep bouncing underneath — and are mutually exclusive; opening one
+closes the others. `Esc` or `q` dismisses whichever is open.
+
+**History** (`h`) lists recent rolls, newest first, with the kept faces and the
+total (in-memory only — it's cleared on quit). **Statistics** (`s`) shows the
+theoretical odds for the expression currently in the input box — min, max,
+average, and a small distribution curve, estimated by sampling the roll many
+times so every modifier (keep/drop, exploding, multiply) is accounted for —
+alongside a summary of the rolls of that expression you've actually made this
+session.
 
 ## Dice notation
 

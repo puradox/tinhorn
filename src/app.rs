@@ -27,6 +27,8 @@ const TOPPLE_MAX: f32 = 20.0; // cap on a single topple kick so a hard slam can'
 const MIN_SLIDE_VX: f32 = 2.5; // sideways speed below this is killed on contact so piles settle
 const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long settles in place no matter what
 const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so the pool can't run away
+const MAX_HISTORY: usize = 200; // most recent rolls kept in memory for the history pane
+const STAT_SAMPLES: usize = 20_000; // Monte-Carlo trials for the statistics pane's odds
 
 /// One die in flight.
 pub struct Die {
@@ -58,17 +60,43 @@ pub struct Die {
     age: f32,       // seconds since thrown; a hard cap so nothing tumbles forever
 }
 
+/// Which pop-out pane, if any, is currently overlaid on the UI. They're mutually
+/// exclusive — opening one closes the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    None,
+    Help,
+    History,
+    Stats,
+}
+
+/// One completed roll, recorded for the history pane when the dice settle.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    /// The expression as typed, e.g. "4d6dl1".
+    pub expr: String,
+    /// Each kept die's face value, in pool order (dropped dice excluded).
+    pub values: Vec<u32>,
+    /// The final total, modifiers and all.
+    pub total: i32,
+}
+
 pub struct App {
     pub input: String,
     pub dice: Vec<Die>,
     pub modifier: i32,
     pub error: Option<String>,
+    /// Completed rolls, newest last. Capped so a long session can't grow without
+    /// bound; the history pane shows the most recent slice.
+    pub history: Vec<HistoryEntry>,
+    /// Which pop-out pane is showing (help / history / stats / none).
+    pub pane: Pane,
+    /// Set the first frame after every die settles, so the roll is recorded into
+    /// `history` exactly once rather than every frame thereafter.
+    recorded: bool,
     pub arena_w: f32,
     pub arena_h: f32,
     pub spawned: bool,
-    /// When true the help overlay is shown; toggled with `?`. The simulation
-    /// keeps running underneath so the dice are still mid-roll when it closes.
-    pub show_help: bool,
     needs_spawn: bool,
     /// Count of dice an exploding term has spawned so far this roll, indexed by
     /// term. Explosions happen over the course of the animation, so the cap has
@@ -84,10 +112,12 @@ impl App {
             dice: Vec::new(),
             modifier: 0,
             error: None,
+            history: Vec::new(),
+            pane: Pane::None,
+            recorded: false,
             arena_w: 0.0,
             arena_h: 0.0,
             spawned: false,
-            show_help: false,
             needs_spawn: false,
             explosions: Vec::new(),
             rng: StdRng::from_entropy(),
@@ -114,6 +144,7 @@ impl App {
                 self.dice = dice;
                 self.spawned = false;
                 self.needs_spawn = true;
+                self.recorded = false;
             }
             Err(e) => {
                 self.error = Some(e);
@@ -280,6 +311,31 @@ impl App {
         // matters: settling reads the post-separation resting positions.
         self.resolve_collisions(maxx, maxy);
         self.settle_supported(dt, maxx, maxy);
+
+        // The frame the roll finishes, record it once for the history pane.
+        if !self.recorded && self.all_settled() {
+            self.record_roll();
+            self.recorded = true;
+        }
+    }
+
+    /// Append the just-settled roll to the history (newest last), capped.
+    fn record_roll(&mut self) {
+        let values: Vec<u32> = self
+            .dice
+            .iter()
+            .filter(|d| d.kept)
+            .map(|d| d.final_value)
+            .collect();
+        self.history.push(HistoryEntry {
+            expr: self.input.trim().to_string(),
+            values,
+            total: self.total(),
+        });
+        if self.history.len() > MAX_HISTORY {
+            let overflow = self.history.len() - MAX_HISTORY;
+            self.history.drain(0..overflow);
+        }
     }
 
     /// Push apart any overlapping pairs of dice (axis-aligned boxes). Settled
@@ -470,6 +526,192 @@ impl App {
             sum += term_sum * mult;
         }
         sum + self.modifier
+    }
+
+    /// Compute the statistics pane's contents for the current input: the
+    /// theoretical distribution (by Monte-Carlo sampling, so every modifier is
+    /// handled) plus a summary of the session's history. Returns `None` (with the
+    /// parse error) if the expression doesn't parse.
+    pub fn stats(&self) -> Result<Stats, String> {
+        let roll = parse::parse(self.input.trim())?;
+
+        // Sample the expression many times to estimate its distribution.
+        let mut sample_rng = StdRng::seed_from_u64(self.history.len() as u64 ^ 0x5715_d1ce);
+        let mut totals = Vec::with_capacity(STAT_SAMPLES);
+        let mut sum = 0i64;
+        let (mut lo, mut hi) = (i32::MAX, i32::MIN);
+        for _ in 0..STAT_SAMPLES {
+            let t = sample_total(&roll, &mut sample_rng);
+            totals.push(t);
+            sum += t as i64;
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        let mean = sum as f64 / STAT_SAMPLES as f64;
+
+        // A coarse histogram over the observed range for the little curve.
+        let dist = histogram(&totals, lo, hi);
+
+        // Session history for the current expression (and overall).
+        let expr = self.input.trim().to_string();
+        let here: Vec<&HistoryEntry> = self.history.iter().filter(|e| e.expr == expr).collect();
+        let session = SessionStats::from(&here);
+
+        Ok(Stats {
+            expr,
+            samples: STAT_SAMPLES,
+            min: lo,
+            max: hi,
+            mean,
+            dist,
+            session,
+            total_rolls: self.history.len(),
+        })
+    }
+}
+
+/// One bucket of the sampled distribution: a total value and how often it came up.
+#[derive(Debug, Clone, Copy)]
+pub struct Bucket {
+    pub total: i32,
+    pub fraction: f64, // 0.0..=1.0
+}
+
+/// Theoretical odds for an expression plus a summary of the session so far.
+#[derive(Debug, Clone)]
+pub struct Stats {
+    pub expr: String,
+    pub samples: usize,
+    pub min: i32,
+    pub max: i32,
+    pub mean: f64,
+    /// Up to a handful of buckets spanning min..=max, for a sparkline-ish curve.
+    pub dist: Vec<Bucket>,
+    /// Stats over the rolls of *this* expression actually made this session.
+    pub session: SessionStats,
+    /// How many rolls are in the whole session history.
+    pub total_rolls: usize,
+}
+
+/// Aggregates of the actual rolls made this session for one expression.
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    pub count: usize,
+    pub min: i32,
+    pub max: i32,
+    pub mean: f64,
+}
+
+impl SessionStats {
+    fn from(entries: &[&HistoryEntry]) -> Self {
+        if entries.is_empty() {
+            return SessionStats::default();
+        }
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        let mut sum = 0i64;
+        for e in entries {
+            lo = lo.min(e.total);
+            hi = hi.max(e.total);
+            sum += e.total as i64;
+        }
+        SessionStats {
+            count: entries.len(),
+            min: lo,
+            max: hi,
+            mean: sum as f64 / entries.len() as f64,
+        }
+    }
+}
+
+/// Bucket `totals` into at most `MAX_BUCKETS` evenly-spaced bins spanning
+/// `lo..=hi`, returning each bin's representative value and its share of the
+/// samples. A single-value distribution collapses to one full bucket.
+fn histogram(totals: &[i32], lo: i32, hi: i32) -> Vec<Bucket> {
+    const MAX_BUCKETS: usize = 11;
+    if totals.is_empty() {
+        return Vec::new();
+    }
+    let span = (hi - lo).max(0) as usize + 1;
+    let bins = span.min(MAX_BUCKETS);
+    let width = (span as f64 / bins as f64).max(1.0);
+
+    let mut counts = vec![0usize; bins];
+    for &t in totals {
+        let b = (((t - lo) as f64) / width) as usize;
+        counts[b.min(bins - 1)] += 1;
+    }
+    let n = totals.len() as f64;
+    counts
+        .iter()
+        .enumerate()
+        .map(|(b, &c)| Bucket {
+            // Label each bucket with the rounded centre of the range it covers,
+            // so a coarsened curve still reads as "roughly this total".
+            total: lo + (b as f64 * width + width / 2.0).floor() as i32,
+            fraction: c as f64 / n,
+        })
+        .collect()
+}
+
+/// Evaluate a parsed roll once, instantly, returning its total. This is the
+/// non-animated twin of [`App::roll`] + the settle-time explosion: same rules
+/// (explode → keep/drop on the base pool → per-term multiply → flat modifier),
+/// just resolved in a tight loop. Used to Monte-Carlo a roll's distribution for
+/// the statistics pane, where running the physics thousands of times is absurd.
+fn sample_total(roll: &Roll, rng: &mut StdRng) -> i32 {
+    let mut total = roll.modifier;
+    for term in &roll.terms {
+        let explode = explode_condition(term);
+        let mult = term_multiplier(term);
+
+        // Base pool: (value, kept). Explosions append more dice, always kept.
+        let mut pool: Vec<(u32, bool)> = (0..term.count)
+            .map(|_| (rng.gen_range(1..=term.sides), true))
+            .collect();
+
+        if let Some(cmp) = explode {
+            let mut spawned = 0usize;
+            let mut i = 0;
+            while i < pool.len() {
+                if cmp.matches(pool[i].0) && spawned < MAX_EXPLOSIONS {
+                    pool.push((rng.gen_range(1..=term.sides), true));
+                    spawned += 1;
+                }
+                i += 1;
+            }
+        }
+
+        // Keep/drop applies to the base pool only (exploded dice always count),
+        // matching the animation. Flag the discarded base dice out.
+        let base = term.count as usize;
+        for m in &term.mods {
+            let (high, n) = match *m {
+                TermMod::KeepHigh(n) => (true, n as usize),
+                TermMod::DropLow(n) => (true, base.saturating_sub(n as usize)),
+                TermMod::KeepLow(n) => (false, n as usize),
+                TermMod::DropHigh(n) => (false, base.saturating_sub(n as usize)),
+                _ => continue,
+            };
+            keep_n_values(&mut pool[..base], n, high);
+        }
+
+        let term_sum: i32 = pool.iter().filter(|&&(_, k)| k).map(|&(v, _)| v as i32).sum();
+        total += term_sum * mult;
+    }
+    total
+}
+
+/// Keep the `n` highest- (or lowest-) valued kept entries in `pool`, flagging
+/// the rest out. The value-slice twin of [`keep_n`].
+fn keep_n_values(pool: &mut [(u32, bool)], n: usize, high: bool) {
+    let mut live: Vec<usize> = (0..pool.len()).filter(|&i| pool[i].1).collect();
+    live.sort_by_key(|&i| pool[i].0);
+    if high {
+        live.reverse();
+    }
+    for &i in live.iter().skip(n) {
+        pool[i].1 = false;
     }
 }
 
@@ -664,9 +906,11 @@ mod tests {
             arena_w: 60.0,
             arena_h: 20.0,
             spawned: false,
-            show_help: false,
             needs_spawn: false,
             explosions: Vec::new(),
+            history: Vec::new(),
+            pane: Pane::None,
+            recorded: false,
             rng: StdRng::seed_from_u64(seed),
         };
         app.roll();
@@ -973,6 +1217,106 @@ mod tests {
         app.arena_w = 3.0; // smaller than a die box
         app.arena_h = 2.0;
         assert!(settle(&mut app, 100).is_some());
+    }
+
+    #[test]
+    fn a_completed_roll_is_recorded_in_history_exactly_once() {
+        let mut app = seeded("3d6+1", 5);
+        assert!(app.history.is_empty(), "nothing recorded before it settles");
+        settle(&mut app, 6000).expect("never settled");
+
+        // Keep stepping after settling — the entry must not be duplicated.
+        for _ in 0..200 {
+            app.update(1.0 / 60.0);
+        }
+        assert_eq!(app.history.len(), 1, "recorded once and only once");
+
+        let e = &app.history[0];
+        assert_eq!(e.expr, "3d6+1");
+        assert_eq!(e.values.len(), 3); // three kept dice
+        // total = sum of faces + 1, and matches what the entry stored.
+        let face_sum: i32 = e.values.iter().map(|&v| v as i32).sum();
+        assert_eq!(e.total, face_sum + 1);
+        assert_eq!(e.total, app.total());
+    }
+
+    #[test]
+    fn history_records_only_kept_dice() {
+        // Advantage: two thrown, one kept — history stores the single kept value.
+        let mut app = seeded("2d20kh1", 9);
+        settle(&mut app, 6000).expect("never settled");
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].values.len(), 1, "only the kept die is stored");
+        assert_eq!(app.history[0].total, app.history[0].values[0] as i32);
+    }
+
+    #[test]
+    fn history_is_capped() {
+        let mut app = seeded("d6", 1);
+        // Forge more than the cap of entries, then roll one more for real.
+        for n in 0..(MAX_HISTORY + 50) {
+            app.history.push(HistoryEntry {
+                expr: "d6".into(),
+                values: vec![1],
+                total: n as i32,
+            });
+        }
+        app.input = "d6".into();
+        app.roll();
+        settle(&mut app, 6000).expect("never settled");
+        assert!(app.history.len() <= MAX_HISTORY, "history exceeded its cap");
+    }
+
+    #[test]
+    fn sampled_stats_match_known_dice_ranges() {
+        // 3d6: exactly 3..=18, average 10.5. Sampling should pin the bounds and
+        // land close on the mean.
+        let app = seeded("3d6", 1);
+        let s = app.stats().expect("3d6 parses");
+        assert_eq!(s.min, 3);
+        assert_eq!(s.max, 18);
+        assert!((s.mean - 10.5).abs() < 0.3, "mean {} far from 10.5", s.mean);
+        // The distribution fractions sum to ~1.
+        let total: f64 = s.dist.iter().map(|b| b.fraction).sum();
+        assert!((total - 1.0).abs() < 1e-6, "fractions sum to {total}");
+    }
+
+    #[test]
+    fn sampled_stats_reflect_modifiers() {
+        // Advantage shifts the average of a single d20 up from 10.5 toward ~13.8.
+        let adv = App::new("2d20kh1".to_string()).stats().unwrap();
+        assert_eq!(adv.min, 1);
+        assert_eq!(adv.max, 20);
+        assert!(adv.mean > 12.0, "advantage mean {} should beat a flat d20", adv.mean);
+
+        // A flat *2 multiplier doubles the achievable range.
+        let doubled = App::new("1d6*2".to_string()).stats().unwrap();
+        assert_eq!(doubled.min, 2);
+        assert_eq!(doubled.max, 12);
+    }
+
+    #[test]
+    fn session_stats_summarize_matching_rolls() {
+        let mut app = seeded("3d6", 2);
+        settle(&mut app, 6000).expect("settle 1");
+        // Roll the same expression a second time.
+        app.input = "3d6".into();
+        app.roll();
+        settle(&mut app, 6000).expect("settle 2");
+
+        let s = app.stats().unwrap();
+        assert_eq!(s.session.count, 2, "both 3d6 rolls counted");
+        assert_eq!(s.total_rolls, 2);
+        assert!(s.session.min <= s.session.max);
+        // Mean of the session sits within the achievable 3..=18 range.
+        assert!(s.session.mean >= 3.0 && s.session.mean <= 18.0);
+    }
+
+    #[test]
+    fn stats_error_surfaces_for_bad_input() {
+        let mut app = App::new(String::new());
+        app.input = "garbage".into();
+        assert!(app.stats().is_err());
     }
 }
 

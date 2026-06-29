@@ -19,9 +19,19 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use app::App;
+use app::{App, Pane};
 
 const FRAME: Duration = Duration::from_millis(16); // ~60 fps
+
+/// Pressing a pane's own key while it's open closes it; pressing it while a
+/// *different* pane is open switches to it.
+fn toggle(current: Pane, target: Pane) -> Pane {
+    if current == target {
+        Pane::None
+    } else {
+        target
+    }
+}
 
 fn main() -> io::Result<()> {
     let initial = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
@@ -47,26 +57,30 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                // Ctrl-C always quits, even from the help overlay.
+                // Ctrl-C always quits, even from an overlay.
                 if ctrl && key.code == KeyCode::Char('c') {
                     break;
                 }
 
-                // While the help overlay is up it captures input: any of
-                // ?/Esc/q closes it, everything else is ignored so the user
-                // can't blindly edit the hidden expression.
-                if app.show_help {
+                // While a pop-out pane is up it captures input: its own key or
+                // Esc/q closes it, everything else is ignored so the user can't
+                // blindly edit the hidden expression. Each pane toggles closed
+                // on its own key, so `?`/`h`/`s` flip between panes too.
+                if app.pane != Pane::None {
                     match key.code {
-                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
-                            app.show_help = false;
-                        }
+                        KeyCode::Esc | KeyCode::Char('q') => app.pane = Pane::None,
+                        KeyCode::Char('?') => app.pane = toggle(app.pane, Pane::Help),
+                        KeyCode::Char('h') => app.pane = toggle(app.pane, Pane::History),
+                        KeyCode::Char('s') => app.pane = toggle(app.pane, Pane::Stats),
                         _ => {}
                     }
                     continue;
                 }
 
                 match key.code {
-                    KeyCode::Char('?') => app.show_help = true,
+                    KeyCode::Char('?') => app.pane = Pane::Help,
+                    KeyCode::Char('h') => app.pane = Pane::History,
+                    KeyCode::Char('s') => app.pane = Pane::Stats,
                     KeyCode::Esc => break,
                     KeyCode::Enter => app.roll(),
                     KeyCode::Backspace => {
@@ -157,6 +171,72 @@ mod tests {
         }
     }
 
+    /// Roll an expression to completion so it lands in history.
+    fn roll_to_settle(app: &mut App, expr: &str, terminal: &mut Terminal<TestBackend>) {
+        app.input = expr.to_string();
+        app.roll();
+        terminal.draw(|f| ui::render(f, app)).unwrap();
+        for _ in 0..6000 {
+            app.update(1.0 / 60.0);
+            if app.all_settled() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn history_pane_lists_recent_rolls() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 28)).unwrap();
+
+        // Empty history shows a hint, not a crash.
+        app.pane = app::Pane::History;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(flatten(&terminal).contains("no rolls yet"));
+
+        // After a couple of rolls the pane lists them with their totals.
+        app.pane = app::Pane::None;
+        roll_to_settle(&mut app, "3d6", &mut terminal);
+        roll_to_settle(&mut app, "d20", &mut terminal);
+        app.pane = app::Pane::History;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let screen = flatten(&terminal);
+        assert!(screen.contains("history"), "history title missing");
+        assert!(screen.contains("3d6"), "first roll not listed");
+        assert!(screen.contains("d20"), "second roll not listed");
+    }
+
+    #[test]
+    fn stats_pane_shows_odds_and_session_summary() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 28)).unwrap();
+        roll_to_settle(&mut app, "3d6", &mut terminal);
+
+        app.pane = app::Pane::Stats;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let screen = flatten(&terminal);
+        assert!(screen.contains("statistics"), "stats title missing");
+        assert!(screen.contains("Odds for"), "odds header missing");
+        assert!(screen.contains("min 3"), "min not shown for 3d6");
+        assert!(screen.contains("max 18"), "max not shown for 3d6");
+        assert!(screen.contains("This session"), "session summary missing");
+    }
+
+    #[test]
+    fn panes_are_mutually_exclusive() {
+        // Only one pane title is ever on screen at a time.
+        let mut app = App::new("3d6".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(72, 28)).unwrap();
+        for pane in [app::Pane::Help, app::Pane::History, app::Pane::Stats] {
+            app.pane = pane;
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            let s = flatten(&terminal);
+            let titles = ["dice notation", "🎲   history", "🎲   statistics"];
+            let showing = titles.iter().filter(|t| s.contains(**t)).count();
+            assert_eq!(showing, 1, "exactly one pane should be visible for {pane:?}");
+        }
+    }
+
     #[test]
     fn advantage_renders_the_dropped_die_dimmed() {
         use ratatui::style::Color;
@@ -203,7 +283,7 @@ mod tests {
         assert!(!flatten(&terminal).contains("dice notation"));
 
         // Open it (what pressing `?` does) and the syntax table appears.
-        app.show_help = true;
+        app.pane = app::Pane::Help;
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         let screen = flatten(&terminal);
         assert!(screen.contains("dice notation"), "help title missing");
@@ -212,7 +292,7 @@ mod tests {
         assert!(screen.contains("to close"), "dismiss hint missing");
 
         // Close it again.
-        app.show_help = false;
+        app.pane = app::Pane::None;
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         assert!(!flatten(&terminal).contains("dice notation"));
     }
@@ -221,7 +301,7 @@ mod tests {
     fn help_overlay_fits_a_short_terminal_without_panicking() {
         // A frame too short to hold the whole panel must still render (trimmed).
         let mut app = App::new("3d6".to_string());
-        app.show_help = true;
+        app.pane = app::Pane::Help;
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         assert!(flatten(&terminal).contains("notation"), "panel did not render");
