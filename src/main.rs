@@ -43,6 +43,63 @@ fn main() -> io::Result<()> {
     result
 }
 
+/// What the event loop should do after handling a key.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Continue,
+    Quit,
+}
+
+/// Apply one key press to the app. Pure (no I/O) so the routing is unit-tested;
+/// the bug this guards against is a pane hotkey eating a letter the user needs
+/// to *type* (e.g. the `h` in `kh`).
+fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
+    // Ctrl-C always quits, even from an overlay.
+    if ctrl && code == KeyCode::Char('c') {
+        return Action::Quit;
+    }
+
+    // Pane hotkeys are global (work whether or not a pane is open) and use
+    // chords / `?` so they never collide with typed notation — `h` and `s` have
+    // to stay typeable for `kh`/`dh` and any expression containing them. Pressing
+    // a pane's key again closes it.
+    match code {
+        KeyCode::Char('?') => {
+            app.pane = toggle(app.pane, Pane::Help);
+            return Action::Continue;
+        }
+        KeyCode::Char('h') if ctrl => {
+            app.pane = toggle(app.pane, Pane::History);
+            return Action::Continue;
+        }
+        KeyCode::Char('s') if ctrl => {
+            app.pane = toggle(app.pane, Pane::Stats);
+            return Action::Continue;
+        }
+        _ => {}
+    }
+
+    // While a pane is open it captures the rest of input: Esc/q close it,
+    // everything else is ignored so the hidden expression can't be edited blind.
+    if app.pane != Pane::None {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.pane = Pane::None;
+        }
+        return Action::Continue;
+    }
+
+    match code {
+        KeyCode::Esc => return Action::Quit,
+        KeyCode::Enter => app.roll(),
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Char(c) if !ctrl => app.input.push(c),
+        _ => {}
+    }
+    Action::Continue
+}
+
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut last = Instant::now();
 
@@ -56,38 +113,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-                // Ctrl-C always quits, even from an overlay.
-                if ctrl && key.code == KeyCode::Char('c') {
+                if handle_key(app, key.code, ctrl) == Action::Quit {
                     break;
-                }
-
-                // While a pop-out pane is up it captures input: its own key or
-                // Esc/q closes it, everything else is ignored so the user can't
-                // blindly edit the hidden expression. Each pane toggles closed
-                // on its own key, so `?`/`h`/`s` flip between panes too.
-                if app.pane != Pane::None {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => app.pane = Pane::None,
-                        KeyCode::Char('?') => app.pane = toggle(app.pane, Pane::Help),
-                        KeyCode::Char('h') => app.pane = toggle(app.pane, Pane::History),
-                        KeyCode::Char('s') => app.pane = toggle(app.pane, Pane::Stats),
-                        _ => {}
-                    }
-                    continue;
-                }
-
-                match key.code {
-                    KeyCode::Char('?') => app.pane = Pane::Help,
-                    KeyCode::Char('h') => app.pane = Pane::History,
-                    KeyCode::Char('s') => app.pane = Pane::Stats,
-                    KeyCode::Esc => break,
-                    KeyCode::Enter => app.roll(),
-                    KeyCode::Backspace => {
-                        app.input.pop();
-                    }
-                    KeyCode::Char(c) if !ctrl => app.input.push(c),
-                    _ => {}
                 }
             }
         }
@@ -105,8 +132,73 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::Pane;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// Feed a string of plain (non-ctrl) characters through the key handler.
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            assert_eq!(handle_key(app, KeyCode::Char(c), false), Action::Continue);
+        }
+    }
+
+    #[test]
+    fn typing_kh_reaches_the_input_and_does_not_open_a_pane() {
+        // Regression: `h`/`s` must be typeable so `kh`, `dh`, etc. work. Before
+        // the fix a bare `h` opened the history pane instead of typing.
+        let mut app = App::new(String::new());
+        type_str(&mut app, "2d20kh1");
+        assert_eq!(app.input, "2d20kh1");
+        assert_eq!(app.pane, Pane::None, "typing must never open a pane");
+
+        // An `s`-bearing expression types cleanly too.
+        let mut app2 = App::new(String::new());
+        type_str(&mut app2, "3d6s"); // a stray 's' is just text
+        assert_eq!(app2.input, "3d6s");
+        assert_eq!(app2.pane, Pane::None);
+    }
+
+    #[test]
+    fn ctrl_chords_toggle_panes_without_typing() {
+        let mut app = App::new("3d6".to_string());
+
+        // Ctrl-H opens history; the letter is not inserted into the input.
+        assert_eq!(handle_key(&mut app, KeyCode::Char('h'), true), Action::Continue);
+        assert_eq!(app.pane, Pane::History);
+        assert_eq!(app.input, "3d6", "the chord must not type 'h'");
+
+        // Pressing it again closes it; Ctrl-S then opens stats.
+        handle_key(&mut app, KeyCode::Char('h'), true);
+        assert_eq!(app.pane, Pane::None);
+        handle_key(&mut app, KeyCode::Char('s'), true);
+        assert_eq!(app.pane, Pane::Stats);
+
+        // `?` toggles help and switches from another open pane.
+        handle_key(&mut app, KeyCode::Char('?'), false);
+        assert_eq!(app.pane, Pane::Help);
+    }
+
+    #[test]
+    fn esc_closes_a_pane_then_quits() {
+        let mut app = App::new("3d6".to_string());
+        app.pane = Pane::History;
+        // First Esc just closes the pane (does not quit).
+        assert_eq!(handle_key(&mut app, KeyCode::Esc, false), Action::Continue);
+        assert_eq!(app.pane, Pane::None);
+        // With no pane open, Esc quits.
+        assert_eq!(handle_key(&mut app, KeyCode::Esc, false), Action::Quit);
+    }
+
+    #[test]
+    fn keys_are_swallowed_while_a_pane_is_open() {
+        let mut app = App::new(String::new());
+        app.pane = Pane::Stats;
+        // Typing while a pane is open must not edit the hidden expression.
+        type_str(&mut app, "9d9");
+        assert_eq!(app.input, "", "input changed while a pane was open");
+        assert_eq!(app.pane, Pane::Stats);
+    }
 
     fn flatten(terminal: &Terminal<TestBackend>) -> String {
         terminal

@@ -39,12 +39,16 @@ cargo run --release -- "d6+d8" # quote anything with shell-special chars
 | -------------- | ----------------------------------- |
 | `Enter`        | roll / re-roll the current dice     |
 | `?`            | toggle the dice-notation help overlay |
-| `h`            | toggle the roll-history pane        |
-| `s`            | toggle the statistics pane          |
+| `Ctrl-H`       | toggle the roll-history pane        |
+| `Ctrl-S`       | toggle the statistics pane          |
 | type / `Backspace` | edit the dice expression        |
 | `Esc` / `Ctrl-C` | quit (`Esc` closes an open pane first) |
 
-The three pop-out panes (`?` / `h` / `s`) float over the running animation —
+The history and statistics panes use `Ctrl` chords, not bare letters, so that
+`h` and `s` stay free to type — `kh`/`dh` and any expression containing those
+letters would otherwise be swallowed by a hotkey.
+
+The three pop-out panes (`?` / `Ctrl-H` / `Ctrl-S`) float over the running animation —
 the dice keep bouncing underneath — and are mutually exclusive; opening one
 closes the others. `Esc` or `q` dismisses whichever is open.
 
