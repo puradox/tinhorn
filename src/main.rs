@@ -1,25 +1,28 @@
 //! roll — a terminal dice roller whose dice bounce around the screen.
 //!
-//! Usage:
-//!   roll            # start empty, type an expression and press Enter
-//!   roll 3d6        # roll immediately
-//!   roll "d6+d8"    # quote expressions that contain shell-special characters
+//! Two modes:
+//!   roll              # interactive: type an expression and watch it bounce
+//!   roll 3d6          # interactive, rolling 3d6 immediately
+//!   roll -p 3d6       # one-shot: print the result and exit (for scripting)
+//!   roll 3d6 | cat    # one-shot too — a non-TTY stdout switches modes
+//!   roll --json 3d6   # one-shot, machine-readable JSON breakdown
+//!   roll --seed 42 3d6  # reproducible roll
 //!
-//! Keys (while running):
-//!   Enter        roll (or re-roll) the current expression
-//!   Backspace    edit the expression
-//!   Esc / Ctrl-C quit
+//! Interactive keys: Enter roll · ? help · Ctrl-H history · Ctrl-S stats · Esc quit
 
 mod app;
+mod cli;
 mod parse;
 mod ui;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use app::{App, Pane};
+use cli::Cli;
 
 const FRAME: Duration = Duration::from_millis(16); // ~60 fps
 
@@ -34,10 +37,29 @@ fn toggle(current: Pane, target: Pane) -> Pane {
 }
 
 fn main() -> io::Result<()> {
-    let initial = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let cli = Cli::parse();
+    let expr = cli.expression();
 
+    // One-shot mode: print a result and exit instead of animating. Triggered by
+    // an explicit output flag, or automatically when stdout isn't a terminal
+    // (so `roll 3d6 | cat` and `roll 3d6 > f` just work).
+    let one_shot = cli.print || cli.json || cli.verbose || !io::stdout().is_terminal();
+    if one_shot {
+        if expr.is_empty() {
+            // Nothing to roll, and either a flag was given or there's no TTY to
+            // animate in — a usage error rather than a silent empty TUI.
+            eprintln!("roll: no dice expression given (e.g. `roll 3d6`)");
+            std::process::exit(2);
+        }
+        return cli::run_one_shot(&cli, &expr);
+    }
+
+    // Interactive: launch the animated TUI.
     let mut terminal = ratatui::init();
-    let mut app = App::new(initial);
+    let mut app = match cli.seed {
+        Some(seed) => App::with_seed(expr, seed),
+        None => App::new(expr),
+    };
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
     result

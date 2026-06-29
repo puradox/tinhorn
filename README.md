@@ -3,7 +3,9 @@
 A terminal dice roller. Type dice in common notation and watch them bounce
 around the screen, tumbling through random faces until they settle and the
 total is tallied. Each die is drawn as the 2D silhouette of its polyhedron.
-Built in Rust with [ratatui](https://ratatui.rs).
+Built in Rust with [ratatui](https://ratatui.rs). Or run it
+[one-shot](#scripting-one-shot-mode) — `roll -p 3d6` — to print a result and
+exit, so it works in scripts and pipes too.
 
 ```
 ┌ 🎲  roll — settled ───────────────────────────────────────────────────┐
@@ -32,6 +34,34 @@ cargo run --release            # start empty, type an expression
 cargo run --release -- 3d6     # roll immediately
 cargo run --release -- "d6+d8" # quote anything with shell-special chars
 ```
+
+## Scripting (one-shot mode)
+
+Given an expression, `roll` normally opens the animation. But with an output
+flag — or whenever stdout isn't a terminal — it skips the TUI, evaluates the
+roll once, prints a result, and exits. So it drops straight into scripts and
+pipelines:
+
+```sh
+roll -p 3d6              # 13            (just the total)
+roll 3d6 | cat           # 13            (piped stdout → one-shot automatically)
+total=$(roll -p 2d20kh1) # capture it in a variable
+roll --seed 42 4d6dl1    # reproducible: the same seed always rolls the same dice
+roll -v 4d6dl1+2         # a full breakdown (dropped dice in [brackets])
+roll --json 2d20kh1+3    # machine-readable for jq & friends
+```
+
+```text
+$ roll -v --seed 2 "4d6! + d8"
+  4d6!       1 6 1 2 4!  = 14      ← a 6 exploded into a 5th die (4!)
+  d8         4  = 4
+  total      18
+```
+
+The `--json` output carries every die with its `kept` and `exploded` flags, the
+per-term subtotals, the flat modifier, and the grand total — everything the
+animation knows, in a form a script can read. A parse error goes to stderr and
+exits non-zero, so failures are catchable.
 
 ## Keys
 
@@ -155,4 +185,7 @@ The suite covers notation parsing, that dice always converge to rest (with a
 hard frame cap so a non-converging bug fails instead of hanging), that they
 never escape the arena, that a crowded pool settles without any two dice
 overlapping, and that the UI renders a full roll without panicking (via
-ratatui's `TestBackend`).
+ratatui's `TestBackend`). It also covers the one-shot path — seeded rolls are
+reproducible, the JSON breakdown has the expected shape, and the verbose output
+marks dropped and exploded dice — and the key routing, so a pane hotkey can
+never swallow a letter you need to type.

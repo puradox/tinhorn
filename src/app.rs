@@ -106,7 +106,18 @@ pub struct App {
 }
 
 impl App {
+    /// Start with a fresh, entropy-seeded RNG.
     pub fn new(initial: String) -> Self {
+        Self::with_rng(initial, StdRng::from_entropy())
+    }
+
+    /// Start with a fixed seed, so the animation produces a reproducible roll
+    /// (the `--seed` flag flows through here).
+    pub fn with_seed(initial: String, seed: u64) -> Self {
+        Self::with_rng(initial, StdRng::seed_from_u64(seed))
+    }
+
+    fn with_rng(initial: String, rng: StdRng) -> Self {
         let mut app = App {
             input: String::new(),
             dice: Vec::new(),
@@ -120,7 +131,7 @@ impl App {
             spawned: false,
             needs_spawn: false,
             explosions: Vec::new(),
-            rng: StdRng::from_entropy(),
+            rng,
         };
         if !initial.trim().is_empty() {
             app.input = initial.trim().to_string();
@@ -700,6 +711,170 @@ fn sample_total(roll: &Roll, rng: &mut StdRng) -> i32 {
         total += term_sum * mult;
     }
     total
+}
+
+/// One rolled die in a headless evaluation.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct OutcomeDie {
+    pub value: u32,
+    /// Whether this die counts toward the total (false ⇒ dropped by keep/drop).
+    pub kept: bool,
+    /// Whether this die was spawned by an explosion (vs. a base-pool die).
+    pub exploded: bool,
+}
+
+/// The result of evaluating one dice term headlessly: its dice and subtotal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutcomeTerm {
+    /// The term as written, e.g. "4d6dl1" or "3d6!".
+    pub notation: String,
+    pub sides: u32,
+    pub dice: Vec<OutcomeDie>,
+    /// The per-term multiplier (`*N`), 1 when absent.
+    pub multiplier: i32,
+    /// Sum of this term's kept dice, after the multiplier.
+    pub subtotal: i32,
+}
+
+/// A complete headless roll: every term's dice plus the grand total. This is the
+/// data behind the plain / verbose / `--json` CLI output and is the non-animated
+/// equivalent of a full settled roll in the TUI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Outcome {
+    /// The whole expression as typed.
+    pub expression: String,
+    pub terms: Vec<OutcomeTerm>,
+    /// The flat `+N`/`-N` modifier.
+    pub modifier: i32,
+    pub total: i32,
+}
+
+/// Evaluate a parsed roll once into a full breakdown (every die, kept/exploded
+/// flags, per-term subtotals, grand total). Mirrors the animation's semantics
+/// exactly — explode → keep/drop on the base pool → per-term multiply → flat
+/// modifier — but resolves instantly. Used by the one-shot CLI path; [`App`]'s
+/// animated roll and this share the same rules so a die shown bouncing and a die
+/// printed to stdout always agree.
+pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
+    let mut terms = Vec::with_capacity(roll.terms.len());
+    let mut total = roll.modifier;
+
+    for term in &roll.terms {
+        let explode = explode_condition(term);
+        let mult = term_multiplier(term);
+        let base = term.count as usize;
+
+        // Base pool, then explosions appended (always kept). Track which dice
+        // were spawned by explosions so the output can flag them.
+        let mut dice: Vec<OutcomeDie> = (0..base)
+            .map(|_| OutcomeDie {
+                value: rng.gen_range(1..=term.sides),
+                kept: true,
+                exploded: false,
+            })
+            .collect();
+
+        if let Some(cmp) = explode {
+            let mut spawned = 0usize;
+            let mut i = 0;
+            while i < dice.len() {
+                if cmp.matches(dice[i].value) && spawned < MAX_EXPLOSIONS {
+                    dice.push(OutcomeDie {
+                        value: rng.gen_range(1..=term.sides),
+                        kept: true,
+                        exploded: true,
+                    });
+                    spawned += 1;
+                }
+                i += 1;
+            }
+        }
+
+        // Keep/drop on the base pool only (exploded dice always count).
+        for m in &term.mods {
+            let (high, n) = match *m {
+                TermMod::KeepHigh(n) => (true, n as usize),
+                TermMod::DropLow(n) => (true, base.saturating_sub(n as usize)),
+                TermMod::KeepLow(n) => (false, n as usize),
+                TermMod::DropHigh(n) => (false, base.saturating_sub(n as usize)),
+                _ => continue,
+            };
+            keep_n_outcome(&mut dice[..base], n, high);
+        }
+
+        let kept_sum: i32 = dice.iter().filter(|d| d.kept).map(|d| d.value as i32).sum();
+        let subtotal = kept_sum * mult;
+        total += subtotal;
+
+        terms.push(OutcomeTerm {
+            notation: term_notation(term),
+            sides: term.sides,
+            dice,
+            multiplier: mult,
+            subtotal,
+        });
+    }
+
+    Outcome {
+        expression: expression.to_string(),
+        terms,
+        modifier: roll.modifier,
+        total,
+    }
+}
+
+/// Keep the `n` highest/lowest-valued kept dice, flagging the rest out. The
+/// [`OutcomeDie`] twin of [`keep_n_values`].
+fn keep_n_outcome(dice: &mut [OutcomeDie], n: usize, high: bool) {
+    let mut live: Vec<usize> = (0..dice.len()).filter(|&i| dice[i].kept).collect();
+    live.sort_by_key(|&i| dice[i].value);
+    if high {
+        live.reverse();
+    }
+    for &i in live.iter().skip(n) {
+        dice[i].kept = false;
+    }
+}
+
+/// Reconstruct a term's notation from its parsed form, e.g. "4d6dl1*2". Used to
+/// label terms in the breakdown output.
+fn term_notation(term: &DiceTerm) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    if term.count != 1 {
+        let _ = write!(s, "{}", term.count);
+    }
+    let _ = write!(s, "d{}", term.sides);
+    for m in &term.mods {
+        match *m {
+            TermMod::KeepHigh(n) => {
+                let _ = write!(s, "kh{n}");
+            }
+            TermMod::KeepLow(n) => {
+                let _ = write!(s, "kl{n}");
+            }
+            TermMod::DropHigh(n) => {
+                let _ = write!(s, "dh{n}");
+            }
+            TermMod::DropLow(n) => {
+                let _ = write!(s, "dl{n}");
+            }
+            TermMod::Explode(None) => s.push('!'),
+            TermMod::Explode(Some(parse::Compare::Eq(n))) => {
+                let _ = write!(s, "!={n}");
+            }
+            TermMod::Explode(Some(parse::Compare::Gt(n))) => {
+                let _ = write!(s, "!>{n}");
+            }
+            TermMod::Explode(Some(parse::Compare::Lt(n))) => {
+                let _ = write!(s, "!<{n}");
+            }
+            TermMod::Mul(n) => {
+                let _ = write!(s, "*{n}");
+            }
+        }
+    }
+    s
 }
 
 /// Keep the `n` highest- (or lowest-) valued kept entries in `pool`, flagging
