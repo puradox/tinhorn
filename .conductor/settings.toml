@@ -1,0 +1,24 @@
+#:schema https://conductor.build/schemas/settings.repo.schema.json
+
+[scripts]
+# Fetch crate dependencies when a workspace is created. Compilation is left to
+# the run scripts so setup stays fast; the crate cache in ~/.cargo is shared.
+setup = "cargo fetch"
+
+# Reclaim the (large, gitignored) target/ directory before the workspace is archived.
+archive = "cargo clean"
+
+# Each workspace has its own target/ dir and the app needs no shared port, DB,
+# or other local resource, so multiple workspaces can run at the same time.
+run_mode = "concurrent"
+
+[scripts.run.roll]
+# Launch the TUI dice roller (release build for smooth animation).
+command = "cargo run --release"
+default = true
+icon = "dices"
+
+[scripts.run.test]
+# Run the parser / physics / rendering unit tests.
+command = "cargo test"
+icon = "test-tube"
