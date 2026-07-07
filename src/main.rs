@@ -8,10 +8,12 @@
 //!   roll --json 3d6   # one-shot, machine-readable JSON breakdown
 //!   roll --seed 42 3d6  # reproducible roll
 //!
-//! Interactive keys: Enter roll · ? help · Ctrl-H history · Ctrl-S stats · Esc quit
+//! Interactive keys: Enter roll · Tab shake/throw · ? help · Ctrl-H history ·
+//! Ctrl-S stats · Ctrl-M mute · Esc quit
 
 mod app;
 mod cli;
+mod foley;
 mod parse;
 mod ui;
 
@@ -25,6 +27,7 @@ use app::{App, Pane};
 use cli::Cli;
 
 const FRAME: Duration = Duration::from_millis(16); // ~60 fps
+const MAX_CLICKS_PER_FRAME: usize = 8; // impact/knock sounds played per frame; more is mush
 
 /// Pressing a pane's own key while it's open closes it; pressing it while a
 /// *different* pane is open switches to it.
@@ -54,15 +57,57 @@ fn main() -> io::Result<()> {
         return cli::run_one_shot(&cli, &expr);
     }
 
-    // Interactive: launch the animated TUI.
+    // Interactive: launch the animated TUI. The dice are audible unless muted
+    // (`--mute` starts muted; Ctrl-M toggles) or there's no output device
+    // (Foley::new degrades to None silently).
+    let sound = foley::Foley::new();
     let mut terminal = ratatui::init();
+    let keys = KeyGuard::engage();
+
     let mut app = match cli.seed {
         Some(seed) => App::with_seed(expr, seed),
         None => App::new(expr),
     };
-    let result = run(&mut terminal, &mut app);
+    app.muted = cli.mute;
+    app.mute_key = keys.enhanced;
+    let result = run(&mut terminal, &mut app, sound.as_ref());
+
+    drop(keys);
     ratatui::restore();
     result
+}
+
+/// Enables the enhanced keyboard protocol where the terminal supports it, so
+/// Ctrl-M is distinguishable from Enter (legacy encoding makes them the same
+/// CR byte). Undone in Drop — panic paths included, which ratatui's own
+/// panic hook knows nothing about — so the flag can never leak into the
+/// user's shell. `enhanced == false` just means the mute chord is
+/// unavailable, never a broken terminal.
+struct KeyGuard {
+    enhanced: bool,
+}
+
+impl KeyGuard {
+    fn engage() -> Self {
+        let supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let enhanced = supported
+            && crossterm::execute!(
+                io::stdout(),
+                event::PushKeyboardEnhancementFlags(
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )
+            .is_ok();
+        KeyGuard { enhanced }
+    }
+}
+
+impl Drop for KeyGuard {
+    fn drop(&mut self) {
+        if self.enhanced {
+            let _ = crossterm::execute!(io::stdout(), event::PopKeyboardEnhancementFlags);
+        }
+    }
 }
 
 /// What the event loop should do after handling a key.
@@ -98,6 +143,13 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
             app.pane = toggle(app.pane, Pane::Stats);
             return Action::Continue;
         }
+        // Mute is global too. Reaching us as Char('m')+CTRL requires the
+        // enhanced keyboard protocol (pushed at startup where supported) —
+        // legacy terminals send Ctrl-M as a bare CR, i.e. Enter.
+        KeyCode::Char('m') if ctrl => {
+            app.muted = !app.muted;
+            return Action::Continue;
+        }
         _ => {}
     }
 
@@ -110,9 +162,22 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
         return Action::Continue;
     }
 
+    // The Throw: while the cup is shaking it captures input — Enter/Tab
+    // releases the throw, Esc puts the dice down, and everything else is
+    // swallowed so the expression can't change mid-shake.
+    if app.shaking() {
+        match code {
+            KeyCode::Enter | KeyCode::Tab => app.throw(),
+            KeyCode::Esc => app.cancel_shake(),
+            _ => {}
+        }
+        return Action::Continue;
+    }
+
     match code {
         KeyCode::Esc => return Action::Quit,
         KeyCode::Enter => app.roll(),
+        KeyCode::Tab => app.start_shake(),
         KeyCode::Backspace => {
             app.input.pop();
         }
@@ -122,7 +187,11 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
     Action::Continue
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    sound: Option<&foley::Foley>,
+) -> io::Result<()> {
     let mut last = Instant::now();
 
     loop {
@@ -146,6 +215,26 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         let dt = (now - last).as_secs_f32();
         last = now;
         app.update(dt);
+
+        // Whatever the physics wanted heard, play (take_sounds returns nothing
+        // while muted). Impacts and knocks are additionally capped per frame:
+        // a dense pool can strike dozens of times inside 16ms, each play
+        // synthesizes a fresh buffer, and eight overlapping clicks already
+        // sound like a fistful of dice.
+        let mut clicks = 0usize;
+        for ev in app.take_sounds() {
+            let Some(f) = sound else { break };
+            if matches!(
+                ev,
+                app::SoundEvent::Impact { .. } | app::SoundEvent::Knock { .. }
+            ) {
+                clicks += 1;
+                if clicks > MAX_CLICKS_PER_FRAME {
+                    continue;
+                }
+            }
+            f.play(ev);
+        }
     }
 
     Ok(())
@@ -186,7 +275,10 @@ mod tests {
         let mut app = App::new("3d6".to_string());
 
         // Ctrl-H opens history; the letter is not inserted into the input.
-        assert_eq!(handle_key(&mut app, KeyCode::Char('h'), true), Action::Continue);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('h'), true),
+            Action::Continue
+        );
         assert_eq!(app.pane, Pane::History);
         assert_eq!(app.input, "3d6", "the chord must not type 'h'");
 
@@ -199,6 +291,169 @@ mod tests {
         // `?` toggles help and switches from another open pane.
         handle_key(&mut app, KeyCode::Char('?'), false);
         assert_eq!(app.pane, Pane::Help);
+    }
+
+    #[test]
+    fn tab_shakes_and_enter_throws() {
+        let mut app = App::new(String::new());
+        type_str(&mut app, "2d20kh1");
+
+        // Tab picks the cup up; nothing is rolled yet.
+        assert_eq!(handle_key(&mut app, KeyCode::Tab, false), Action::Continue);
+        assert!(app.shaking());
+        assert!(app.dice.is_empty(), "shaking must not roll");
+
+        // Typing while shaking is swallowed — the expression is locked in.
+        type_str(&mut app, "9d9");
+        assert_eq!(app.input, "2d20kh1", "input changed mid-shake");
+
+        // Esc puts the dice down instead of quitting.
+        assert_eq!(handle_key(&mut app, KeyCode::Esc, false), Action::Continue);
+        assert!(!app.shaking());
+        assert!(app.dice.is_empty(), "a cancelled shake must not roll");
+
+        // Shake again and release with Enter: now the roll happens.
+        handle_key(&mut app, KeyCode::Tab, false);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, false),
+            Action::Continue
+        );
+        assert!(!app.shaking());
+        assert_eq!(app.dice.len(), 2, "the throw rolls the locked expression");
+    }
+
+    #[test]
+    fn shaking_renders_the_cup_and_power_meter() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+
+        type_str(&mut app, "3d6");
+        handle_key(&mut app, KeyCode::Tab, false);
+        app.update(0.3);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        let screen = flatten(&terminal);
+        assert!(screen.contains("shaking"), "title should say shaking");
+        assert!(screen.contains("╲____╱"), "the cup is missing");
+        assert!(screen.contains("power"), "the power meter is missing");
+        assert!(screen.contains("throw"), "the release hint is missing");
+
+        // Throw and let it land: the cup vanishes and the roll completes.
+        handle_key(&mut app, KeyCode::Enter, false);
+        for _ in 0..6000 {
+            app.update(1.0 / 60.0);
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            if app.all_settled() {
+                break;
+            }
+        }
+        assert!(app.all_settled(), "thrown dice never settled on screen");
+        let screen = flatten(&terminal);
+        assert!(
+            !screen.contains("╲____╱"),
+            "the cup should be gone after the throw"
+        );
+        assert!(
+            screen.contains("settled"),
+            "the roll should finish as usual"
+        );
+    }
+
+    #[test]
+    fn ctrl_m_toggles_mute_everywhere() {
+        let mut app = App::new(String::new());
+        assert!(!app.muted, "sound starts on");
+
+        // Plain toggle, and the chord must not type an 'm'.
+        type_str(&mut app, "3d6");
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('m'), true),
+            Action::Continue
+        );
+        assert!(app.muted);
+        assert_eq!(app.input, "3d6", "the chord must not type 'm'");
+
+        // Works while a pane is open (and leaves the pane alone)…
+        app.pane = Pane::Stats;
+        handle_key(&mut app, KeyCode::Char('m'), true);
+        assert!(!app.muted);
+        assert_eq!(app.pane, Pane::Stats);
+        app.pane = Pane::None;
+
+        // …and mid-shake, without throwing or cancelling.
+        handle_key(&mut app, KeyCode::Tab, false);
+        assert!(app.shaking());
+        handle_key(&mut app, KeyCode::Char('m'), true);
+        assert!(app.muted);
+        assert!(app.shaking(), "muting must not disturb the shake");
+
+        // A bare 'm' (no ctrl) still just types.
+        app.cancel_shake();
+        type_str(&mut app, "m");
+        assert_eq!(app.input, "3d6m");
+    }
+
+    #[test]
+    fn a_staked_roll_renders_its_verdict() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        roll_to_settle(&mut app, "2d20kh1 vs 12", &mut terminal);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let screen = flatten(&terminal);
+        assert!(screen.contains("vs 12"), "the target is not on screen");
+        let (success, _) = app.verdict().expect("settled staked roll has a verdict");
+        if success {
+            assert!(
+                screen.contains("SUCCESS"),
+                "verdict chip missing:\n{screen}"
+            );
+        } else {
+            assert!(screen.contains("FAIL"), "verdict chip missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_tiny_terminal_skips_the_cup_rather_than_breaking_the_border() {
+        // Regression: on an arena narrower than the cup, drawing it would
+        // paint over the border chrome. It is skipped instead.
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(9, 12)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+
+        type_str(&mut app, "d6");
+        handle_key(&mut app, KeyCode::Tab, false);
+        app.update(0.3);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        let screen = flatten(&terminal);
+        assert!(
+            !screen.contains("╲____╱"),
+            "the cup must not squeeze into 7 cells"
+        );
+        assert!(!screen.contains("power"), "nor the meter");
+        // The arena frame survives intact (rows 1..=4 are its left border;
+        // rows 0 and 5 are corners, and the results block starts below).
+        let buf = terminal.backend().buffer();
+        for y in 1..5u16 {
+            assert_eq!(
+                buf[(0, y)].symbol(),
+                "│",
+                "left border corrupted at row {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_with_a_bad_expression_errors_instead_of_shaking() {
+        let mut app = App::new(String::new());
+        type_str(&mut app, "garbage");
+        handle_key(&mut app, KeyCode::Tab, false);
+        assert!(!app.shaking());
+        assert!(app.error.is_some(), "the typo surfaces at pickup");
+        // The input stays editable — the very next key must reach it.
+        type_str(&mut app, "x");
+        assert_eq!(app.input, "garbagex");
     }
 
     #[test]
@@ -285,6 +540,177 @@ mod tests {
         }
     }
 
+    /// Not a real assertion — records scripted TUI sessions as JSON frame dumps
+    /// (glyphs + colours per cell) for building demo players. Run with:
+    ///   DEMO_OUT=/tmp/demo.json cargo test record_demo -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn record_demo() {
+        use ratatui::style::Color;
+        use serde_json::json;
+
+        const W: u16 = 64;
+        const H: u16 = 20;
+
+        fn color_code(c: Color) -> char {
+            match c {
+                Color::Black => 'k',
+                Color::Red => 'r',
+                Color::Green => 'g',
+                Color::Yellow => 'y',
+                Color::Blue => 'b',
+                Color::Magenta => 'm',
+                Color::Cyan => 'c',
+                Color::Gray => 'a',
+                Color::DarkGray => 'd',
+                Color::LightRed => 'R',
+                Color::LightGreen => 'G',
+                Color::LightYellow => 'Y',
+                Color::LightBlue => 'B',
+                Color::LightMagenta => 'M',
+                Color::LightCyan => 'C',
+                Color::White => 'w',
+                _ => '.',
+            }
+        }
+
+        /// Snapshot the buffer: one text row plus parallel fg/bg code rows per
+        /// line. The cell shadowing a wide glyph (the 🎲 in the title) is
+        /// dropped so text and colour rows stay index-aligned.
+        fn snap(terminal: &Terminal<TestBackend>) -> serde_json::Value {
+            let buf = terminal.backend().buffer();
+            let area = *buf.area();
+            let mut text = Vec::new();
+            let mut fg = Vec::new();
+            let mut bg = Vec::new();
+            for y in 0..area.height {
+                let (mut t, mut f, mut b) = (String::new(), String::new(), String::new());
+                let mut skip = false;
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    if skip {
+                        skip = false;
+                        continue;
+                    }
+                    let sym = cell.symbol();
+                    skip = sym.chars().next().is_some_and(|c| c == '🎲');
+                    t.push_str(if sym.is_empty() { " " } else { sym });
+                    f.push(color_code(cell.fg));
+                    b.push(color_code(cell.bg));
+                }
+                text.push(t);
+                fg.push(f);
+                bg.push(b);
+            }
+            json!({ "x": text, "f": fg, "b": bg })
+        }
+
+        /// One sound event as a compact JSON tuple for the player's WebAudio.
+        fn sound_json(ev: &app::SoundEvent) -> serde_json::Value {
+            use app::SoundEvent as E;
+            match *ev {
+                E::Impact { sides, speed } => json!(["impact", sides, speed]),
+                E::Knock { sides, speed } => json!(["knock", sides, speed]),
+                E::Settle { sides } => json!(["settle", sides]),
+                E::Rattle { power } => json!(["rattle", power]),
+                E::Throw { power } => json!(["throw", power]),
+                E::Crit => json!(["crit"]),
+                E::Fumble => json!(["fumble"]),
+                E::Success => json!(["success"]),
+                E::Failure => json!(["failure"]),
+            }
+        }
+
+        /// Drive one scripted session: type `expr`, shake for `shake_secs`,
+        /// throw, and record until everything settles (30 fps output). Sound
+        /// events are drained per emitted frame so the player can foley along.
+        fn record(expr: &str, seed: u64, shake_secs: f32) -> serde_json::Value {
+            let mut app = App::with_seed(String::new(), seed);
+            let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
+            let mut frames = Vec::new();
+            let mut n = 0usize;
+            let mut step = |app: &mut App,
+                            terminal: &mut Terminal<TestBackend>,
+                            frames: &mut Vec<serde_json::Value>| {
+                app.update(1.0 / 60.0);
+                terminal.draw(|f| ui::render(f, app)).unwrap();
+                // Odd frames are skipped (30 fps output); their sound events
+                // stay queued and ride along with the next emitted frame.
+                if n.is_multiple_of(2) {
+                    let sounds: Vec<serde_json::Value> =
+                        app.sounds.drain(..).map(|e| sound_json(&e)).collect();
+                    let mut frame = snap(terminal);
+                    frame["s"] = json!(sounds);
+                    frames.push(frame);
+                }
+                n += 1;
+            };
+
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            for _ in 0..10 {
+                step(&mut app, &mut terminal, &mut frames);
+            }
+            for c in expr.chars() {
+                handle_key(&mut app, KeyCode::Char(c), false);
+                for _ in 0..4 {
+                    step(&mut app, &mut terminal, &mut frames);
+                }
+            }
+            for _ in 0..12 {
+                step(&mut app, &mut terminal, &mut frames);
+            }
+            handle_key(&mut app, KeyCode::Tab, false);
+            for _ in 0..(shake_secs * 60.0) as usize {
+                step(&mut app, &mut terminal, &mut frames);
+            }
+            handle_key(&mut app, KeyCode::Enter, false);
+            for _ in 0..1500 {
+                step(&mut app, &mut terminal, &mut frames);
+                if app.all_settled() {
+                    break;
+                }
+            }
+            assert!(app.all_settled(), "demo roll never settled");
+            for _ in 0..50 {
+                step(&mut app, &mut terminal, &mut frames);
+            }
+            json!({ "w": W, "h": H, "fps": 30, "expr": expr, "frames": frames })
+        }
+
+        // Seed-hunt each take: the RNG draw order is fixed, so probing roll()
+        // headlessly finds a seed the scripted session will reproduce exactly.
+        let find_seed = |expr: &str, wanted: fn(&[u32]) -> bool| -> u64 {
+            (0..)
+                .find(|&s| {
+                    let mut probe = App::with_seed(String::new(), s);
+                    probe.input = expr.into();
+                    probe.roll();
+                    let vals: Vec<u32> = probe.dice.iter().map(|d| d.final_value).collect();
+                    wanted(&vals)
+                })
+                .unwrap()
+        };
+
+        // A natural 20 over a low die: the SUCCESS verdict and the crit burst
+        // land in one take. And a fail take: a clear miss, but not a natural 1.
+        let seed = find_seed("2d20kh1 vs 15", |vals| {
+            vals.iter().max() == Some(&20) && vals.iter().min().is_some_and(|&v| v <= 8)
+        });
+        let fail_seed = find_seed("d20+2 vs 15", |vals| (3..=9).contains(&vals[0]));
+
+        // ~0.78 s of shaking lands the release right at the power peak; ~1.5 s
+        // catches the trough for the contrast lob.
+        let out = json!({
+            "rocket": record("2d20kh1 vs 15", seed, 0.78),
+            "fail": record("d20+2 vs 15", fail_seed, 1.05),
+            "lob": record("4d6", 7, 1.5),
+        });
+
+        let path = std::env::var("DEMO_OUT").expect("set DEMO_OUT=<path> for the frame dump");
+        std::fs::write(&path, serde_json::to_vec(&out).unwrap()).unwrap();
+        eprintln!("wrote {path} (rocket seed {seed})");
+    }
+
     /// Roll an expression to completion so it lands in history.
     fn roll_to_settle(app: &mut App, expr: &str, terminal: &mut Terminal<TestBackend>) {
         app.input = expr.to_string();
@@ -347,7 +773,10 @@ mod tests {
             let s = flatten(&terminal);
             let titles = ["dice notation", "🎲   history", "🎲   statistics"];
             let showing = titles.iter().filter(|t| s.contains(**t)).count();
-            assert_eq!(showing, 1, "exactly one pane should be visible for {pane:?}");
+            assert_eq!(
+                showing, 1,
+                "exactly one pane should be visible for {pane:?}"
+            );
         }
     }
 
@@ -403,6 +832,7 @@ mod tests {
         assert!(screen.contains("dice notation"), "help title missing");
         assert!(screen.contains("advantage"), "keep/drop section missing");
         assert!(screen.contains("explode"), "exploding section missing");
+        assert!(screen.contains("The Throw"), "Throw section missing");
         assert!(screen.contains("to close"), "dismiss hint missing");
 
         // Close it again.
@@ -418,7 +848,10 @@ mod tests {
         app.pane = app::Pane::Help;
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
-        assert!(flatten(&terminal).contains("notation"), "panel did not render");
+        assert!(
+            flatten(&terminal).contains("notation"),
+            "panel did not render"
+        );
     }
 
     #[test]

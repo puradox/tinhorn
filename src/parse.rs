@@ -15,8 +15,11 @@
 //!   "d10!>8"     -> exploding on >8 instead of just the max face
 //!   "4d6*2"      -> multiply this term's kept sum by 2
 //!
+//! Stakes (at most one, anywhere a separator could go — conventionally last):
+//!   "d20+5 vs 15" -> roll against a target: total >= 15 succeeds
+//!
 //! Grammar (loosely):
-//!   expr  := term ( sep? term )*
+//!   expr  := term ( sep? term )* [ ('vs'|'VS') n ]
 //!   sep   := '+' | '-' | ',' | whitespace
 //!   term  := [count] ('d'|'D') sides termmod*   |   integer
 //!   termmod := ('kh'|'kl'|'dh'|'dl') [n]
@@ -65,11 +68,14 @@ pub struct DiceTerm {
     pub mods: Vec<TermMod>,
 }
 
-/// The fully-parsed request: a sequence of dice terms plus a flat modifier.
+/// The fully-parsed request: a sequence of dice terms plus a flat modifier,
+/// and — when the roll has stakes — the target the total is checked against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Roll {
     pub terms: Vec<DiceTerm>,
     pub modifier: i32,
+    /// `vs N`: the roll succeeds when the total meets or beats this.
+    pub target: Option<i32>,
 }
 
 // Sanity limits so "999d999999" can't wedge the renderer or the RNG loop.
@@ -86,6 +92,7 @@ pub fn parse(input: &str) -> Result<Roll, String> {
     let mut modifier: i32 = 0;
     let mut sign: i32 = 1;
     let mut saw_term = false;
+    let mut target: Option<i32> = None;
 
     while i < n {
         let c = chars[i];
@@ -93,6 +100,34 @@ pub fn parse(input: &str) -> Result<Roll, String> {
         // Separators / sign markers.
         if c.is_whitespace() || c == ',' {
             i += 1;
+            continue;
+        }
+
+        // Stakes: `vs N` names the target the total must meet or beat. Matched
+        // before term parsing so the 'v' can't fall through to "unexpected
+        // character". The target must end the roll: allowing dice after it
+        // would make a contested-roll attempt like `d20 vs 4d6` silently parse
+        // as "target 4, plus a d6 for me" — an error beats a misparse.
+        if vs_keyword(&chars, i) {
+            if target.is_some() {
+                return Err("only one 'vs' target per roll".to_string());
+            }
+            i += 2;
+            while i < n && chars[i].is_whitespace() {
+                i += 1;
+            }
+            let t = parse_required_int(
+                &chars,
+                &mut i,
+                "expected a target after 'vs' (e.g. d20 vs 15)",
+            )?;
+            while i < n && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i < n {
+                return Err("the 'vs' target must come last (e.g. d20+5 vs 15)".to_string());
+            }
+            target = Some(t);
             continue;
         }
         if c == '+' {
@@ -172,7 +207,16 @@ pub fn parse(input: &str) -> Result<Roll, String> {
         return Err("no dice — a roll needs at least one 'd' term".to_string());
     }
 
-    Ok(Roll { terms, modifier })
+    Ok(Roll {
+        terms,
+        modifier,
+        target,
+    })
+}
+
+/// Match the stakes keyword `vs` at `pos` without consuming (case-insensitive).
+fn vs_keyword(chars: &[char], pos: usize) -> bool {
+    matches!(chars.get(pos), Some('v' | 'V')) && matches!(chars.get(pos + 1), Some('s' | 'S'))
 }
 
 /// Consume any run of term modifiers (`kh`/`kl`/`dh`/`dl`/`!`/`*`) sitting right
@@ -286,14 +330,18 @@ fn parse_optional_compare(chars: &[char], i: &mut usize) -> Result<Option<Compar
     Ok(Some(op(n)))
 }
 
-/// Parse a required signed integer at `i` (used by `*`). Advances past it.
+/// Parse a required signed integer at `i` (used by `*` and `vs`). Advances
+/// past it. Range-checked: a magnitude that fits u32 but not i32 must error
+/// rather than wrap negative (a `vs 3000000000` that silently becomes a huge
+/// negative target would succeed on every roll).
 fn parse_required_int(chars: &[char], i: &mut usize, msg: &str) -> Result<i32, String> {
     let neg = matches!(chars.get(*i), Some('-'));
     if neg || matches!(chars.get(*i), Some('+')) {
         *i += 1;
     }
-    let mag = parse_optional_count(chars, i).ok_or_else(|| msg.to_string())?;
-    Ok(if neg { -(mag as i32) } else { mag as i32 })
+    let mag = parse_optional_count(chars, i).ok_or_else(|| msg.to_string())? as i64;
+    let v = if neg { -mag } else { mag };
+    i32::try_from(v).map_err(|_| "that number is too large".to_string())
 }
 
 #[cfg(test)]
@@ -385,10 +433,16 @@ mod tests {
         assert_eq!(term(&r, 0).mods, vec![TermMod::Explode(None)]);
 
         let r = parse("d10!>8").unwrap();
-        assert_eq!(term(&r, 0).mods, vec![TermMod::Explode(Some(Compare::Gt(8)))]);
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![TermMod::Explode(Some(Compare::Gt(8)))]
+        );
 
         let r = parse("d6!=6").unwrap();
-        assert_eq!(term(&r, 0).mods, vec![TermMod::Explode(Some(Compare::Eq(6)))]);
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![TermMod::Explode(Some(Compare::Eq(6)))]
+        );
     }
 
     #[test]
@@ -408,7 +462,53 @@ mod tests {
         let r = parse("4d6!kh3*2").unwrap();
         assert_eq!(
             term(&r, 0).mods,
-            vec![TermMod::Explode(None), TermMod::KeepHigh(3), TermMod::Mul(2)]
+            vec![
+                TermMod::Explode(None),
+                TermMod::KeepHigh(3),
+                TermMod::Mul(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn stakes_target() {
+        // The canonical form, with and without spaces, any case.
+        for expr in ["d20+5 vs 15", "d20+5vs15", "d20+5 VS 15"] {
+            let r = parse(expr).unwrap();
+            assert_eq!(r.target, Some(15), "{expr}");
+            assert_eq!(r.modifier, 5, "{expr}");
+        }
+        // No stakes: target is absent.
+        assert_eq!(parse("3d6").unwrap().target, None);
+        // The target may be negative (weird, but well-defined).
+        assert_eq!(parse("d6 vs -2").unwrap().target, Some(-2));
+    }
+
+    #[test]
+    fn stakes_errors() {
+        assert!(parse("d20 vs").is_err(), "vs needs a number");
+        assert!(parse("d20 vs 10 vs 12").is_err(), "one target only");
+        assert!(parse("vs 15").is_err(), "stakes with no dice is not a roll");
+        // The target ends the roll: trailing terms are an error, not a bonus
+        // die quietly added to the roller's own pool.
+        assert!(
+            parse("d20 vs 4d6").is_err(),
+            "dice after the target must not parse"
+        );
+        assert!(
+            parse("d20 vs 15 + 5").is_err(),
+            "modifiers after the target must not parse"
+        );
+        // A magnitude that fits u32 but not i32 must error, not wrap negative.
+        assert!(
+            parse("d20 vs 3000000000").is_err(),
+            "an oversized target must not wrap"
+        );
+        assert!(parse("d20 vs -3000000000").is_err());
+        // i32::MIN's magnitude is the one negative that must not panic.
+        assert!(
+            parse("d20 vs -2147483648").is_ok(),
+            "i32::MIN is a valid (absurd) target"
         );
     }
 

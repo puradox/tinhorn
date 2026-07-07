@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, Die, Pane, Stats, DIE_H, DIE_W};
+use crate::app::{App, Die, Pane, Particle, Stats, DIE_H, DIE_W};
 
 /// Per-die colour palette; dice cycle through it by index.
 const PALETTE: [Color; 8] = [
@@ -37,7 +37,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_arena(frame, app, chunks[0]);
     render_results(frame, app, chunks[1]);
     render_input(frame, app, chunks[2]);
-    render_help(frame, chunks[3]);
+    render_help(frame, app, chunks[3]);
 
     // A pop-out pane floats on top of everything when one is toggled open.
     match app.pane {
@@ -48,11 +48,42 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// The one tier ladder for a throw's power. The arena title and the release
+/// echo both read it, so the two labels on screen can never disagree about
+/// the same release.
+#[derive(Clone, Copy, PartialEq)]
+enum ThrowTier {
+    Lob,
+    Toss,
+    Rocket,
+    Peak,
+}
+
+fn throw_tier(power: f32) -> ThrowTier {
+    if power >= 0.92 {
+        ThrowTier::Peak
+    } else if power >= 0.70 {
+        ThrowTier::Rocket
+    } else if power >= 0.33 {
+        ThrowTier::Toss
+    } else {
+        ThrowTier::Lob
+    }
+}
+
 fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = if app.all_settled() {
+    let title = if app.shaking() {
+        " 🎲  roll — shaking… ".to_string()
+    } else if app.all_settled() {
         " 🎲  roll — settled ".to_string()
     } else if app.spawned {
-        " 🎲  roll — rolling… ".to_string()
+        // Name the throw for what it was; a plain Enter roll just "rolls".
+        match app.last_throw.map(|t| throw_tier(t.power)) {
+            Some(ThrowTier::Lob) => " 🎲  roll — a timid lob… ".to_string(),
+            Some(ThrowTier::Toss) => " 🎲  roll — a clean toss… ".to_string(),
+            Some(ThrowTier::Rocket | ThrowTier::Peak) => " 🎲  roll — a rocket throw… ".to_string(),
+            None => " 🎲  roll — rolling… ".to_string(),
+        }
     } else {
         " 🎲  roll ".to_string()
     };
@@ -68,25 +99,179 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
     app.arena_w = inner.width as f32;
     app.arena_h = inner.height as f32;
 
-    if !app.spawned || inner.width < DIE_W as u16 || inner.height < DIE_H as u16 {
+    if inner.width < DIE_W as u16 || inner.height < DIE_H as u16 {
         return;
     }
 
-    let buf = frame.buffer_mut();
-    for die in &app.dice {
-        draw_die(buf, inner, die);
+    // A hard throw rattles the whole box for its first instants: every die is
+    // drawn shifted by the same jitter, so the arena itself seems to shudder.
+    let jitter = match app.last_throw {
+        Some(throw) if app.tremor() > 0.0 => {
+            let phase = (throw.age * 30.0) as i32;
+            match phase % 4 {
+                0 => (1i32, 0i32),
+                1 => (0, 1),
+                2 => (-1, 0),
+                _ => (0, -1),
+            }
+        }
+        _ => (0, 0),
+    };
+
+    if app.spawned {
+        let buf = frame.buffer_mut();
+        for die in &app.dice {
+            draw_die(buf, inner, die, jitter);
+        }
+        for p in &app.particles {
+            draw_particle(buf, inner, p);
+        }
+    }
+
+    // The cup rattles along the arena floor while a shake is in progress,
+    // drawn over whatever the last roll left lying around.
+    if app.shaking() {
+        draw_cup(frame.buffer_mut(), inner, app);
+    }
+
+    // The release echo: the caught power, frozen at the top of the arena so
+    // you learn what your timing bought you while the dice are still flying.
+    if let Some(throw) = app.release_echo() {
+        draw_release_echo(frame.buffer_mut(), inner, throw);
+    }
+}
+
+/// Width of the power meter in cells — the live one in the cup and the frozen
+/// release echo, which must stay pixel-identical to the meter it echoes.
+const METER_WIDTH: usize = 14;
+
+/// The meter itself: `power` as filled-vs-empty cells.
+fn power_bar(power: f32) -> String {
+    let filled = ((power * METER_WIDTH as f32).round() as usize).min(METER_WIDTH);
+    "▓".repeat(filled) + &"░".repeat(METER_WIDTH - filled)
+}
+
+/// The frozen caught-power readout shown right after a release: the meter as
+/// it was the instant you let go, graded and named. Fades before it vanishes.
+fn draw_release_echo(buf: &mut ratatui::buffer::Buffer, inner: Rect, throw: crate::app::Throw) {
+    let (word, color) = release_grade(throw.power);
+    let label = format!("caught {} {word}", power_bar(throw.power));
+    let w = label.chars().count() as u16;
+    if inner.width < w || inner.height < 2 {
+        return;
+    }
+    let x = inner.x + (inner.width - w) / 2;
+    // Old (dying) echo dims; a fresh one is bold.
+    let mut style = Style::default().fg(color);
+    if throw.age > 0.9 {
+        style = style.add_modifier(Modifier::DIM);
+    } else {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    buf.set_string(x, inner.y, label, style);
+}
+
+/// How the release reads on the meter: the wording of the catch. The peak is
+/// the prize; a lob is its own reward.
+fn release_grade(power: f32) -> (&'static str, Color) {
+    match throw_tier(power) {
+        ThrowTier::Peak => ("— the peak!", Color::Yellow),
+        ThrowTier::Rocket => ("— a rocket", Color::Red),
+        ThrowTier::Toss => ("— a clean toss", Color::Cyan),
+        ThrowTier::Lob => ("— a timid lob", Color::DarkGray),
+    }
+}
+
+/// One celebration glyph: gold sparks for a crit, grey dust for a fumble,
+/// dimming as it dies.
+fn draw_particle(buf: &mut ratatui::buffer::Buffer, inner: Rect, p: &Particle) {
+    let x = inner.x as i32 + p.x.round() as i32;
+    let y = inner.y as i32 + p.y.round() as i32;
+    if x < inner.x as i32
+        || x >= inner.right() as i32
+        || y < inner.y as i32
+        || y >= inner.bottom() as i32
+    {
+        return;
+    }
+    let mut style = Style::default().fg(if p.bright {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    });
+    if p.fade() > 0.55 {
+        style = style.add_modifier(Modifier::DIM);
+    } else if p.bright {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    buf.set_string(x as u16, y as u16, p.glyph.to_string(), style);
+}
+
+/// The dice cup and its power meter, drawn while shaking (the Throw). The cup
+/// sways with [`App::cup_x`]; the glyphs inside rattle frame to frame; the
+/// meter above is fixed and colour-codes the power you'd release right now.
+fn draw_cup(buf: &mut ratatui::buffer::Buffer, inner: Rect, app: &App) {
+    let power = app.power();
+
+    // Rattling dice inside the cup: two quarter-block glyphs that jump around
+    // as the shake clock advances. Purely cosmetic, so no RNG is consumed.
+    const RATTLE: [char; 6] = ['▖', '▘', '▝', '▗', '▚', '▞'];
+    let tick = (app.shake_t() * 14.0) as usize;
+    let (g1, g2) = (RATTLE[tick % 6], RATTLE[(tick + 3) % 6]);
+
+    // On an arena too narrow for the cup, drawing anyway would paint over the
+    // border chrome (max_x saturates below inner.x); skip the theater instead.
+    let cup_w: u16 = 8;
+    if inner.width < cup_w {
+        return;
+    }
+    let max_x = inner.right() - cup_w;
+    let cx = (inner.x as f32 + app.cup_x() - cup_w as f32 / 2.0).round() as i32;
+    let cx = (cx.max(inner.x as i32) as u16).min(max_x);
+    let cup_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    if inner.height >= 2 {
+        let top = inner.bottom() - 2;
+        buf.set_string(cx, top, format!("(  {g1}{g2}  )"), cup_style);
+        buf.set_string(cx, top + 1, " ╲____╱ ", cup_style);
+    }
+
+    // The power meter sits centred above the cup's travel, steady so your eye
+    // can time the release against it. Skipped when it wouldn't fit — like
+    // the cup, it must never spill over the arena border.
+    if inner.height >= 5 {
+        let label = format!("power {} throw ↵", power_bar(power));
+        let w = label.chars().count() as u16;
+        if inner.width < w {
+            return;
+        }
+        let x = inner.x + (inner.width - w) / 2;
+        let y = inner.bottom() - 4;
+        let bar_color = if power < 0.5 {
+            Color::Green
+        } else if power < 0.85 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        buf.set_string(x, y, label, Style::default().fg(bar_color));
     }
 }
 
 /// Paint a single die into the buffer at its current position, drawn as the
 /// 2D silhouette of the matching polyhedron (triangle for d4, square for d6,
 /// diamond for d8, kite for d10, pentagon for d12, hexagon for d20).
-fn draw_die(buf: &mut ratatui::buffer::Buffer, inner: Rect, die: &Die) {
+/// `jitter` shifts the whole drawing — the throw's brief screen-shake.
+fn draw_die(buf: &mut ratatui::buffer::Buffer, inner: Rect, die: &Die, jitter: (i32, i32)) {
     let max_x = inner.right().saturating_sub(DIE_W as u16);
     let max_y = inner.bottom().saturating_sub(DIE_H as u16);
 
-    let bx = (inner.x + die.x.round() as u16).clamp(inner.x, max_x);
-    let by = (inner.y + die.y.round() as u16).clamp(inner.y, max_y);
+    let jx = (inner.x as i32 + die.x.round() as i32 + jitter.0).max(inner.x as i32) as u16;
+    let jy = (inner.y as i32 + die.y.round() as i32 + jitter.1).max(inner.y as i32) as u16;
+    let bx = jx.clamp(inner.x, max_x);
+    let by = jy.clamp(inner.y, max_y);
 
     // A dropped die (kept == false) is still thrown and animated, but rendered
     // greyed-and-dimmed so you can watch e.g. advantage discard the lower d20.
@@ -225,8 +410,12 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
-    // Line 2: the total.
-    let total = if settled { app.total() } else { app.live_total() };
+    // Line 2: the total — and, when the roll is staked, the verdict.
+    let total = if settled {
+        app.total()
+    } else {
+        app.live_total()
+    };
     let total_style = if settled {
         Style::default()
             .fg(Color::Black)
@@ -235,35 +424,129 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let total_line = Line::from(vec![
+    let mut total_spans = vec![
         Span::styled("  Σ total ", Style::default().fg(Color::Gray)),
         Span::styled(format!(" {total} "), total_style),
         Span::raw("   "),
-        Span::styled(
-            if settled { "" } else { "(rolling…)" },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    ];
 
-    let p = Paragraph::new(vec![Line::from(chips), total_line]);
+    match (app.target, app.verdict()) {
+        // Settled with stakes: slam the verdict (the wording is shared with
+        // the CLI's verbose breakdown so the two can't drift).
+        (Some(target), Some((success, margin))) => {
+            let bg = if success { Color::Green } else { Color::Red };
+            total_spans.push(Span::styled(
+                format!("vs {target}  "),
+                Style::default().fg(Color::Gray),
+            ));
+            total_spans.push(Span::styled(
+                format!(" {} ", crate::app::verdict_text(success, margin)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Stakes declared, dice still falling: show what's at stake.
+        (Some(target), None) => {
+            total_spans.push(Span::styled(
+                format!("vs {target}  (rolling…)"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        _ => {
+            total_spans.push(Span::styled(
+                if settled { "" } else { "(rolling…)" },
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    // Maxed dice and 1s get named, whatever the stakes. A d20's own crit
+    // keeps its beloved name; anything else is a crit on its merits.
+    if settled {
+        let crits = app.crit_dice().count();
+        if crits > 0 {
+            let all_d20 = app.crit_dice().all(|d| d.sides == 20);
+            let mut label = if all_d20 {
+                "  ✦ natural 20".to_string()
+            } else {
+                "  ✦ crit".to_string()
+            };
+            if crits > 1 {
+                label.push_str(&format!(" ×{crits}"));
+            }
+            total_spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let fumbles = app.fumble_dice().count();
+        if fumbles > 0 {
+            let all_d20 = app.fumble_dice().all(|d| d.sides == 20);
+            let mut label = if all_d20 {
+                "  natural 1".to_string()
+            } else {
+                "  fumble".to_string()
+            };
+            if fumbles > 1 {
+                label.push_str(&format!(" ×{fumbles}"));
+            }
+            total_spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+
+    let p = Paragraph::new(vec![Line::from(chips), Line::from(total_spans)]);
     frame.render_widget(p, inner);
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, app: &App, area: Rect) {
     let key = |k| Span::styled(k, Style::default().fg(Color::Cyan).bold());
-    let help = Line::from(vec![
-        Span::styled(" › ", Style::default().fg(Color::Cyan)),
-        key("Enter"),
-        Span::raw(" roll  "),
-        key("?"),
-        Span::raw(" help  "),
-        key("^H"),
-        Span::raw(" history  "),
-        key("^S"),
-        Span::raw(" stats  "),
-        key("Esc"),
-        Span::raw(" quit"),
-    ]);
+    let help = if app.shaking() {
+        // Mid-shake the bar narrows to the only choices that exist.
+        Line::from(vec![
+            Span::styled(" › shaking…  ", Style::default().fg(Color::Yellow)),
+            key("Enter"),
+            Span::raw(" · "),
+            key("Tab"),
+            Span::raw(" throw  "),
+            key("Esc"),
+            Span::raw(" put them down"),
+        ])
+    } else {
+        let mut spans = vec![
+            Span::styled(" › ", Style::default().fg(Color::Cyan)),
+            key("Enter"),
+            Span::raw(" roll  "),
+            key("Tab"),
+            Span::raw(" shake  "),
+            key("?"),
+            Span::raw(" help  "),
+            key("^H"),
+            Span::raw(" history  "),
+            key("^S"),
+            Span::raw(" stats  "),
+        ];
+        // Only teach the mute chord where the terminal can actually deliver
+        // it — on legacy encodings Ctrl-M IS Enter, and following this hint
+        // would roll the dice instead.
+        if app.mute_key {
+            spans.push(key("^M"));
+            spans.push(Span::raw(if app.muted {
+                " unmute 🔇  "
+            } else {
+                " mute  "
+            }));
+        }
+        spans.push(key("Esc"));
+        spans.push(Span::raw(" quit"));
+        Line::from(spans)
+    };
     frame.render_widget(Paragraph::new(help), area);
 }
 
@@ -281,7 +564,9 @@ fn syntax_row<'a>(example: &'a str, meaning: &'a str) -> Line<'a> {
 fn heading(text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(
         text.into(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -289,7 +574,9 @@ fn heading(text: impl Into<String>) -> Line<'static> {
 fn close_hint() -> Line<'static> {
     Line::from(Span::styled(
         "  Esc · q to close",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     ))
 }
 
@@ -316,7 +603,9 @@ fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line
         lines.truncate(max_lines);
     }
 
-    let para = Paragraph::new(lines).block(block).alignment(Alignment::Left);
+    let para = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Left);
     frame.render_widget(Clear, rect); // blank whatever's behind the panel
     frame.render_widget(para, rect);
 }
@@ -338,18 +627,20 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::raw(""),
         heading("Exploding"),
         syntax_row("3d6!", "a max face rolls another die"),
-        syntax_row("d10!>8", "explode on any face over 8"),
-        syntax_row("d6!=6", "explode on exactly 6"),
+        syntax_row("d10!>8", "explode on any face over 8 (also !=N, !<N)"),
         Line::raw(""),
-        heading("Multiply"),
-        syntax_row("4d6*2", "double this term's sum"),
-        syntax_row("4d6!kh3*2", "modifiers stack, left to right"),
+        heading("Multiply & stakes"),
+        syntax_row("4d6*2", "double this term's sum (modifiers stack)"),
+        syntax_row("d20+5 vs 15", "roll against a target — meet it, beat it"),
+        Line::raw(""),
+        heading("The Throw"),
+        syntax_row("Tab", "pick up & shake; Enter throws — harder at the peak"),
+        syntax_row("Esc", "put them down. Power never touches the values."),
         Line::raw(""),
         Line::from(Span::styled(
             "  Separators: +  -  ,  space  or just write dice next to each other.",
             Style::default().fg(Color::DarkGray),
         )),
-        Line::raw(""),
         close_hint(),
     ];
     overlay_panel(frame, area, " 🎲  dice notation ", lines);
@@ -377,12 +668,17 @@ fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 .collect::<Vec<_>>()
                 .join(" ");
             lines.push(Line::from(vec![
-                Span::styled(format!("  {idx:>3}. "), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  {idx:>3}. "),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(format!("{:<12}", e.expr), Style::default().fg(Color::Cyan)),
                 Span::styled(format!("[{faces}]  "), Style::default().fg(Color::Gray)),
                 Span::styled(
                     format!("= {}", e.total),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
@@ -401,7 +697,7 @@ fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The statistics pane: theoretical odds for the current expression plus a
 /// summary of the rolls actually made this session.
-fn render_stats_overlay(frame: &mut Frame, app: &App, area: Rect) {
+fn render_stats_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
     let lines = match app.stats() {
         Ok(s) => stats_lines(&s),
         Err(e) => vec![
@@ -439,14 +735,39 @@ fn stats_lines(s: &Stats) -> Vec<Line<'static>> {
         Line::raw(""),
     ];
 
+    // A staked expression leads with what matters: the odds of making it.
+    if let (Some(target), Some(odds)) = (s.target, s.success_odds) {
+        lines.insert(
+            1,
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("vs {target}: "), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:.0}% to succeed", odds * 100.0),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        );
+    }
+
     // A little horizontal distribution: one bar per bucket, scaled to the peak.
     if !s.dist.is_empty() {
-        let peak = s.dist.iter().map(|b| b.fraction).fold(0.0_f64, f64::max).max(1e-9);
+        let peak = s
+            .dist
+            .iter()
+            .map(|b| b.fraction)
+            .fold(0.0_f64, f64::max)
+            .max(1e-9);
         for b in &s.dist {
             let filled = (b.fraction / peak * 18.0).round() as usize;
             let bar: String = "█".repeat(filled);
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>4} ", b.total), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("  {:>4} ", b.total),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(bar, Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" {:>4.1}%", b.fraction * 100.0),
@@ -461,7 +782,10 @@ fn stats_lines(s: &Stats) -> Vec<Line<'static>> {
     lines.push(heading("This session"));
     if s.session.count == 0 {
         lines.push(Line::from(Span::styled(
-            format!("  no rolls of {} yet ({} rolls total)", s.expr, s.total_rolls),
+            format!(
+                "  no rolls of {} yet ({} rolls total)",
+                s.expr, s.total_rolls
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     } else {

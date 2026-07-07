@@ -5,6 +5,13 @@
 //! the roll once, prints a result, and exits. This is what makes `roll` usable in
 //! scripts and pipelines. Three output shapes: a bare total (default), a verbose
 //! breakdown (`-v`), and machine-readable JSON (`--json`).
+//!
+//! A staked roll (`d20+5 vs 15`) under an explicit `-p`/`-v` also *exits* with
+//! the verdict — 0 on success, 1 on failure — so a shell script can branch on
+//! a saving throw: `roll -p d20+4 vs 14 && echo "the potion works"`. The
+//! implicit piped-stdout mode and `--json` always exit 0 on clean output:
+//! `roll d20 vs 15 | tee log` in a `set -e` script must not abort just
+//! because the die came up short, and JSON consumers read `success` instead.
 
 use std::io::{self, Write};
 
@@ -44,6 +51,10 @@ pub struct Cli {
     /// Seed the RNG for a reproducible roll (works in both modes).
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
+
+    /// Start the interactive mode muted (Ctrl-M toggles sound at runtime).
+    #[arg(long)]
+    pub mute: bool,
 }
 
 impl Cli {
@@ -83,6 +94,16 @@ pub fn run_one_shot(cli: &Cli, expr: &str) -> io::Result<()> {
     } else {
         writeln!(out, "{}", outcome.total)?;
     }
+
+    // A staked roll reports its verdict through the exit code (0 = success,
+    // 1 = failure) so scripts can branch on the check itself — but only when
+    // the caller explicitly asked for `-p`/`-v`. The automatic non-tty
+    // one-shot (`roll d20 vs 15 | tee`) and `--json` keep exit 0, so piping
+    // output can never read as the program failing.
+    if (cli.print || cli.verbose) && outcome.success == Some(false) {
+        out.flush()?;
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -121,6 +142,13 @@ pub fn format_verbose(o: &Outcome) -> String {
     }
 
     let _ = writeln!(s, "  total      {}", o.total);
+
+    // The staked verdict, spelled out with the same wording as the TUI chip
+    // (the exit code carries it for scripts).
+    if let (Some(target), Some(success), Some(margin)) = (o.target, o.success, o.margin) {
+        let verdict = crate::app::verdict_text(success, margin).to_lowercase();
+        let _ = writeln!(s, "  vs {target:<7} {verdict}");
+    }
     s
 }
 
@@ -151,7 +179,12 @@ mod tests {
         assert_eq!(o.terms[0].dice.len(), 4);
         assert_eq!(o.terms[0].dice.iter().filter(|d| !d.kept).count(), 1);
         // Total = sum of kept dice + modifier.
-        let kept: i32 = o.terms[0].dice.iter().filter(|d| d.kept).map(|d| d.value as i32).sum();
+        let kept: i32 = o.terms[0]
+            .dice
+            .iter()
+            .filter(|d| d.kept)
+            .map(|d| d.value as i32)
+            .sum();
         assert_eq!(o.total, kept + 2);
         assert_eq!(o.modifier, 2);
     }
@@ -160,7 +193,12 @@ mod tests {
     fn multiply_is_reflected_in_subtotal() {
         let o = outcome("3d6*2+d8", 3);
         let t0 = &o.terms[0];
-        let raw: i32 = t0.dice.iter().filter(|d| d.kept).map(|d| d.value as i32).sum();
+        let raw: i32 = t0
+            .dice
+            .iter()
+            .filter(|d| d.kept)
+            .map(|d| d.value as i32)
+            .sum();
         assert_eq!(t0.multiplier, 2);
         assert_eq!(t0.subtotal, raw * 2);
     }
@@ -172,7 +210,11 @@ mod tests {
             let o = outcome("6d6!", seed);
             if o.terms[0].dice.iter().any(|d| d.exploded) {
                 // Every exploded die is kept (explosions always count).
-                assert!(o.terms[0].dice.iter().filter(|d| d.exploded).all(|d| d.kept));
+                assert!(o.terms[0]
+                    .dice
+                    .iter()
+                    .filter(|d| d.exploded)
+                    .all(|d| d.kept));
                 return;
             }
         }
@@ -191,6 +233,30 @@ mod tests {
         assert!(die["value"].is_number());
         assert!(die["kept"].is_boolean());
         assert!(die["exploded"].is_boolean());
+        // Crit/fumble ride along so JSON consumers never re-derive the rule.
+        assert!(die["crit"].is_boolean());
+        assert!(die["fumble"].is_boolean());
+    }
+
+    #[test]
+    fn json_crits_match_the_arena_rule() {
+        // Any die type crits on its max: find a d6 that rolled a 6 and a 1.
+        for seed in 0..300 {
+            let o = outcome("4d6", seed);
+            for d in &o.terms[0].dice {
+                assert_eq!(d.crit, d.kept && d.value == 6, "seed {seed}");
+                assert_eq!(d.fumble, d.kept && d.value == 1, "seed {seed}");
+            }
+        }
+        // A dropped max die is not a crit.
+        for seed in 0..500 {
+            let o = outcome("2d20kl1", seed);
+            if let Some(d) = o.terms[0].dice.iter().find(|d| !d.kept && d.value == 20) {
+                assert!(!d.crit, "seed {seed}: a dropped 20 must not be a crit");
+                return;
+            }
+        }
+        panic!("no seed dropped a 20 under disadvantage");
     }
 
     #[test]
@@ -206,5 +272,44 @@ mod tests {
     fn expression_joins_args() {
         let cli = Cli::parse_from(["roll", "d6", "+", "d8"]);
         assert_eq!(cli.expression(), "d6 + d8");
+        // Stakes survive the join too: `roll d20 vs 15` needs no quotes.
+        let cli = Cli::parse_from(["roll", "d20", "vs", "15"]);
+        assert_eq!(cli.expression(), "d20 vs 15");
+    }
+
+    #[test]
+    fn staked_outcome_carries_the_verdict() {
+        // d20+5 vs 15 for a seed spread: verdict always matches the total.
+        for seed in 0..50 {
+            let o = outcome("d20+5 vs 15", seed);
+            assert_eq!(o.target, Some(15));
+            assert_eq!(o.margin, Some(o.total - 15));
+            assert_eq!(o.success, Some(o.total >= 15), "seed {seed}");
+        }
+        // Unstaked rolls carry nothing.
+        let o = outcome("3d6", 1);
+        assert_eq!((o.target, o.success, o.margin), (None, None, None));
+    }
+
+    #[test]
+    fn staked_json_and_verbose_show_the_verdict() {
+        let o = outcome("d20 vs 10", 3);
+        let v: serde_json::Value = serde_json::to_value(&o).unwrap();
+        assert_eq!(v["target"], 10);
+        assert!(v["success"].is_boolean());
+        assert!(v["margin"].is_number());
+        let text = format_verbose(&o);
+        assert!(
+            text.contains("vs 10"),
+            "verbose verdict line missing:\n{text}"
+        );
+        assert!(
+            text.contains("success") || text.contains("fail"),
+            "no verdict wording:\n{text}"
+        );
+
+        // Unstaked JSON omits the stake keys entirely.
+        let v: serde_json::Value = serde_json::to_value(outcome("3d6", 1)).unwrap();
+        assert!(v.get("target").is_none());
     }
 }
