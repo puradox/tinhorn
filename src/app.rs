@@ -27,8 +27,20 @@ const TOPPLE_MAX: f32 = 20.0; // cap on a single topple kick so a hard slam can'
 const MIN_SLIDE_VX: f32 = 2.5; // sideways speed below this is killed on contact so piles settle
 const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long settles in place no matter what
 const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so the pool can't run away
+
+// The Throw: shake-the-cup tuning. Power rises from 0 the moment the cup is
+// picked up and oscillates forever, so the release timing is the whole game.
+const SHAKE_POWER_RATE: f32 = 3.9; // rad/s: a full 0→1→0 power cycle ≈ 1.6 s
+const CUP_SWAY_RATE: f32 = 7.0; // rad/s: how fast the cup rattles side to side
+const THROW_SPEED_MIN: f32 = 26.0; // a zero-power lob still clears the cup's lip
+const THROW_SPEED_MAX: f32 = 95.0; // a full-power throw crosses the arena and works the walls
 const MAX_HISTORY: usize = 200; // most recent rolls kept in memory for the history pane
 const STAT_SAMPLES: usize = 20_000; // Monte-Carlo trials for the statistics pane's odds
+const MAX_SOUNDS: usize = 64; // pending sound events; when nothing drains them, stop queuing
+const KNOCK_BUDGET: usize = 8; // die-vs-die clicks collected per frame; more is inaudible
+const SOUND_SPEED_MIN: f32 = 8.0; // impacts slower than this are silent (they'd be noise)
+const CRIT_PARTICLES: usize = 16; // burst size for a natural 20
+const RELEASE_ECHO_SECS: f32 = 1.6; // how long the caught-power verdict lingers on screen
 
 /// One die in flight.
 pub struct Die {
@@ -60,6 +72,130 @@ pub struct Die {
     age: f32,       // seconds since thrown; a hard cap so nothing tumbles forever
 }
 
+impl Die {
+    /// Put the die at a launch position/velocity and reset every piece of its
+    /// flight state. All three launch sites (the rain spawn, the cup throw,
+    /// and explosion spawns) go through here so a new flight-state field can
+    /// never be reset in one and forgotten in another.
+    fn launch_at(&mut self, x: f32, y: f32, vx: f32, vy: f32) {
+        self.x = x;
+        self.y = y;
+        self.vx = vx;
+        self.vy = vy;
+        self.settled = false;
+        self.tumble_acc = 0.0;
+        self.still_for = 0.0;
+        self.age = 0.0;
+    }
+}
+
+/// THE statement of the meet-or-beat rule: `(success, margin)` for a total
+/// checked against a `vs` target. Every consumer — the TUI verdict, the
+/// headless [`evaluate`], the stats pane's success odds — must call this,
+/// never restate the comparison, so the rule can only ever change in one
+/// place. Margin is computed in i64 so an absurd-but-parseable target
+/// (i32::MIN) can't overflow the subtraction.
+pub fn check(total: i32, target: i32) -> (bool, i32) {
+    let margin = (total as i64 - target as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    (margin >= 0, margin)
+}
+
+/// The staked verdict, spelled out. Shared by the TUI chip and the CLI's
+/// verbose breakdown (which lowercases it) so the two paths can't drift.
+pub fn verdict_text(success: bool, margin: i32) -> String {
+    match (success, margin) {
+        (true, 0) => "SUCCESS — exactly".to_string(),
+        (true, m) => format!("SUCCESS by {m}"),
+        (false, m) => format!("FAIL by {}", -m),
+    }
+}
+
+/// The crit rule, one place: a die of `sides` showing `value` is a crit on
+/// its max face. A d1 is excluded — it is always at its max (and its min)
+/// and deserves neither celebration nor pity. Shared by the animated path
+/// ([`App::crit_dice`]) and the headless evaluator so `--json` consumers see
+/// the same call the arena makes.
+pub fn crit_face(sides: u32, value: u32) -> bool {
+    sides >= 2 && value == sides
+}
+
+/// The fumble rule: a 1 on any die of 2+ sides. See [`crit_face`].
+pub fn fumble_face(sides: u32, value: u32) -> bool {
+    sides >= 2 && value == 1
+}
+
+/// Something the physics did that deserves a noise. `App` only *emits* these —
+/// pure data, so the simulation stays testable — and the foley module turns
+/// them into sound. When nothing drains the queue it simply stops filling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SoundEvent {
+    /// A die struck a wall, the ceiling, or the floor at `speed`.
+    Impact {
+        sides: u32,
+        speed: f32,
+    },
+    /// Two dice knocked together with the given closing speed.
+    Knock {
+        sides: u32,
+        speed: f32,
+    },
+    /// A die came to rest.
+    Settle {
+        sides: u32,
+    },
+    /// The cup crossed a sway peak while shaking (one tick of the rattle).
+    Rattle {
+        power: f32,
+    },
+    /// The shake was released.
+    Throw {
+        power: f32,
+    },
+    /// A kept d20 settled on 20 / on 1.
+    Crit,
+    Fumble,
+    /// A staked roll resolved.
+    Success,
+    Failure,
+}
+
+/// A short-lived celebratory glyph in the arena (nat-20 burst, fumble dust).
+pub struct Particle {
+    pub x: f32,
+    pub y: f32,
+    vx: f32,
+    vy: f32,
+    age: f32,
+    life: f32,
+    pub glyph: char,
+    /// Gold burst (crit) vs dim dust (fumble).
+    pub bright: bool,
+}
+
+impl Particle {
+    /// 0.0 fresh → 1.0 expired; the UI dims the glyph as it dies.
+    pub fn fade(&self) -> f32 {
+        (self.age / self.life).clamp(0.0, 1.0)
+    }
+}
+
+/// A shake in progress: its clock plus the expression locked in at pickup.
+/// The throw rolls the snapshot — so no future path that edits the input
+/// mid-shake can change what was validated and shown when the cup was lifted.
+struct Shake {
+    t: f32,
+    expr: String,
+}
+
+/// The most recent release: the power caught and how long ago. Bundling the
+/// age inside the Option makes "age only means something after a throw"
+/// unrepresentable instead of a rule every consumer must remember.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Throw {
+    pub power: f32,
+    pub age: f32,
+}
+
 /// Which pop-out pane, if any, is currently overlaid on the UI. They're mutually
 /// exclusive — opening one closes the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +221,8 @@ pub struct App {
     pub input: String,
     pub dice: Vec<Die>,
     pub modifier: i32,
+    /// `vs N` from the current roll: the total must meet or beat this.
+    pub target: Option<i32>,
     pub error: Option<String>,
     /// Completed rolls, newest last. Capped so a long session can't grow without
     /// bound; the history pane shows the most recent slice.
@@ -98,6 +236,32 @@ pub struct App {
     pub arena_h: f32,
     pub spawned: bool,
     needs_spawn: bool,
+    /// The shake in progress, if any (the Throw). Power and cup sway are both
+    /// functions of its one clock; the throw rolls its locked expression.
+    shake: Option<Shake>,
+    /// A throw released but not yet spawned: `(power, cup_x)` captured at the
+    /// moment of release. Consumed by [`Self::spawn`], which launches the dice
+    /// out of the cup instead of raining them from the top.
+    pending_throw: Option<(f32, f32)>,
+    /// The most recent release: caught power plus seconds since. Drives the
+    /// arena title, the release echo, and the brief impact screen-shake.
+    pub last_throw: Option<Throw>,
+    /// Celebration glyphs in flight (crit burst, fumble dust).
+    pub particles: Vec<Particle>,
+    /// Noises the simulation wants made, oldest first. The event loop drains
+    /// this every frame; headless callers can ignore it (it self-caps).
+    pub sounds: Vec<SoundEvent>,
+    /// Foley gate, toggled with Ctrl-M (and seeded by `--mute`). Enforced by
+    /// [`Self::take_sounds`] so every drain site inherits the rule.
+    pub muted: bool,
+    /// The last computed stats, keyed by (expression, history length) — the
+    /// two values the sampler is seeded from, so a hit is exact.
+    stats_cache: Option<(String, usize, Stats)>,
+    /// Whether the terminal can deliver Ctrl-M as its own key (enhanced
+    /// keyboard protocol). The help bar only advertises the mute chord when
+    /// it can actually arrive — on legacy encodings Ctrl-M *is* Enter, and
+    /// teaching it would make "mute" roll the dice.
+    pub mute_key: bool,
     /// Count of dice an exploding term has spawned so far this roll, indexed by
     /// term. Explosions happen over the course of the animation, so the cap has
     /// to be enforced across frames rather than in one up-front loop.
@@ -122,6 +286,7 @@ impl App {
             input: String::new(),
             dice: Vec::new(),
             modifier: 0,
+            target: None,
             error: None,
             history: Vec::new(),
             pane: Pane::None,
@@ -130,6 +295,14 @@ impl App {
             arena_h: 0.0,
             spawned: false,
             needs_spawn: false,
+            shake: None,
+            pending_throw: None,
+            last_throw: None,
+            particles: Vec::new(),
+            sounds: Vec::new(),
+            muted: false,
+            stats_cache: None,
+            mute_key: false,
             explosions: Vec::new(),
             rng,
         };
@@ -144,9 +317,14 @@ impl App {
     /// Actual spawn positions are assigned later, once the arena size is known.
     pub fn roll(&mut self) {
         match parse::parse(&self.input) {
-            Ok(Roll { terms, modifier }) => {
+            Ok(Roll {
+                terms,
+                modifier,
+                target,
+            }) => {
                 self.error = None;
                 self.modifier = modifier;
+                self.target = target;
                 self.explosions = vec![0; terms.len()];
                 let mut dice: Vec<Die> = Vec::new();
                 for (ti, term) in terms.iter().enumerate() {
@@ -156,6 +334,10 @@ impl App {
                 self.spawned = false;
                 self.needs_spawn = true;
                 self.recorded = false;
+                self.particles.clear();
+                // A plain Enter roll rains from the top; only throw() re-arms these.
+                self.pending_throw = None;
+                self.last_throw = None;
             }
             Err(e) => {
                 self.error = Some(e);
@@ -225,6 +407,149 @@ impl App {
         }
     }
 
+    /// Pick the dice up and start shaking the cup (the Throw). Validates the
+    /// expression immediately so a typo surfaces now, not at release — and
+    /// locks it: the eventual throw rolls this snapshot, whatever happens to
+    /// the input in between.
+    pub fn start_shake(&mut self) {
+        if self.shake.is_some() {
+            return;
+        }
+        match parse::parse(&self.input) {
+            Ok(_) => {
+                self.error = None;
+                self.shake = Some(Shake {
+                    t: 0.0,
+                    expr: self.input.clone(),
+                });
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    pub fn shaking(&self) -> bool {
+        self.shake.is_some()
+    }
+
+    /// Seconds spent shaking so far (0 when not shaking). The UI keys the cup's
+    /// rattle animation off this clock.
+    pub fn shake_t(&self) -> f32 {
+        self.shake.as_ref().map(|s| s.t).unwrap_or(0.0)
+    }
+
+    /// Put the dice down without throwing. Nothing is rolled or consumed.
+    pub fn cancel_shake(&mut self) {
+        self.shake = None;
+    }
+
+    /// Where the throw's power sits right now: 0..=1, rising from 0 the moment
+    /// the cup is picked up, then oscillating. Catching the peak is the game.
+    /// Power only shapes the launch — never the values, which stay pure RNG.
+    pub fn power(&self) -> f32 {
+        if self.shake.is_some() {
+            0.5 - 0.5 * (self.shake_t() * SHAKE_POWER_RATE).cos()
+        } else {
+            0.0
+        }
+    }
+
+    /// The cup's centre x in arena cells. It sways side to side, harder as
+    /// power builds, so the throw's origin is part of the theater too.
+    pub fn cup_x(&self) -> f32 {
+        let centre = self.arena_w / 2.0;
+        let amp = (self.arena_w * 0.18) * (0.35 + 0.65 * self.power());
+        centre + (self.shake_t() * CUP_SWAY_RATE).sin() * amp
+    }
+
+    /// Release the shake: roll the expression locked at pickup and launch the
+    /// dice out of the cup with the power caught at this instant.
+    pub fn throw(&mut self) {
+        let power = self.power();
+        let cup_x = self.cup_x();
+        let Some(shake) = self.shake.take() else {
+            return;
+        };
+        self.input = shake.expr;
+        self.roll();
+        if self.error.is_none() {
+            self.pending_throw = Some((power, cup_x));
+            self.last_throw = Some(Throw { power, age: 0.0 });
+            self.emit(SoundEvent::Throw { power });
+        }
+    }
+
+    /// Queue a sound for the event loop to play. Self-capping so headless
+    /// runs (tests, the stats sampler) never grow the queue without bound.
+    fn emit(&mut self, ev: SoundEvent) {
+        if self.sounds.len() < MAX_SOUNDS {
+            self.sounds.push(ev);
+        }
+    }
+
+    /// Queue a sound that must survive a full queue — the once-per-roll
+    /// climax events (crit ring, verdict). Evicts the oldest queued noise
+    /// instead of dropping the new one, so 64 wall knocks can never silence
+    /// the natural 20 they preceded.
+    fn emit_priority(&mut self, ev: SoundEvent) {
+        if self.sounds.len() >= MAX_SOUNDS {
+            self.sounds.remove(0);
+        }
+        self.sounds.push(ev);
+    }
+
+    /// Hand over (and clear) the queued sounds — empty when muted. The mute
+    /// rule lives here so every drain site inherits it instead of each
+    /// remembering its own gate.
+    pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
+        let events = std::mem::take(&mut self.sounds);
+        if self.muted {
+            Vec::new()
+        } else {
+            events
+        }
+    }
+
+    /// The release echo: the most recent throw while it's still fresh enough
+    /// to show (the frozen caught-power meter). Purely descriptive — the
+    /// physics already happened.
+    pub fn release_echo(&self) -> Option<Throw> {
+        self.last_throw.filter(|t| t.age < RELEASE_ECHO_SECS)
+    }
+
+    /// How hard the arena should tremble right now (0 = still). A hard throw
+    /// rattles the box for its first instants; a lob doesn't move it.
+    pub fn tremor(&self) -> f32 {
+        match self.last_throw {
+            Some(t) if t.power > 0.6 && t.age < 0.35 => (t.power - 0.6) / 0.4,
+            _ => 0.0,
+        }
+    }
+
+    /// The staked verdict, once everything is settled: [`check`]'s
+    /// `(success, margin)` for the current total against the `vs` target.
+    pub fn verdict(&self) -> Option<(bool, i32)> {
+        let target = self.target?;
+        if !self.all_settled() {
+            return None;
+        }
+        Some(check(self.total(), target))
+    }
+
+    /// Kept dice that settled on their proudest face — [`crit_face`] on any
+    /// die type (a 6 on a d6 counts as much as a 20 on a d20).
+    pub fn crit_dice(&self) -> impl Iterator<Item = &Die> {
+        self.dice
+            .iter()
+            .filter(|d| d.kept && d.settled && crit_face(d.sides, d.final_value))
+    }
+
+    /// Kept dice of any type that settled on a 1 ([`fumble_face`]).
+    pub fn fumble_dice(&self) -> impl Iterator<Item = &Die> {
+        self.dice
+            .iter()
+            .filter(|d| d.kept && d.settled && fumble_face(d.sides, d.final_value))
+    }
+
     fn max_xy(&self) -> (f32, f32) {
         (
             (self.arena_w - DIE_W).max(0.0),
@@ -232,27 +557,72 @@ impl App {
         )
     }
 
-    /// Toss every die from a random spot near the top with a random velocity.
+    /// Place and launch the pool. A plain roll rains the dice from random spots
+    /// near the top; a released throw fires them out of the cup instead.
     fn spawn(&mut self) {
         let (maxx, maxy) = self.max_xy();
-        // Borrow the rng separately from the dice to satisfy the borrow checker.
-        let rng = &mut self.rng;
-        for die in &mut self.dice {
-            die.x = rng.gen_range(0.0..=maxx.max(0.01));
-            die.y = rng.gen_range(0.0..=(maxy * 0.35).max(0.01));
-            die.vx = rng.gen_range(-42.0..=42.0);
-            die.vy = rng.gen_range(-22.0..=18.0);
-            die.settled = false;
-            die.tumble_acc = 0.0;
-            die.still_for = 0.0;
-            die.age = 0.0;
+        if let Some((power, cup_x)) = self.pending_throw.take() {
+            self.spawn_throw(power, cup_x, maxx, maxy);
+        } else {
+            // Borrow the rng separately from the dice to satisfy the borrow checker.
+            let rng = &mut self.rng;
+            for die in &mut self.dice {
+                die.launch_at(
+                    rng.gen_range(0.0..=maxx.max(0.01)),
+                    rng.gen_range(0.0..=(maxy * 0.35).max(0.01)),
+                    rng.gen_range(-42.0..=42.0),
+                    rng.gen_range(-22.0..=18.0),
+                );
+            }
         }
         self.spawned = true;
         self.needs_spawn = false;
     }
 
+    /// Launch every die out of the cup's mouth. Speed scales with the released
+    /// power and the arc flattens as it grows: a timid lob plops out beside the
+    /// cup, a full-power throw crosses the arena and works the far wall. Only
+    /// the trajectory is power's to shape — the faces were rolled in [`Self::roll`].
+    fn spawn_throw(&mut self, power: f32, cup_x: f32, maxx: f32, maxy: f32) {
+        let rng = &mut self.rng;
+        let speed = THROW_SPEED_MIN + (THROW_SPEED_MAX - THROW_SPEED_MIN) * power;
+        // Throw toward the far side of wherever the cup ended up swaying.
+        let dir = if cup_x < maxx / 2.0 { 1.0 } else { -1.0 };
+        let upward = 0.9 - 0.35 * power; // share of speed that goes up; flattens with power
+        for die in &mut self.dice {
+            let s = speed * rng.gen_range(0.85..=1.15);
+            die.launch_at(
+                (cup_x - DIE_W / 2.0 + rng.gen_range(-2.0..=2.0)).clamp(0.0, maxx),
+                (maxy - rng.gen_range(0.0..=2.0)).max(0.0),
+                dir * s * rng.gen_range(0.25 + 0.4 * power..=0.45 + 0.5 * power),
+                -s * rng.gen_range(upward * 0.8..=upward * 1.1),
+            );
+        }
+    }
+
     /// Advance the simulation by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
+        let dt = dt.min(0.05); // clamp so a stalled frame doesn't teleport dice
+
+        // The shake clock ticks whether or not any dice are in flight — the cup
+        // rattles over whatever the last roll left on the floor. Crossing into
+        // a new half-cycle of the sway is one audible tick of the rattle;
+        // deriving both cycle indices from the clock (rather than remembering
+        // the last one) means a fresh shake can't inherit stale state.
+        if let Some(shake) = &mut self.shake {
+            let before = (shake.t * CUP_SWAY_RATE / std::f32::consts::PI) as i32;
+            shake.t += dt;
+            let after = (shake.t * CUP_SWAY_RATE / std::f32::consts::PI) as i32;
+            if after != before {
+                let power = self.power();
+                self.emit(SoundEvent::Rattle { power });
+            }
+        }
+        if let Some(throw) = &mut self.last_throw {
+            throw.age += dt;
+        }
+        self.update_particles(dt);
+
         if self.needs_spawn && self.arena_w > 0.0 {
             self.spawn();
         }
@@ -260,9 +630,16 @@ impl App {
             return;
         }
 
-        let dt = dt.min(0.05); // clamp so a stalled frame doesn't teleport dice
         let (maxx, maxy) = self.max_xy();
         let drag = (1.0 - AIR_DRAG * dt).max(0.0);
+        let mut impacts: Vec<SoundEvent> = Vec::new();
+
+        // The one audibility gate for every wall/ceiling/floor strike.
+        fn clack(impacts: &mut Vec<SoundEvent>, sides: u32, speed: f32) {
+            if speed > SOUND_SPEED_MIN {
+                impacts.push(SoundEvent::Impact { sides, speed });
+            }
+        }
 
         for die in &mut self.dice {
             if die.settled {
@@ -287,21 +664,25 @@ impl App {
             // Side walls.
             if die.x < 0.0 {
                 die.x = 0.0;
+                clack(&mut impacts, die.sides, die.vx.abs());
                 die.vx = -die.vx * WALL_RESTITUTION;
             } else if die.x > maxx {
                 die.x = maxx;
+                clack(&mut impacts, die.sides, die.vx.abs());
                 die.vx = -die.vx * WALL_RESTITUTION;
             }
 
             // Ceiling.
             if die.y < 0.0 {
                 die.y = 0.0;
+                clack(&mut impacts, die.sides, die.vy.abs());
                 die.vy = -die.vy * WALL_RESTITUTION;
             }
 
             // Floor: bounce, rub off horizontal speed, and kill tiny hops.
             if die.y > maxy {
                 die.y = maxy;
+                clack(&mut impacts, die.sides, die.vy.abs());
                 die.vy = -die.vy * FLOOR_RESTITUTION;
                 die.vx *= FLOOR_FRICTION;
                 if die.vy.abs() < MIN_BOUNCE_VY {
@@ -315,6 +696,9 @@ impl App {
                 die.tumble_acc = 0.0;
                 die.shown = self.rng.gen_range(1..=die.sides);
             }
+        }
+        for ev in impacts {
+            self.emit(ev);
         }
 
         // Keep dice from overlapping, then let any that are slow and supported
@@ -330,7 +714,8 @@ impl App {
         }
     }
 
-    /// Append the just-settled roll to the history (newest last), capped.
+    /// Append the just-settled roll to the history (newest last), capped —
+    /// and let the moment land: crit bursts, fumble dust, the staked verdict.
     fn record_roll(&mut self) {
         let values: Vec<u32> = self
             .dice
@@ -347,17 +732,111 @@ impl App {
             let overflow = self.history.len() - MAX_HISTORY;
             self.history.drain(0..overflow);
         }
+
+        // Every maxed die bursts gold and every 1 slumps, but the ring and the
+        // thud play once per roll however many dice earned them — a fistful of
+        // sixes is one chord, not a bell choir. Positions are copied out first
+        // so the burst can borrow the RNG mutably.
+        let crits: Vec<(f32, f32)> = self.crit_dice().map(|d| (d.x, d.y)).collect();
+        let fumbles: Vec<(f32, f32)> = self.fumble_dice().map(|d| (d.x, d.y)).collect();
+        for &(x, y) in &crits {
+            self.burst(x, y, true);
+        }
+        for &(x, y) in &fumbles {
+            self.burst(x, y, false);
+        }
+        if !crits.is_empty() {
+            self.emit_priority(SoundEvent::Crit);
+        }
+        if !fumbles.is_empty() {
+            self.emit_priority(SoundEvent::Fumble);
+        }
+        match self.verdict() {
+            Some((true, _)) => self.emit_priority(SoundEvent::Success),
+            Some((false, _)) => self.emit_priority(SoundEvent::Failure),
+            None => {}
+        }
+    }
+
+    /// Spray celebration glyphs from a die's centre: a gold radial burst for a
+    /// crit, a small grey slump of dust for a fumble.
+    fn burst(&mut self, x: f32, y: f32, bright: bool) {
+        let (cx, cy) = (x + DIE_W / 2.0, y + DIE_H / 2.0);
+        let n = if bright { CRIT_PARTICLES } else { 6 };
+        for i in 0..n {
+            let angle =
+                (i as f32 / n as f32) * std::f32::consts::TAU + self.rng.gen_range(-0.2..=0.2);
+            // Fumble dust barely rises; crit sparks fly.
+            let speed = if bright {
+                self.rng.gen_range(9.0..=20.0)
+            } else {
+                self.rng.gen_range(2.0..=5.0)
+            };
+            let glyph = if bright {
+                ['✦', '*', '·'][i % 3]
+            } else {
+                '·'
+            };
+            self.particles.push(Particle {
+                x: cx,
+                y: cy,
+                vx: angle.cos() * speed * 1.8, // terminal cells are tall; widen the spray
+                vy: angle.sin() * speed - if bright { 6.0 } else { 0.0 },
+                age: 0.0,
+                life: if bright {
+                    self.rng.gen_range(0.7..=1.2)
+                } else {
+                    self.rng.gen_range(0.4..=0.8)
+                },
+                glyph,
+                bright,
+            });
+        }
+    }
+
+    /// Drift, fall, and expire the celebration glyphs. Light gravity so a crit
+    /// burst blooms and rains instead of dropping like rocks.
+    fn update_particles(&mut self, dt: f32) {
+        let (maxx, maxy) = (self.arena_w.max(1.0), self.arena_h.max(1.0));
+        for p in &mut self.particles {
+            p.age += dt;
+            p.vy += GRAVITY * 0.25 * dt;
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            // Out of the arena = done, a touch early is fine.
+            if p.x < -1.0 || p.x > maxx || p.y > maxy {
+                p.age = p.life;
+            }
+        }
+        self.particles.retain(|p| p.age < p.life);
     }
 
     /// Push apart any overlapping pairs of dice (axis-aligned boxes). Settled
     /// dice act as immovable obstacles so piles build from the bottom up.
     fn resolve_collisions(&mut self, maxx: f32, maxy: f32) {
         let n = self.dice.len();
-        for _ in 0..COLLISION_ITERS {
+        let mut knocks: Vec<SoundEvent> = Vec::new();
+        for iter in 0..COLLISION_ITERS {
             for i in 0..n {
                 for j in (i + 1)..n {
                     let (left, right) = self.dice.split_at_mut(j);
-                    resolve_pair(&mut left[i], &mut right[0]);
+                    let (a, b) = (&mut left[i], &mut right[0]);
+                    let closing = resolve_pair(a, b);
+                    // Only the first pass is an audible strike; later passes
+                    // re-separate the same contact and would double-report.
+                    // A dense pool striking itself is O(n²) contacts a frame,
+                    // so stop collecting once a frame's worth of near-identical
+                    // clicks is already more than anyone can hear.
+                    if iter == 0 && knocks.len() < KNOCK_BUDGET {
+                        if let Some(speed) = closing {
+                            if speed > SOUND_SPEED_MIN {
+                                knocks.push(SoundEvent::Knock {
+                                    sides: a.sides.max(b.sides),
+                                    speed,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -367,6 +846,9 @@ impl App {
                 die.x = die.x.clamp(0.0, maxx);
                 die.y = die.y.clamp(0.0, maxy);
             }
+        }
+        for ev in knocks {
+            self.emit(ev);
         }
     }
 
@@ -465,6 +947,7 @@ impl App {
             die.vx = 0.0;
             die.vy = 0.0;
             resting.push((rest_x, rest_y));
+            let sides = die.sides;
 
             // Exploding: a die that comes to rest on a face meeting its condition
             // spawns one more die — but only once, and only while its term is
@@ -479,6 +962,7 @@ impl App {
                     }
                 }
             }
+            self.emit(SoundEvent::Settle { sides });
         }
 
         // Toss any dice the just-settled dice exploded into. They drop from the
@@ -496,11 +980,12 @@ impl App {
     /// Toss a single die from a random spot near the top, like the opening
     /// throw. Used for explosion spawns that appear mid-animation.
     fn launch(&mut self, die: &mut Die, maxx: f32, maxy: f32) {
-        die.x = self.rng.gen_range(0.0..=maxx.max(0.01));
-        die.y = self.rng.gen_range(0.0..=(maxy * 0.35).max(0.01));
-        die.vx = self.rng.gen_range(-42.0..=42.0);
-        die.vy = self.rng.gen_range(-22.0..=18.0);
-        die.settled = false;
+        die.launch_at(
+            self.rng.gen_range(0.0..=maxx.max(0.01)),
+            self.rng.gen_range(0.0..=(maxy * 0.35).max(0.01)),
+            self.rng.gen_range(-42.0..=42.0),
+            self.rng.gen_range(-22.0..=18.0),
+        );
     }
 
     pub fn all_settled(&self) -> bool {
@@ -541,10 +1026,22 @@ impl App {
 
     /// Compute the statistics pane's contents for the current input: the
     /// theoretical distribution (by Monte-Carlo sampling, so every modifier is
-    /// handled) plus a summary of the session's history. Returns `None` (with the
+    /// handled) plus a summary of the session's history. Returns `Err` (with the
     /// parse error) if the expression doesn't parse.
-    pub fn stats(&self) -> Result<Stats, String> {
-        let roll = parse::parse(self.input.trim())?;
+    ///
+    /// Memoized on (expression, history length): the render loop calls this
+    /// every frame while the stats pane is open, and 20 000 samples per frame
+    /// is a core of wasted heat for bit-identical numbers — the sample RNG is
+    /// seeded from exactly the values in the key.
+    pub fn stats(&mut self) -> Result<Stats, String> {
+        let expr = self.input.trim().to_string();
+        if let Some((k_expr, k_rolls, stats)) = &self.stats_cache {
+            if *k_expr == expr && *k_rolls == self.history.len() {
+                return Ok(stats.clone());
+            }
+        }
+
+        let roll = parse::parse(&expr)?;
 
         // Sample the expression many times to estimate its distribution.
         let mut sample_rng = StdRng::seed_from_u64(self.history.len() as u64 ^ 0x5715_d1ce);
@@ -560,24 +1057,33 @@ impl App {
         }
         let mean = sum as f64 / STAT_SAMPLES as f64;
 
+        // A staked expression also gets its odds of succeeding, judged by the
+        // same check() as the real verdict.
+        let success_odds = roll.target.map(|t| {
+            totals.iter().filter(|&&v| check(v, t).0).count() as f64 / STAT_SAMPLES as f64
+        });
+
         // A coarse histogram over the observed range for the little curve.
         let dist = histogram(&totals, lo, hi);
 
         // Session history for the current expression (and overall).
-        let expr = self.input.trim().to_string();
         let here: Vec<&HistoryEntry> = self.history.iter().filter(|e| e.expr == expr).collect();
         let session = SessionStats::from(&here);
 
-        Ok(Stats {
-            expr,
+        let stats = Stats {
+            expr: expr.clone(),
             samples: STAT_SAMPLES,
             min: lo,
             max: hi,
             mean,
+            target: roll.target,
+            success_odds,
             dist,
             session,
             total_rolls: self.history.len(),
-        })
+        };
+        self.stats_cache = Some((expr, self.history.len(), stats.clone()));
+        Ok(stats)
     }
 }
 
@@ -596,6 +1102,10 @@ pub struct Stats {
     pub min: i32,
     pub max: i32,
     pub mean: f64,
+    /// The `vs N` target, when the expression is staked.
+    pub target: Option<i32>,
+    /// Estimated chance the staked roll succeeds (present iff `target` is).
+    pub success_odds: Option<f64>,
     /// Up to a handful of buckets spanning min..=max, for a sparkline-ish curve.
     pub dist: Vec<Bucket>,
     /// Stats over the rolls of *this* expression actually made this session.
@@ -707,7 +1217,11 @@ fn sample_total(roll: &Roll, rng: &mut StdRng) -> i32 {
             keep_n_values(&mut pool[..base], n, high);
         }
 
-        let term_sum: i32 = pool.iter().filter(|&&(_, k)| k).map(|&(v, _)| v as i32).sum();
+        let term_sum: i32 = pool
+            .iter()
+            .filter(|&&(_, k)| k)
+            .map(|&(v, _)| v as i32)
+            .sum();
         total += term_sum * mult;
     }
     total
@@ -721,6 +1235,11 @@ pub struct OutcomeDie {
     pub kept: bool,
     /// Whether this die was spawned by an explosion (vs. a base-pool die).
     pub exploded: bool,
+    /// A kept die on its max face ([`crit_face`]) — the same call the arena
+    /// celebrates, so JSON consumers never re-derive the rule.
+    pub crit: bool,
+    /// A kept die on a 1 ([`fumble_face`]).
+    pub fumble: bool,
 }
 
 /// The result of evaluating one dice term headlessly: its dice and subtotal.
@@ -747,6 +1266,15 @@ pub struct Outcome {
     /// The flat `+N`/`-N` modifier.
     pub modifier: i32,
     pub total: i32,
+    /// The `vs N` target, when the roll was staked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<i32>,
+    /// Whether the total met or beat the target (present iff `target` is).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    /// total − target: how far the check succeeded or failed by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub margin: Option<i32>,
 }
 
 /// Evaluate a parsed roll once into a full breakdown (every die, kept/exploded
@@ -771,6 +1299,8 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
                 value: rng.gen_range(1..=term.sides),
                 kept: true,
                 exploded: false,
+                crit: false,
+                fumble: false,
             })
             .collect();
 
@@ -783,6 +1313,8 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
                         value: rng.gen_range(1..=term.sides),
                         kept: true,
                         exploded: true,
+                        crit: false,
+                        fumble: false,
                     });
                     spawned += 1;
                 }
@@ -802,6 +1334,13 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
             keep_n_outcome(&mut dice[..base], n, high);
         }
 
+        // Crit/fumble is judged after keep/drop — a dropped 20 celebrates
+        // nothing — with the same face rules the arena uses.
+        for d in &mut dice {
+            d.crit = d.kept && crit_face(term.sides, d.value);
+            d.fumble = d.kept && fumble_face(term.sides, d.value);
+        }
+
         let kept_sum: i32 = dice.iter().filter(|d| d.kept).map(|d| d.value as i32).sum();
         let subtotal = kept_sum * mult;
         total += subtotal;
@@ -815,11 +1354,16 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
         });
     }
 
+    // The staked verdict: the same check() App::verdict calls.
+    let checked = roll.target.map(|t| check(total, t));
     Outcome {
         expression: expression.to_string(),
         terms,
         modifier: roll.modifier,
         total,
+        target: roll.target,
+        success: checked.map(|(s, _)| s),
+        margin: checked.map(|(_, m)| m),
     }
 }
 
@@ -958,9 +1502,12 @@ fn penetration(ax: f32, ay: f32, bx: f32, by: f32) -> (f32, f32) {
 /// normal. Dice are equal-size axis-aligned boxes, so this is plain AABB:
 /// resolve along the axis of least penetration. A settled die is immovable, so
 /// moving dice get pushed off it and piles build from the bottom up.
-fn resolve_pair(a: &mut Die, b: &mut Die) {
+///
+/// Returns the closing speed along the contact normal when the pair actually
+/// struck (approaching, not just overlapping) — the foley's cue for a knock.
+fn resolve_pair(a: &mut Die, b: &mut Die) -> Option<f32> {
     if a.settled && b.settled {
-        return; // two resting dice: never nudge them
+        return None; // two resting dice: never nudge them
     }
 
     // Equal extents, so the centre offset equals the top-left offset.
@@ -968,7 +1515,7 @@ fn resolve_pair(a: &mut Die, b: &mut Die) {
     let dy = a.y - b.y;
     let (px, py) = penetration(a.x, a.y, b.x, b.y);
     if px <= 0.0 || py <= 0.0 {
-        return; // not touching
+        return None; // not touching
     }
 
     // A settled die yields nothing; otherwise split the correction evenly.
@@ -985,7 +1532,9 @@ fn resolve_pair(a: &mut Die, b: &mut Die) {
         let n = if dx >= 0.0 { 1.0 } else { -1.0 };
         a.x += n * px * a_share;
         b.x -= n * px * b_share;
+        let closing = -(a.vx - b.vx) * n;
         resolve_velocity(&mut a.vx, &mut b.vx, n, a.settled, b.settled);
+        (closing > 0.0).then_some(closing)
     } else {
         // Vertical contact: bounce and kill tiny hops so stacks can come to rest.
         let n = if dy >= 0.0 { 1.0 } else { -1.0 };
@@ -1001,7 +1550,11 @@ fn resolve_pair(a: &mut Die, b: &mut Die) {
         // how far its centre overhangs the die below, so it rolls off the edge.
         // (overhang/DIE_W is the signed overhang fraction.) The kick is capped so
         // a hard, far-overhanging slam can't fling a die across the arena.
-        let (upper, lower) = if dy < 0.0 { (&mut *a, &*b) } else { (&mut *b, &*a) };
+        let (upper, lower) = if dy < 0.0 {
+            (&mut *a, &*b)
+        } else {
+            (&mut *b, &*a)
+        };
         if closing > 0.0 && !upper.settled {
             let kick = (upper.x - lower.x) / DIE_W * closing * TOPPLE_FACTOR;
             upper.vx += kick.clamp(-TOPPLE_MAX, TOPPLE_MAX);
@@ -1022,6 +1575,7 @@ fn resolve_pair(a: &mut Die, b: &mut Die) {
                 d.vx = 0.0;
             }
         }
+        (closing > 0.0).then_some(closing)
     }
 }
 
@@ -1042,12 +1596,12 @@ fn resolve_velocity(va: &mut f32, vb: &mut f32, n: f32, a_static: bool, b_static
         }
         (true, false) => {
             if *vb * n > 0.0 {
-                *vb = -e * *vb;
+                *vb *= -e;
             }
         }
         (false, true) => {
             if *va * n < 0.0 {
-                *va = -e * *va;
+                *va *= -e;
             }
         }
         (true, true) => {}
@@ -1077,11 +1631,20 @@ mod tests {
             input: input.to_string(),
             dice: Vec::new(),
             modifier: 0,
+            target: None,
             error: None,
             arena_w: 60.0,
             arena_h: 20.0,
             spawned: false,
             needs_spawn: false,
+            shake: None,
+            pending_throw: None,
+            last_throw: None,
+            particles: Vec::new(),
+            sounds: Vec::new(),
+            muted: false,
+            stats_cache: None,
+            mute_key: false,
             explosions: Vec::new(),
             history: Vec::new(),
             pane: Pane::None,
@@ -1090,6 +1653,461 @@ mod tests {
         };
         app.roll();
         app
+    }
+
+    /// Step `app` for `secs` of simulated time without asserting anything.
+    fn tick(app: &mut App, secs: f32) {
+        let frames = (secs * 60.0) as usize;
+        for _ in 0..frames {
+            app.update(1.0 / 60.0);
+        }
+    }
+
+    #[test]
+    fn power_starts_at_zero_and_stays_in_unit_range() {
+        let mut app = seeded("", 1);
+        app.input = "3d6".into();
+        app.start_shake();
+        assert!(app.shaking());
+        assert_eq!(app.power(), 0.0, "power starts from a standstill");
+        // Sample a few seconds of shaking: power must stay in 0..=1 and move.
+        let mut peak = 0.0f32;
+        for _ in 0..300 {
+            app.update(1.0 / 60.0);
+            let p = app.power();
+            assert!((0.0..=1.0).contains(&p), "power {p} escaped 0..=1");
+            peak = peak.max(p);
+        }
+        assert!(peak > 0.95, "power never came near its peak (max {peak})");
+    }
+
+    #[test]
+    fn shaking_rolls_nothing_until_released() {
+        let mut app = seeded("", 2);
+        app.input = "3d6".into();
+        app.start_shake();
+        tick(&mut app, 1.0);
+        assert!(app.dice.is_empty(), "dice appeared before the throw");
+        assert!(app.history.is_empty());
+
+        // Cancelling puts the dice down: still nothing rolled.
+        app.cancel_shake();
+        assert!(!app.shaking());
+        assert!(app.dice.is_empty(), "cancelling a shake must not roll");
+    }
+
+    #[test]
+    fn a_bad_expression_errors_at_pickup_not_at_release() {
+        let mut app = seeded("", 3);
+        app.input = "nonsense".into();
+        app.start_shake();
+        assert!(!app.shaking(), "a bad expression must not start a shake");
+        assert!(app.error.is_some(), "the typo surfaces immediately");
+    }
+
+    #[test]
+    fn a_throw_launches_from_the_cup_and_settles_in_bounds() {
+        for seed in 0..20 {
+            let mut app = seeded("", seed);
+            app.input = "4d6".into();
+            app.start_shake();
+            tick(&mut app, 0.4); // release on the rise
+            let cup = app.cup_x();
+            app.throw();
+            assert!(!app.shaking());
+            assert_eq!(app.dice.len(), 4);
+
+            // The dice spawn out of the cup's mouth near the arena floor. The
+            // same update also runs a separation pass, which can shove
+            // co-spawned dice apart, so the bounds are generous.
+            app.update(1.0 / 60.0); // first update performs the spawn
+            let (maxx, maxy) = app.max_xy();
+            let avg_vy: f32 = app.dice.iter().map(|d| d.vy).sum::<f32>() / app.dice.len() as f32;
+            assert!(
+                avg_vy < 0.0,
+                "seed {seed}: the pool must launch upward on balance"
+            );
+            for d in &app.dice {
+                assert!(
+                    (d.x - (cup - DIE_W / 2.0)).abs() <= 3.0 * DIE_W,
+                    "seed {seed}: die spawned at x={} far from the cup at {cup}",
+                    d.x
+                );
+                assert!(
+                    d.y >= maxy - 3.0 - 2.0 * DIE_H,
+                    "seed {seed}: die spawned at y={} nowhere near the floor",
+                    d.y
+                );
+            }
+
+            // ...and the roll still converges inside the arena like any other.
+            settle(&mut app, 20000).expect("thrown dice never settled");
+            for d in &app.dice {
+                assert!(d.x >= -0.01 && d.x <= maxx + 0.01);
+                assert!(d.y >= -0.01 && d.y <= maxy + 0.01);
+            }
+            assert_eq!(
+                app.history.len(),
+                1,
+                "a thrown roll is recorded like any other"
+            );
+        }
+    }
+
+    #[test]
+    fn throw_power_shapes_the_launch_but_not_the_values() {
+        // Same seed: the faces must be identical however hard you throw,
+        // because power only feeds the trajectory, never the RNG draw order.
+        let faces = |shake_secs: f32| -> (Vec<u32>, f32) {
+            let mut app = seeded("", 42);
+            app.input = "5d20".into();
+            app.start_shake();
+            tick(&mut app, shake_secs);
+            let power = app.power();
+            app.throw();
+            let mut vals: Vec<u32> = app.dice.iter().map(|d| d.final_value).collect();
+            vals.sort_unstable();
+            (vals, power)
+        };
+        // ~0.8s is near the power peak; ~1.55s is near the trough.
+        let (hard_vals, hard_power) = faces(0.8);
+        let (soft_vals, soft_power) = faces(1.55);
+        assert!(
+            hard_power > 0.9,
+            "expected a near-peak release, got {hard_power}"
+        );
+        assert!(
+            soft_power < 0.2,
+            "expected a near-trough release, got {soft_power}"
+        );
+        assert_eq!(
+            hard_vals, soft_vals,
+            "throw power leaked into the roll values"
+        );
+    }
+
+    #[test]
+    fn a_full_power_throw_leaves_the_cup_faster_than_a_lob() {
+        let launch_speed = |shake_secs: f32, seed: u64| -> f32 {
+            let mut app = seeded("", seed);
+            app.input = "3d6".into();
+            app.start_shake();
+            tick(&mut app, shake_secs);
+            app.throw();
+            app.update(1.0 / 60.0); // spawn
+            app.dice
+                .iter()
+                .map(|d| (d.vx * d.vx + d.vy * d.vy).sqrt())
+                .fold(0.0, f32::max)
+        };
+        for seed in 0..10 {
+            let rocket = launch_speed(0.8, seed);
+            let lob = launch_speed(1.55, seed);
+            assert!(
+                rocket > lob * 1.5,
+                "seed {seed}: rocket {rocket:.1} not clearly faster than lob {lob:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn staked_roll_reaches_a_verdict_only_once_settled() {
+        for seed in 0..30 {
+            let mut app = seeded("d20+2 vs 12", seed);
+            assert_eq!(app.target, Some(12));
+            assert_eq!(app.verdict(), None, "no verdict while dice are falling");
+            settle(&mut app, 6000).expect("never settled");
+            let (success, margin) = app.verdict().expect("settled roll must have a verdict");
+            assert_eq!(margin, app.total() - 12);
+            assert_eq!(success, app.total() >= 12, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_natural_20_bursts_gold_and_rings() {
+        // Find a seed whose d20 lands a 20, and one that lands a 1.
+        let mut found = (false, false);
+        for seed in 0..300 {
+            let mut app = seeded("d20", seed);
+            let v = app.dice[0].final_value;
+            if v != 20 && v != 1 {
+                continue;
+            }
+            settle(&mut app, 6000).expect("never settled");
+            if v == 20 {
+                assert!(app.crit_dice().count() == 1);
+                assert!(
+                    app.particles.iter().any(|p| p.bright),
+                    "seed {seed}: no gold burst for a natural 20"
+                );
+                assert!(app.sounds.contains(&SoundEvent::Crit), "no crit ring");
+                found.0 = true;
+            } else {
+                assert!(app.fumble_dice().count() == 1);
+                assert!(
+                    app.particles.iter().any(|p| !p.bright),
+                    "seed {seed}: no dust for a natural 1"
+                );
+                assert!(app.sounds.contains(&SoundEvent::Fumble), "no fumble thud");
+                found.1 = true;
+            }
+            if found == (true, true) {
+                return;
+            }
+        }
+        panic!("seed range produced neither a 20 nor a 1: {found:?}");
+    }
+
+    #[test]
+    fn any_die_type_crits_on_its_max_and_fumbles_on_one() {
+        // A d6 landing a 6 earns the same gold as a d20 landing a 20…
+        let mut found = (false, false);
+        for seed in 0..200 {
+            let mut app = seeded("d6", seed);
+            let v = app.dice[0].final_value;
+            if v != 6 && v != 1 {
+                continue;
+            }
+            settle(&mut app, 6000).expect("never settled");
+            if v == 6 {
+                assert_eq!(
+                    app.crit_dice().count(),
+                    1,
+                    "seed {seed}: a maxed d6 is a crit"
+                );
+                assert!(
+                    app.particles.iter().any(|p| p.bright),
+                    "no gold for a maxed d6"
+                );
+                assert!(app.sounds.contains(&SoundEvent::Crit));
+                found.0 = true;
+            } else {
+                assert_eq!(
+                    app.fumble_dice().count(),
+                    1,
+                    "seed {seed}: a d6 on 1 fumbles"
+                );
+                assert!(app.sounds.contains(&SoundEvent::Fumble));
+                found.1 = true;
+            }
+            if found == (true, true) {
+                return;
+            }
+        }
+        panic!("seed range produced neither a 6 nor a 1 on a d6: {found:?}");
+    }
+
+    #[test]
+    fn dropped_dice_never_crit() {
+        // Disadvantage where the *dropped* die maxed: no crit, no gold.
+        for seed in 0..500 {
+            let mut app = seeded("2d20kl1", seed);
+            let dropped_max = app.dice.iter().any(|d| !d.kept && d.final_value == 20);
+            let kept_max = app.dice.iter().any(|d| d.kept && d.final_value == 20);
+            if !dropped_max || kept_max {
+                continue;
+            }
+            settle(&mut app, 6000).expect("never settled");
+            assert_eq!(
+                app.crit_dice().count(),
+                0,
+                "seed {seed}: a dropped 20 must not crit"
+            );
+            assert!(
+                !app.sounds.contains(&SoundEvent::Crit),
+                "seed {seed}: dropped 20 rang"
+            );
+            return;
+        }
+        panic!("no seed dropped a 20 under disadvantage");
+    }
+
+    #[test]
+    fn many_crits_burst_per_die_but_ring_once() {
+        // A pool with several maxed dice: one gold burst per die, one chord.
+        for seed in 0..300 {
+            let mut app = seeded("8d4", seed);
+            let maxes = app.dice.iter().filter(|d| d.final_value == 4).count();
+            if maxes < 2 {
+                continue;
+            }
+            settle(&mut app, 12000).expect("never settled");
+            assert_eq!(app.crit_dice().count(), maxes);
+            let bursts = app.particles.iter().filter(|p| p.bright).count();
+            assert!(
+                bursts >= maxes * 6,
+                "seed {seed}: {maxes} crits but only {bursts} spark glyphs"
+            );
+            let rings = app
+                .sounds
+                .iter()
+                .filter(|s| **s == SoundEvent::Crit)
+                .count();
+            assert_eq!(rings, 1, "seed {seed}: the ring plays once per roll");
+            return;
+        }
+        panic!("no seed rolled two maxed d4s");
+    }
+
+    #[test]
+    fn particles_expire_rather_than_accumulate() {
+        for seed in 0..300 {
+            let mut app = seeded("d20", seed);
+            if app.dice[0].final_value != 20 {
+                continue;
+            }
+            settle(&mut app, 6000).expect("never settled");
+            assert!(!app.particles.is_empty());
+            tick(&mut app, 3.0); // long past every particle's life
+            assert!(app.particles.is_empty(), "particles never died");
+            return;
+        }
+        panic!("no natural 20 in seed range");
+    }
+
+    #[test]
+    fn a_staked_settle_emits_the_matching_verdict_sound() {
+        for seed in 0..30 {
+            let mut app = seeded("d20 vs 10", seed);
+            settle(&mut app, 6000).expect("never settled");
+            let (success, _) = app.verdict().unwrap();
+            let expect = if success {
+                SoundEvent::Success
+            } else {
+                SoundEvent::Failure
+            };
+            let opposite = if success {
+                SoundEvent::Failure
+            } else {
+                SoundEvent::Success
+            };
+            assert!(
+                app.sounds.contains(&expect),
+                "seed {seed}: verdict sound missing"
+            );
+            assert!(
+                !app.sounds.contains(&opposite),
+                "seed {seed}: wrong verdict sound"
+            );
+        }
+    }
+
+    #[test]
+    fn physics_makes_noise_and_the_queue_self_caps() {
+        // A big undrained roll: impacts/knocks/settles pile up but never
+        // exceed the cap (headless users don't drain).
+        let mut app = seeded("20d6", 4);
+        settle(&mut app, 20000).expect("never settled");
+        assert!(!app.sounds.is_empty(), "a full roll should make some noise");
+        assert!(app.sounds.len() <= MAX_SOUNDS, "queue exceeded its cap");
+        assert!(
+            app.sounds
+                .iter()
+                .any(|s| matches!(s, SoundEvent::Settle { .. })),
+            "no settle knock recorded"
+        );
+    }
+
+    #[test]
+    fn a_fresh_shake_does_not_inherit_a_stale_rattle() {
+        // Regression: the sway half-cycle used to be remembered across shakes,
+        // so every pickup after the first opened with a phantom rattle tick.
+        let mut app = seeded("", 6);
+        app.input = "3d6".into();
+        app.start_shake();
+        tick(&mut app, 1.0);
+        app.cancel_shake();
+        app.sounds.clear();
+
+        app.start_shake();
+        app.update(1.0 / 60.0);
+        assert!(
+            !app.sounds
+                .iter()
+                .any(|s| matches!(s, SoundEvent::Rattle { .. })),
+            "a fresh shake must not open with a leftover rattle tick"
+        );
+    }
+
+    #[test]
+    fn muting_empties_the_sound_queue_at_the_source() {
+        let mut app = seeded("3d6", 1);
+        settle(&mut app, 6000).expect("never settled");
+        assert!(!app.sounds.is_empty(), "a roll should queue some noise");
+
+        // Muted: the queue is cleared but nothing is handed over.
+        app.muted = true;
+        assert!(
+            app.take_sounds().is_empty(),
+            "muted take_sounds must return nothing"
+        );
+        assert!(
+            app.sounds.is_empty(),
+            "muted take_sounds must still clear the queue"
+        );
+
+        // Unmuted: events flow again.
+        app.muted = false;
+        app.input = "3d6".into();
+        app.roll();
+        settle(&mut app, 6000).expect("never settled");
+        assert!(
+            !app.take_sounds().is_empty(),
+            "unmuted take_sounds must hand events over"
+        );
+    }
+
+    #[test]
+    fn the_throw_rolls_the_expression_locked_at_pickup() {
+        // The shake snapshots the input: whatever mutates it mid-shake, the
+        // throw rolls what was validated when the cup was lifted.
+        let mut app = seeded("", 8);
+        app.input = "2d6".into();
+        app.start_shake();
+        app.input = "9d9nonsense".into(); // bypasses the key router on purpose
+        app.throw();
+        assert!(app.error.is_none(), "the locked expression was valid");
+        assert_eq!(
+            app.dice.len(),
+            2,
+            "the throw must roll the snapshot, not the mutation"
+        );
+        assert_eq!(
+            app.input, "2d6",
+            "the input reverts to what was actually thrown"
+        );
+    }
+
+    #[test]
+    fn shaking_rattles_and_release_echo_fades() {
+        let mut app = seeded("", 5);
+        app.input = "3d6".into();
+        app.start_shake();
+        tick(&mut app, 0.8);
+        assert!(
+            app.sounds
+                .iter()
+                .any(|s| matches!(s, SoundEvent::Rattle { .. })),
+            "a shaken cup must rattle"
+        );
+        app.throw();
+        assert!(app.sounds.contains(&SoundEvent::Throw {
+            power: app.last_throw.unwrap().power
+        }));
+
+        // The echo (and, for a hard catch, the tremor) is up right after…
+        assert!(
+            app.release_echo().is_some(),
+            "no release echo after a throw"
+        );
+        assert!(
+            app.tremor() > 0.0,
+            "a near-peak throw should shake the arena"
+        );
+        // …and both die down.
+        tick(&mut app, 2.0);
+        assert_eq!(app.release_echo(), None, "the echo must fade");
+        assert_eq!(app.tremor(), 0.0, "the tremor must stop");
     }
 
     #[test]
@@ -1180,7 +2198,10 @@ mod tests {
                 "seed {seed}: {sixes} sixes but {spawned} spawned"
             );
             // Once settled, every die has had (and used up) its one explosion chance.
-            assert!(app.dice.iter().all(|d| d.exploded), "a settled die never got its explosion check");
+            assert!(
+                app.dice.iter().all(|d| d.exploded),
+                "a settled die never got its explosion check"
+            );
         }
     }
 
@@ -1333,7 +2354,10 @@ mod tests {
             }
         }
         for (i, d) in app.dice.iter().enumerate() {
-            eprintln!("  die {i}: x={:6.2} y={:6.2} settled={}", d.x, d.y, d.settled);
+            eprintln!(
+                "  die {i}: x={:6.2} y={:6.2} settled={}",
+                d.x, d.y, d.settled
+            );
         }
     }
 
@@ -1356,7 +2380,10 @@ mod tests {
                 assert!(
                     pen < 0.5,
                     "dice {i} and {j} overlap by {pen:.2} at ({},{}) / ({},{})",
-                    a.x, a.y, b.x, b.y
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y
                 );
             }
         }
@@ -1368,7 +2395,11 @@ mod tests {
         // stacks reach the ceiling and the stuck/over-tall paths kick in, but the
         // pool still converges. No settled die may end up outside the arena
         // (a regression guard for the once-unclamped rest position).
-        for (spec, w, h) in [("12d6", 20.0, 14.0), ("12d6", 18.0, 14.0), ("16d6", 22.0, 16.0)] {
+        for (spec, w, h) in [
+            ("12d6", 20.0, 14.0),
+            ("12d6", 18.0, 14.0),
+            ("16d6", 22.0, 16.0),
+        ] {
             for _ in 0..40 {
                 let mut app = App::new(spec.to_string());
                 app.arena_w = w;
@@ -1379,7 +2410,8 @@ mod tests {
                     assert!(
                         d.x >= -0.01 && d.x <= maxx + 0.01 && d.y >= -0.01 && d.y <= maxy + 0.01,
                         "{spec} die {i} settled out of bounds at ({}, {})",
-                        d.x, d.y
+                        d.x,
+                        d.y
                     );
                 }
             }
@@ -1409,7 +2441,7 @@ mod tests {
         let e = &app.history[0];
         assert_eq!(e.expr, "3d6+1");
         assert_eq!(e.values.len(), 3); // three kept dice
-        // total = sum of faces + 1, and matches what the entry stored.
+                                       // total = sum of faces + 1, and matches what the entry stored.
         let face_sum: i32 = e.values.iter().map(|&v| v as i32).sum();
         assert_eq!(e.total, face_sum + 1);
         assert_eq!(e.total, app.total());
@@ -1421,7 +2453,11 @@ mod tests {
         let mut app = seeded("2d20kh1", 9);
         settle(&mut app, 6000).expect("never settled");
         assert_eq!(app.history.len(), 1);
-        assert_eq!(app.history[0].values.len(), 1, "only the kept die is stored");
+        assert_eq!(
+            app.history[0].values.len(),
+            1,
+            "only the kept die is stored"
+        );
         assert_eq!(app.history[0].total, app.history[0].values[0] as i32);
     }
 
@@ -1446,7 +2482,7 @@ mod tests {
     fn sampled_stats_match_known_dice_ranges() {
         // 3d6: exactly 3..=18, average 10.5. Sampling should pin the bounds and
         // land close on the mean.
-        let app = seeded("3d6", 1);
+        let mut app = seeded("3d6", 1);
         let s = app.stats().expect("3d6 parses");
         assert_eq!(s.min, 3);
         assert_eq!(s.max, 18);
@@ -1462,7 +2498,11 @@ mod tests {
         let adv = App::new("2d20kh1".to_string()).stats().unwrap();
         assert_eq!(adv.min, 1);
         assert_eq!(adv.max, 20);
-        assert!(adv.mean > 12.0, "advantage mean {} should beat a flat d20", adv.mean);
+        assert!(
+            adv.mean > 12.0,
+            "advantage mean {} should beat a flat d20",
+            adv.mean
+        );
 
         // A flat *2 multiplier doubles the achievable range.
         let doubled = App::new("1d6*2".to_string()).stats().unwrap();
@@ -1494,4 +2534,3 @@ mod tests {
         assert!(app.stats().is_err());
     }
 }
-
