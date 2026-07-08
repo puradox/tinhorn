@@ -125,6 +125,36 @@ stats odds — all backed by one shared rule. Key routing is tested so a
 hotkey can never swallow a letter you need to type, and the foley synthesis
 is unit-tested for range, pitch ordering, and loudness scaling.
 
+## Releasing
+
+Releases are automated by [release-plz](https://release-plz.dev) across two
+workflows; a maintainer's only manual act is merging a PR.
+
+- **`.github/workflows/release-plz.yml`** (on push to `main`) keeps a standing
+  **Release PR** that bumps `Cargo.toml` and updates `CHANGELOG.md`. Merge it to
+  cut a release: release-plz publishes to crates.io, pushes the `vX.Y.Z` tag, and
+  creates the GitHub Release from the changelog.
+- **`.github/workflows/cd.yml`** (on that release being *published*) builds
+  `tinhorn` for four targets and attaches the archives plus `sha256` sums.
+
+Two repository secrets are required:
+
+- **`RELEASE_PLZ_TOKEN`** — a Personal Access Token with **Contents** and
+  **Pull requests** read/write (fine-grained, scoped to this repo; or classic
+  `repo`). release-plz runs under it so the release it publishes can trigger
+  `cd.yml`: the default `GITHUB_TOKEN` cannot trigger further workflow runs. As
+  a bonus it also lets CI run on the Release PR.
+- **`CARGO_REGISTRY_TOKEN`** — a crates.io API token, for the publish.
+
+Two things worth knowing:
+
+- release-plz reads **conventional-commit** prefixes (`feat:`, `fix:`) to choose
+  the version bump and group the changelog. Commits without them still release,
+  but as a patch bump under a flat changelog.
+- `cd.yml` covers the four targets that build natively on GitHub runners.
+  `aarch64-unknown-linux-gnu` is left out on purpose: rodio links ALSA, so
+  cross-compiling to another Linux arch needs that C library for the target too.
+
 ## Licensing
 
 Unless you explicitly state otherwise, any contribution intentionally

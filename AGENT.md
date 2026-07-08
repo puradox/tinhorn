@@ -135,6 +135,13 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 - The README is user-facing only; design notes, test docs, and the invariant
   list for humans live in `CONTRIBUTING.md`. When a module description or
   invariant changes, update CONTRIBUTING.md alongside this file.
+- **Commits follow [Conventional Commits](https://www.conventionalcommits.org)**:
+  `type(optional scope): description`, where type is one of
+  `feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert` (append `!`
+  before the colon for a breaking change). release-plz reads these to choose
+  the version bump and group the changelog, so they earn their keep. A
+  PreToolUse hook (`.claude/hooks/conventional-commit.sh`) blocks any
+  `git commit -m` whose subject doesn't match — write the type in from the start.
 
 ## Voice & tone — "the honest tinhorn"
 
