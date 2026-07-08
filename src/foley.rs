@@ -58,7 +58,10 @@ impl Foley {
             .name("tinhorn-foley".into())
             .spawn(move || audio_thread(rx))
             .expect("spawn audio thread");
-        Foley { tx, _thread: thread }
+        Foley {
+            tx,
+            _thread: thread,
+        }
     }
 
     /// Fire-and-forget: hand this event to the audio thread. Never blocks, and
