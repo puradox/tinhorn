@@ -11,7 +11,16 @@
 //! the OS raises a one-time *microphone* prompt for any process that starts
 //! playback — even Apple's `afplay`. That's the OS, not this code (no input
 //! path exists here); the README's Sound section documents it, and the lazy
-//! init in `main.rs::run` keeps `--mute` sessions from ever asking.
+//! spawn in `main.rs::run` (the audio thread only starts on the first audible
+//! event) keeps `--mute` sessions from ever asking.
+//!
+//! The device lives on its own thread ([`Foley::spawn`]): opening it blocks for
+//! tens of milliseconds while the OS audio stack wakes up, and on the ~60 fps
+//! render loop that shows up as a one-frame hitch on the first sound. The
+//! thread absorbs that cost; the render loop only posts [`SoundEvent`]s to it.
+
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::JoinHandle;
 
 use rodio::buffer::SamplesBuffer;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink};
@@ -24,43 +33,86 @@ const MASTER: f32 = 0.38;
 /// The speed at which an impact reaches full loudness (arena cells/second).
 const SPEED_FULL: f32 = 90.0;
 
-/// A live connection to the default audio output.
+/// A handle to the audio thread. Emitting a sound posts it over a channel; the
+/// thread owns the output device and does the mixing, so the render loop never
+/// blocks on the audio stack.
 pub struct Foley {
-    /// Keeping the sink alive keeps the device open; drop = silence.
-    sink: MixerDeviceSink,
+    /// Dropped on shutdown, which closes the channel and lets the thread exit.
+    tx: Sender<SoundEvent>,
+    /// Held only to tie the thread's lifetime to this handle.
+    _thread: JoinHandle<()>,
 }
 
 impl Foley {
-    /// Open the default output device, or `None` when there isn't one — the
-    /// dice just roll quietly.
+    /// Start the audio thread and return immediately.
     ///
-    /// Deliberately NOT `open_default_sink()`: its fallback enumerates every
-    /// audio device (microphones included), which is its own way to draw the
-    /// macOS microphone prompt, and it eprintln!s over the TUI on failure.
-    /// If the one default output device won't open, silence is the correct
-    /// fallback.
-    pub fn new() -> Option<Foley> {
-        let mut sink = DeviceSinkBuilder::from_default_device()
-            .ok()?
-            .open_stream()
-            .ok()?;
-        // rodio logs to stderr on drop by default; in a TUI that's garbage
-        // sprayed over the restored terminal.
-        sink.log_on_drop(false);
-        Some(Foley { sink })
-    }
-
-    /// Fire-and-forget: mix this event's sound into whatever is playing.
-    pub fn play(&self, ev: SoundEvent) {
-        let samples = synth(ev);
-        if !samples.is_empty() {
-            let mono = std::num::NonZero::<u16>::MIN; // 1 channel
-            let rate = std::num::NonZero::new(RATE).expect("RATE is non-zero");
-            self.sink
-                .mixer()
-                .add(SamplesBuffer::new(mono, rate, samples));
+    /// Opening the output device blocks for tens of milliseconds while the OS
+    /// audio stack starts up; doing it on this thread keeps that cost off the
+    /// render loop (otherwise a visible hitch on the first sound). The caller
+    /// decides *when* to spawn — on the first audible, unmuted event — so a
+    /// muted session never starts the thread and never touches the audio APIs
+    /// (see the module docs on the macOS microphone prompt).
+    pub fn spawn() -> Foley {
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("tinhorn-foley".into())
+            .spawn(move || audio_thread(rx))
+            .expect("spawn audio thread");
+        Foley {
+            tx,
+            _thread: thread,
         }
     }
+
+    /// Fire-and-forget: hand this event to the audio thread. Never blocks, and
+    /// never fails loudly — if the thread has gone (no output device) the send
+    /// is silently dropped and the dice roll on in silence.
+    pub fn play(&self, ev: SoundEvent) {
+        let _ = self.tx.send(ev);
+    }
+}
+
+/// The audio thread: open the device once, then render and mix every event
+/// until the channel closes (the app dropped its [`Foley`]).
+///
+/// Deliberately NOT `open_default_sink()`: its fallback enumerates every audio
+/// device (microphones included), which is its own way to draw the macOS
+/// microphone prompt, and it eprintln!s over the TUI on failure. If the one
+/// default output device won't open, silence is the correct fallback.
+fn audio_thread(rx: Receiver<SoundEvent>) {
+    let Some(sink) = open_sink() else {
+        // No output device: keep draining so `play` never blocks a sender, and
+        // exit once the app drops its end of the channel.
+        for _ in rx {}
+        return;
+    };
+
+    // Discard whatever piled up while the device was opening — those impacts
+    // are already in the past on screen, so playing them now would be a stale
+    // burst rather than foley. Sound simply catches up from the next event on.
+    while rx.try_recv().is_ok() {}
+
+    let mono = std::num::NonZero::<u16>::MIN; // 1 channel
+    let rate = std::num::NonZero::new(RATE).expect("RATE is non-zero");
+    for ev in rx {
+        let samples = synth(ev);
+        if !samples.is_empty() {
+            sink.mixer().add(SamplesBuffer::new(mono, rate, samples));
+        }
+    }
+}
+
+/// Open the default output device, or `None` when there isn't one — the dice
+/// just roll quietly.
+fn open_sink() -> Option<MixerDeviceSink> {
+    let mut sink = DeviceSinkBuilder::from_default_device()
+        .ok()?
+        .open_stream()
+        .ok()?;
+    // rodio logs to stderr on drop by default; in a TUI that's garbage sprayed
+    // over the restored terminal.
+    sink.log_on_drop(false);
+    Some(sink)
 }
 
 /// A die's voice: smaller dice click higher, big dice knock deeper.
@@ -264,7 +316,11 @@ mod tests {
     #[test]
     #[ignore]
     fn audible_smoke_test() {
-        let foley = Foley::new().expect("no audio output device");
+        assert!(open_sink().is_some(), "no audio output device");
+        let foley = Foley::spawn();
+        // `spawn` is non-blocking; give the thread a moment to open the device
+        // so the first event isn't discarded as start-up backlog.
+        std::thread::sleep(std::time::Duration::from_millis(250));
         let script = [
             SoundEvent::Rattle { power: 0.4 },
             SoundEvent::Rattle { power: 0.9 },

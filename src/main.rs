@@ -60,7 +60,7 @@ fn main() -> io::Result<()> {
 
     // Interactive: launch the animated TUI. The dice are audible unless muted
     // (`--mute` starts muted; Ctrl-Q toggles) or there's no output device —
-    // audio opens lazily inside `run`, on the first sound that needs playing.
+    // audio spawns lazily inside `run`, on the first sound that needs playing.
     let mut terminal = ratatui::init();
 
     let mut app = match cli.seed {
@@ -161,12 +161,16 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut last = Instant::now();
 
-    // Audio opens lazily, on the first sound that actually needs playing. A
-    // `--mute` session never touches the audio APIs at all — on some macOS
-    // setups even opening playback draws a microphone permission prompt, and
-    // a muted session shouldn't be the one to draw it.
+    // Audio runs on its own thread, spawned lazily on the first sound that
+    // actually needs playing — for two reasons:
+    //   * opening the output device blocks for tens of ms while the OS audio
+    //     stack starts, which on the render loop is a visible hitch on the
+    //     first sound; the thread absorbs that cost instead.
+    //   * a `--mute` session emits no sound, so the thread never spawns and the
+    //     audio APIs are never touched — on some macOS setups even opening
+    //     playback draws a microphone prompt, and a muted session shouldn't be
+    //     the one to draw it.
     let mut sound: Option<foley::Foley> = None;
-    let mut sound_tried = false;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -190,18 +194,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         last = now;
         app.update(dt);
 
-        // Whatever the physics wanted heard, play (take_sounds returns nothing
-        // while muted). Impacts and knocks are additionally capped per frame:
-        // a dense pool can strike dozens of times inside 16ms, each play
-        // synthesizes a fresh buffer, and eight overlapping clicks already
-        // sound like a fistful of dice.
+        // Whatever the physics wanted heard, hand to the audio thread — which
+        // spawns on the first event, so a muted session (take_sounds returns
+        // nothing while muted) never starts it. Impacts and knocks are capped
+        // per frame: a dense pool can strike dozens of times inside 16ms, each
+        // one a fresh buffer to synthesize and mix, and eight overlapping
+        // clicks already sound like a fistful of dice.
         let mut clicks = 0usize;
         for ev in app.take_sounds() {
-            if !sound_tried {
-                sound_tried = true;
-                sound = foley::Foley::new();
-            }
-            let Some(f) = &sound else { break };
+            let f = sound.get_or_insert_with(foley::Foley::spawn);
             if matches!(
                 ev,
                 app::SoundEvent::Impact { .. } | app::SoundEvent::Knock { .. }
