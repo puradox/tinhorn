@@ -4,6 +4,13 @@
 
 # tinhorn
 
+<p align="center">
+  <a href="https://crates.io/crates/tinhorn"><img src="https://img.shields.io/crates/v/tinhorn.svg?logo=rust&logoColor=white" alt="crates.io"></a>
+  <a href="https://crates.io/crates/tinhorn"><img src="https://img.shields.io/crates/d/tinhorn.svg" alt="downloads"></a>
+  <a href="https://github.com/puradox/tinhorn/actions/workflows/ci.yml"><img src="https://github.com/puradox/tinhorn/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/crates/l/tinhorn.svg" alt="license: MIT OR Apache-2.0"></a>
+</p>
+
 Step right up: a terminal dice roller with a genuine tin-cup shake. Type
 your dice in the usual notation, rattle the cup, and let 'em fly — real
 physics on every bounce, real racket off every wall, and the dice land how
