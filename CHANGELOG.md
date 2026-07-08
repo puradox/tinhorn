@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/puradox/tinhorn/compare/v0.1.1...v0.1.2) - 2026-07-08
+
+### Added
+
+- *(tui)* edit the prompt with a caret and scroll overflowing panes ([#13](https://github.com/puradox/tinhorn/pull/13))
+
+### Other
+
+- *(foley)* open the audio device on a dedicated thread ([#12](https://github.com/puradox/tinhorn/pull/12))
+- add crates.io and status badges to README ([#10](https://github.com/puradox/tinhorn/pull/10))
+
 ## [0.1.1](https://github.com/puradox/tinhorn/compare/v0.1.0...v0.1.1) - 2026-07-08
 
 ### Added
