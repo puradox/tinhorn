@@ -64,9 +64,10 @@ Five small modules behind a 60 fps event loop:
 - **`cli`** — clap argument parsing and the one-shot output paths (bare
   total, verbose breakdown, JSON), plus the staked exit-code contract.
 - **`foley`** — procedural sound synthesis: `SoundEvent`s in, sample buffers
-  out (rodio), pitch from die size and loudness from impact speed. Opens
-  lazily on the first audible sound; degrades silently without an audio
-  device.
+  out (rodio), pitch from die size and loudness from impact speed. Runs on a
+  dedicated audio thread that spawns lazily on the first audible sound (so the
+  render loop never blocks on device start-up); degrades silently without an
+  audio device.
 
 The main loop draws a frame, polls for a key for up to one frame budget,
 advances the simulation by the real elapsed `dt`, then plays whatever the
@@ -91,11 +92,14 @@ Tests guard most of these, but know them before you lean on a wall:
   mode; Tab cycles the mode; Space separates notation.
 - **The help overlay fits a 28-row terminal.** A test pins it — trim a line
   before adding one.
-- **Audio opens the default output device only, lazily.** Never call rodio's
-  `open_default_sink()` or enumerate devices — the fallback walks every
-  audio device including microphones (its own way to draw the macOS mic
-  prompt) and prints to stderr over the TUI. There is no input path in this
-  program; if the default device won't open, go silent. Known and accepted:
+- **Audio opens the default output device only, lazily, on the audio thread.**
+  Opening it blocks for tens of ms, so it lives on a dedicated thread that
+  spawns on the first audible sound — never on the render loop, where it would
+  be a one-frame hitch. Never call rodio's `open_default_sink()` or enumerate
+  devices — the fallback walks every audio device including microphones (its
+  own way to draw the macOS mic prompt) and prints to stderr over the TUI.
+  There is no input path in this program; if the default device won't open, go
+  silent. Known and accepted:
   on macOS a duplex default output (USB interface, headset) draws a one-time
   microphone prompt for any playback, even `afplay` — that's the OS, not
   fixable in code; the README documents it.

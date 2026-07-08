@@ -90,12 +90,13 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 - **`foley`** — procedural sound. `App` emits pure `SoundEvent`s (impacts,
   knocks, settles, cup rattle, crit ring, verdicts); `synth()` renders them from
   physics parameters (die size → pitch, impact speed → loudness) with no assets;
-  `Foley` plays them via rodio, degrading silently with no audio device. On by
-  default; `--mute` starts muted, Ctrl-Q toggles. Audio initializes **lazily**
-  in `main.rs::run` on the first audible sound — a muted session never touches
-  audio APIs at all (macOS raises a one-time microphone prompt for playback on
-  duplex output devices; that's the OS, even `afplay` draws it — don't chase
-  it).
+  `Foley` plays them via rodio on a dedicated audio thread, degrading silently
+  with no audio device. On by default; `--mute` starts muted, Ctrl-Q toggles.
+  The thread spawns **lazily** in `main.rs::run` on the first audible sound
+  (opening the device blocks for tens of ms — off the render loop so it isn't a
+  frame hitch), and a muted session never spawns it, so it never touches audio
+  APIs at all (macOS raises a one-time microphone prompt for playback on duplex
+  output devices; that's the OS, even `afplay` draws it — don't chase it).
 
 ## Conventions worth knowing
 
@@ -123,11 +124,11 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 - Demo recordings: `DEMO_OUT=/tmp/d.json cargo test record_demo -- --ignored`
   dumps real rendered frames + per-frame sound events as JSON for the HTML demo
   player; `cargo test audible -- --ignored` plays the foley palette out loud.
-- Audio opens the **default output device only** (`foley.rs::Foley::new`).
-  Never call rodio's `open_default_sink()` or enumerate devices: the fallback
-  walks every audio device including microphones, which is its own way to
-  draw the macOS mic prompt, and it prints to stderr over the TUI. There is
-  no input path in this program; if the default device won't open, go silent.
+- Audio opens the **default output device only** (`foley.rs::open_sink`, on the
+  audio thread). Never call rodio's `open_default_sink()` or enumerate devices:
+  the fallback walks every audio device including microphones, which is its own
+  way to draw the macOS mic prompt, and it prints to stderr over the TUI. There
+  is no input path in this program; if the default device won't open, go silent.
   Note: on macOS with a duplex default output (USB interface, headset), the
   OS raises a one-time microphone prompt for ANY playback — even `afplay`.
   That is not fixable in code (a bespoke AudioUnit backend was tried and
