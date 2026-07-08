@@ -106,6 +106,7 @@ next to each other.
 | Input      | Meaning                              |
 | ---------- | ------------------------------------ |
 | `3d6`      | three six-sided dice                 |
+| `d%`       | percentile — shorthand for `d100`    |
 | `d6+d8`    | one d6 and one d8                    |
 | `d6d10`    | adjacency works as a separator       |
 | `d6,d12`   | commas work too                      |
