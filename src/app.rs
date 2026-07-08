@@ -249,6 +249,17 @@ impl RollMode {
 
 pub struct App {
     pub input: String,
+    /// Byte offset of the edit caret within `input`. Left/Right walk it,
+    /// typing and Backspace/Delete act at it. Kept on a char boundary and
+    /// never past the end by [`Self::cursor_byte`], which every reader goes
+    /// through, so a stale offset (e.g. after the input is reassigned) can't
+    /// panic.
+    pub cursor: usize,
+    /// Vertical scroll offset for whichever pop-out pane is open, in lines.
+    /// Up/Down nudge it; the renderer clamps it to the content that overflows
+    /// the pane and hands the clamped value back. Reset to 0 on every pane
+    /// change so each pane opens at its top.
+    pub pane_scroll: u16,
     pub dice: Vec<Die>,
     pub modifier: i32,
     /// `vs N` from the current roll: the total must meet or beat this.
@@ -311,6 +322,8 @@ impl App {
     fn with_rng(initial: String, rng: StdRng) -> Self {
         let mut app = App {
             input: String::new(),
+            cursor: 0,
+            pane_scroll: 0,
             dice: Vec::new(),
             modifier: 0,
             target: None,
@@ -335,9 +348,85 @@ impl App {
         };
         if !initial.trim().is_empty() {
             app.input = initial.trim().to_string();
+            app.cursor = app.input.len();
             app.roll();
         }
         app
+    }
+
+    /// The edit caret as a byte index that's safe to slice `input` at: never
+    /// past the end, always on a char boundary. Every insert/delete/move
+    /// helper and the renderer read the caret through here, so reassigning
+    /// `input` out from under a larger offset can never panic.
+    pub fn cursor_byte(&self) -> usize {
+        let mut c = self.cursor.min(self.input.len());
+        while !self.input.is_char_boundary(c) {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Insert a typed character at the caret and step over it.
+    pub fn input_insert(&mut self, c: char) {
+        let at = self.cursor_byte();
+        self.input.insert(at, c);
+        self.cursor = at + c.len_utf8();
+    }
+
+    /// Delete the character before the caret (Backspace): step the caret left,
+    /// then delete what's now under it.
+    pub fn input_backspace(&mut self) {
+        if self.cursor_byte() == 0 {
+            return;
+        }
+        self.cursor_left();
+        self.input_delete();
+    }
+
+    /// Delete the character under the caret (Delete); the caret stays put.
+    pub fn input_delete(&mut self) {
+        let at = self.cursor_byte();
+        if at < self.input.len() {
+            self.input.remove(at);
+        }
+        self.cursor = at;
+    }
+
+    /// Move the caret one character left, stopping at the start.
+    pub fn cursor_left(&mut self) {
+        let at = self.cursor_byte();
+        self.cursor = self.input[..at]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    /// Move the caret one character right, stopping at the end.
+    pub fn cursor_right(&mut self) {
+        let at = self.cursor_byte();
+        self.cursor = self.input[at..]
+            .chars()
+            .next()
+            .map(|c| at + c.len_utf8())
+            .unwrap_or(at);
+    }
+
+    /// Jump the caret to the start / end of the expression.
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.len();
+    }
+
+    /// Switch the visible pane and rewind its scroll to the top. Every pane
+    /// change routes through here so `pane` and `pane_scroll` can't drift apart
+    /// (a new pane-opening path can't forget to reset the scroll).
+    pub fn set_pane(&mut self, pane: Pane) {
+        self.pane = pane;
+        self.pane_scroll = 0;
     }
 
     /// Parse the current input and, on success, build a fresh pool of dice.
@@ -1686,6 +1775,8 @@ mod tests {
     fn seeded(input: &str, seed: u64) -> App {
         let mut app = App {
             input: input.to_string(),
+            cursor: input.len(),
+            pane_scroll: 0,
             dice: Vec::new(),
             modifier: 0,
             target: None,

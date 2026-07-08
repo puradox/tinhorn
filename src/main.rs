@@ -9,7 +9,8 @@
 //!   tinhorn --seed 42 3d6  # reproducible roll
 //!
 //! Interactive keys: Enter rolls in the current mode · Tab cycles the mode
-//! (shake → roll → insta) · ? help · Ctrl-H history · Ctrl-S stats ·
+//! (shake → roll → insta) · ←/→ move the caret in the expression (Home/End
+//! jump) · ↑/↓ scroll an open pane · ? help · Ctrl-H history · Ctrl-S stats ·
 //! Ctrl-Q mute · Esc quit
 
 mod app;
@@ -96,15 +97,15 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
     // a pane's key again closes it.
     match code {
         KeyCode::Char('?') => {
-            app.pane = toggle(app.pane, Pane::Help);
+            app.set_pane(toggle(app.pane, Pane::Help));
             return Action::Continue;
         }
         KeyCode::Char('h') if ctrl => {
-            app.pane = toggle(app.pane, Pane::History);
+            app.set_pane(toggle(app.pane, Pane::History));
             return Action::Continue;
         }
         KeyCode::Char('s') if ctrl => {
-            app.pane = toggle(app.pane, Pane::Stats);
+            app.set_pane(toggle(app.pane, Pane::Stats));
             return Action::Continue;
         }
         // Mute is global too. Q for "quiet" — Ctrl-M was the obvious chord,
@@ -117,11 +118,21 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
         _ => {}
     }
 
-    // While a pane is open it captures the rest of input: Esc/q close it,
-    // everything else is ignored so the hidden expression can't be edited blind.
+    // While a pane is open it captures the rest of input: Esc/q close it, the
+    // arrows scroll a pane too tall for the screen, and everything else is
+    // ignored so the hidden expression can't be edited blind. The scroll offset
+    // is clamped to the overflow at render time, so over-scrolling past the end
+    // corrects itself on the next frame.
     if app.pane != Pane::None {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-            app.pane = Pane::None;
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.set_pane(Pane::None),
+            KeyCode::Up => app.pane_scroll = app.pane_scroll.saturating_sub(1),
+            KeyCode::Down => app.pane_scroll = app.pane_scroll.saturating_add(1),
+            KeyCode::PageUp => app.pane_scroll = app.pane_scroll.saturating_sub(10),
+            KeyCode::PageDown => app.pane_scroll = app.pane_scroll.saturating_add(10),
+            KeyCode::Home => app.pane_scroll = 0,
+            KeyCode::End => app.pane_scroll = u16::MAX,
+            _ => {}
         }
         return Action::Continue;
     }
@@ -149,10 +160,15 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
             RollMode::Insta => app.insta_roll(),
         },
         KeyCode::Tab => app.mode = app.mode.next(),
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
-        KeyCode::Char(c) if !ctrl => app.input.push(c),
+        // Line editing on the expression: the caret walks with Left/Right (and
+        // jumps with Home/End), and inserts/deletes happen at it.
+        KeyCode::Left => app.cursor_left(),
+        KeyCode::Right => app.cursor_right(),
+        KeyCode::Home => app.cursor_home(),
+        KeyCode::End => app.cursor_end(),
+        KeyCode::Backspace => app.input_backspace(),
+        KeyCode::Delete => app.input_delete(),
+        KeyCode::Char(c) if !ctrl => app.input_insert(c),
         _ => {}
     }
     Action::Continue
@@ -490,6 +506,238 @@ mod tests {
         type_str(&mut app, "9d9");
         assert_eq!(app.input, "", "input changed while a pane was open");
         assert_eq!(app.pane, Pane::Stats);
+    }
+
+    #[test]
+    fn arrows_move_the_caret_and_edits_land_at_it() {
+        let mut app = App::new(String::new());
+        type_str(&mut app, "3d6");
+        // Typing leaves the caret at the end of the line.
+        assert_eq!(app.cursor, 3);
+
+        // Left steps back over the '6'; the next keystroke inserts there rather
+        // than at the end.
+        handle_key(&mut app, KeyCode::Left, false);
+        assert_eq!(app.cursor, 2);
+        handle_key(&mut app, KeyCode::Char('0'), false);
+        assert_eq!(app.input, "3d06", "the digit lands under the caret");
+        assert_eq!(app.cursor, 3);
+
+        // Backspace deletes the character before the caret (the '0' just typed).
+        handle_key(&mut app, KeyCode::Backspace, false);
+        assert_eq!(app.input, "3d6");
+        assert_eq!(app.cursor, 2);
+
+        // Delete removes the character under the caret (the '6').
+        handle_key(&mut app, KeyCode::Delete, false);
+        assert_eq!(app.input, "3d");
+        assert_eq!(app.cursor, 2);
+
+        // Home/End jump to the ends; an insert at Home prepends.
+        handle_key(&mut app, KeyCode::Home, false);
+        assert_eq!(app.cursor, 0);
+        handle_key(&mut app, KeyCode::Char('+'), false);
+        assert_eq!(app.input, "+3d");
+        handle_key(&mut app, KeyCode::End, false);
+        assert_eq!(app.cursor, app.input.len());
+
+        // The caret clamps at both ends — Right past the end and Left past the
+        // start are no-ops, not panics.
+        handle_key(&mut app, KeyCode::Right, false);
+        assert_eq!(app.cursor, app.input.len());
+        handle_key(&mut app, KeyCode::Home, false);
+        handle_key(&mut app, KeyCode::Left, false);
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn the_caret_renders_over_the_character_it_covers() {
+        use ratatui::style::Color;
+
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        type_str(&mut app, "3d6");
+        // Walk the caret back onto the 'd'.
+        handle_key(&mut app, KeyCode::Left, false); // over '6'
+        handle_key(&mut app, KeyCode::Left, false); // over 'd'
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        // Exactly one reverse-video cell (the block caret) is on screen, and it
+        // covers the character the caret sits on.
+        let buf = terminal.backend().buffer();
+        let caret: Vec<_> = buf
+            .content()
+            .iter()
+            .filter(|c| c.bg == Color::Cyan)
+            .collect();
+        assert_eq!(caret.len(), 1, "exactly one block caret is drawn");
+        assert_eq!(caret[0].symbol(), "d", "the caret covers the char under it");
+    }
+
+    #[test]
+    fn the_input_scrolls_horizontally_to_keep_the_caret_visible() {
+        use ratatui::style::Color;
+
+        // A narrow frame: the expression is wider than the input row, so without
+        // horizontal scrolling the end-of-line caret would clip off the edge.
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(24, 24)).unwrap();
+        type_str(&mut app, "d6+d6+d6+d6+d6+d6"); // 17 chars; caret at the end
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+
+        // The caret is still drawn (it scrolled into view rather than clipping).
+        let cyan = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| c.bg == Color::Cyan)
+            .count();
+        assert_eq!(cyan, 1, "the caret follows the edit point into view");
+    }
+
+    #[test]
+    fn delete_at_end_of_line_is_a_no_op() {
+        // The empty branch of input_delete (caret at end, nothing under it) must
+        // not panic or alter the input.
+        let mut app = App::new(String::new());
+        type_str(&mut app, "3d6");
+        handle_key(&mut app, KeyCode::End, false);
+        handle_key(&mut app, KeyCode::Delete, false);
+        assert_eq!(app.input, "3d6");
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn the_caret_survives_a_throw() {
+        // A throw restores the locked expression; the caret must stay a valid
+        // index into it, and the next keystroke must edit without panicking.
+        let mut app = App::new(String::new());
+        type_str(&mut app, "2d20kh1");
+        handle_key(&mut app, KeyCode::Home, false); // caret to the start
+        handle_key(&mut app, KeyCode::Enter, false); // shake
+        assert!(app.shaking());
+        handle_key(&mut app, KeyCode::Enter, false); // throw
+        assert!(!app.shaking());
+        assert_eq!(app.input, "2d20kh1");
+        assert!(
+            app.cursor <= app.input.len(),
+            "caret must stay within the input"
+        );
+        handle_key(&mut app, KeyCode::Char('x'), false);
+        assert_eq!(
+            app.input, "x2d20kh1",
+            "the next keystroke edits at the caret"
+        );
+    }
+
+    #[test]
+    fn page_keys_scroll_a_pane_by_a_chunk() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        handle_key(&mut app, KeyCode::Char('?'), false); // open help (26 lines)
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.pane_scroll, 0);
+
+        // PageDown jumps a chunk (ten lines), not one.
+        handle_key(&mut app, KeyCode::PageDown, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let after_pgdn = app.pane_scroll;
+        assert!(after_pgdn >= 6, "PageDown scrolls by a chunk, not a line");
+
+        // PageUp walks back toward the top.
+        handle_key(&mut app, KeyCode::PageUp, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(app.pane_scroll < after_pgdn, "PageUp scrolls back up");
+    }
+
+    #[test]
+    fn history_pane_scrolls_to_older_rolls() {
+        // Regression: the pane used to trim to the frame and hide the rest behind
+        // "… and N older", so the scroll affordance couldn't reach them. Now the
+        // whole list lays out and scrolls.
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 8)).unwrap();
+        for expr in ["1d4", "2d4", "3d4", "4d4", "5d4", "6d4", "7d4", "8d4"] {
+            roll_to_settle(&mut app, expr, &mut terminal);
+        }
+        app.pane = app::Pane::History;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let top = flatten(&terminal);
+        assert!(top.contains("8d4"), "the newest roll shows at the top");
+        assert!(!top.contains("1d4"), "the oldest roll is below the fold");
+
+        // End scrolls to the bottom, bringing the oldest roll into view.
+        handle_key(&mut app, KeyCode::End, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(
+            flatten(&terminal).contains("1d4"),
+            "scrolling reaches the oldest roll"
+        );
+    }
+
+    #[test]
+    fn stats_pane_scrolls_when_it_overflows() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 12)).unwrap();
+        roll_to_settle(&mut app, "3d6", &mut terminal); // ~25 lines of stats
+
+        app.pane = app::Pane::Stats;
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let top = flatten(&terminal);
+        assert!(top.contains("Odds for"), "the header shows at the top");
+        assert!(
+            !top.contains("This session"),
+            "the session summary is below the fold"
+        );
+
+        // End scrolls to the bottom, revealing the session summary.
+        handle_key(&mut app, KeyCode::End, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert!(
+            flatten(&terminal).contains("This session"),
+            "scrolling reveals the session summary"
+        );
+    }
+
+    #[test]
+    fn arrows_scroll_a_pane_taller_than_the_frame() {
+        let mut app = App::new(String::new());
+        // A frame too short to hold the whole help panel, so it must scroll.
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+
+        // Open help (opening resets the scroll to the top).
+        handle_key(&mut app, KeyCode::Char('?'), false);
+        assert_eq!(app.pane, Pane::Help);
+        assert_eq!(app.pane_scroll, 0);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let top = flatten(&terminal);
+        assert!(top.contains("Dice"), "the first heading shows at the top");
+        assert!(!top.contains("to close"), "the footer is below the fold");
+
+        // End jumps to the last screenful (u16::MAX, clamped on render): the
+        // footer scrolls in and the first heading scrolls off.
+        handle_key(&mut app, KeyCode::End, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let bottom = flatten(&terminal);
+        assert!(bottom.contains("to close"), "the footer scrolls into view");
+        assert!(!bottom.contains("Dice"), "the top heading scrolled away");
+
+        // The offset is clamped: another Down can't run past the final screenful.
+        let settled = app.pane_scroll;
+        assert!(settled > 0, "the pane actually scrolled");
+        handle_key(&mut app, KeyCode::Down, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.pane_scroll, settled, "scrolling stops at the bottom");
+
+        // Home returns to the top.
+        handle_key(&mut app, KeyCode::Home, false);
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        assert_eq!(app.pane_scroll, 0);
+        assert!(
+            flatten(&terminal).contains("Dice"),
+            "Home shows the top again"
+        );
     }
 
     fn flatten(terminal: &Terminal<TestBackend>) -> String {

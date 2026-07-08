@@ -89,9 +89,20 @@ Tests guard most of these, but know them before you lean on a wall:
   restate those comparisons inline.
 - **No plain-letter hotkeys.** Bare letters must stay typeable — `kh`/`dh`
   need their `h`. Pane keys are chords or `?`; Enter rolls in the current
-  mode; Tab cycles the mode; Space separates notation.
+  mode; Tab cycles the mode; Space separates notation. The arrow keys are
+  reserved for editing and scrolling, never a roll action: on the prompt
+  `←`/`→` (and `Home`/`End`) walk the caret — `App.cursor` is a byte offset,
+  kept valid by `cursor_byte()`, which every insert/delete/move and the
+  renderer read through; while a pane is open the same arrows drive
+  `App.pane_scroll` instead.
 - **The help overlay fits a 28-row terminal.** A test pins it — trim a line
-  before adding one.
+  before adding one. Taller panes (or a short frame) scroll: every overlay
+  lays out its whole content (history included — it no longer trims to the
+  frame) and `overlay_panel` takes a scroll offset, clamps it to the overflow,
+  and returns the corrected value for `render` to store back into `pane_scroll`
+  (so an over-scroll self-corrects next frame). `App::set_pane` owns the
+  `pane` ↔ `pane_scroll` pairing — it's the only way pane changes should be
+  made, so a new pane-opening path can't forget to rewind the scroll.
 - **Audio opens the default output device only, lazily, on the audio thread.**
   Opening it blocks for tens of ms, so it lives on a dedicated thread that
   spawns on the first audible sound — never on the render loop, where it would

@@ -105,7 +105,14 @@ elapsed `dt`, then plays whatever sounds the physics queued.
   `?` help) specifically so bare `h`/`s` stay typeable for notation like `kh`/`dh`.
   Don't add a plain-letter hotkey — it will eat characters users need to type.
   Enter rolls in the current mode; Tab cycles the mode (shake → roll →
-  insta); Space stays a notation separator. Mute is Ctrl-Q ("quiet") — never
+  insta); Space stays a notation separator. The arrows are for editing and
+  scrolling only, never a roll action: on the prompt ←/→ (and Home/End) move
+  the caret (`App.cursor`, a byte offset kept valid by `cursor_byte()`, which
+  the insert/delete/move helpers and the renderer all read through); while a
+  pane is open the same arrows scroll it (`App.pane_scroll`, clamped to the
+  overflow in `ui::overlay_panel`; `App::set_pane` owns the `pane` ↔
+  `pane_scroll` pairing and is the only way to change panes). Mute
+  is Ctrl-Q ("quiet") — never
   move it to Ctrl-M: on legacy encodings (e.g. Apple Terminal) Ctrl-M *is*
   Enter (ASCII CR), so it can't be a hotkey anywhere, which is also why there
   is no enhanced-keyboard machinery in the codebase.

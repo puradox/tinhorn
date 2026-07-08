@@ -39,12 +39,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_input(frame, app, chunks[2]);
     render_help(frame, app, chunks[3]);
 
-    // A pop-out pane floats on top of everything when one is toggled open.
+    // A pop-out pane floats on top of everything when one is toggled open. Each
+    // renderer clamps the scroll to its own overflow and hands it back, so an
+    // over-scroll (Down past the end) settles on the next frame.
+    let scroll = app.pane_scroll;
     match app.pane {
         Pane::None => {}
-        Pane::Help => render_help_overlay(frame, area),
-        Pane::History => render_history_overlay(frame, app, area),
-        Pane::Stats => render_stats_overlay(frame, app, area),
+        Pane::Help => app.pane_scroll = render_help_overlay(frame, area, scroll),
+        Pane::History => app.pane_scroll = render_history_overlay(frame, app, area, scroll),
+        Pane::Stats => app.pane_scroll = render_stats_overlay(frame, app, area, scroll),
     }
 }
 
@@ -567,10 +570,10 @@ fn heading(text: impl Into<String>) -> Line<'static> {
     ))
 }
 
-/// The italic dim "press … to close" footer shared by every pane.
+/// The italic dim footer shared by every pane: how to scroll it and close it.
 fn close_hint() -> Line<'static> {
     Line::from(Span::styled(
-        "  Esc · q to close",
+        "  ↑ ↓ scroll · Esc · q to close",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
@@ -579,9 +582,11 @@ fn close_hint() -> Line<'static> {
 
 /// Draw a centred, bordered panel of `lines` titled `title` over the UI. Sizes
 /// itself to its content (capped to the frame), blanks what's behind it, and
-/// trims overflow from the bottom so it never spills past its border. Shared by
-/// all three pop-out panes.
-fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line>) {
+/// scrolls by `scroll` lines when the content is taller than the frame allows.
+/// Returns the scroll offset actually used — clamped so the last line can just
+/// reach the bottom and no further — so the caller can store the corrected
+/// value back. Shared by all three pop-out panes.
+fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>, scroll: u16) -> u16 {
     let content_h = lines.len() as u16;
     let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let panel_w = (inner_w + 4).min(area.width); // +4 for borders + side padding
@@ -595,20 +600,22 @@ fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line
         .padding(Padding::horizontal(1))
         .title(title.to_string().bold());
 
-    let max_lines = block.inner(rect).height as usize;
-    if lines.len() > max_lines {
-        lines.truncate(max_lines);
-    }
+    // When the content overflows the inner height, scroll within it; the block
+    // clips whatever falls outside. Clamp so scrolling can't run off the end.
+    let inner_h = block.inner(rect).height;
+    let scroll = scroll.min(content_h.saturating_sub(inner_h));
 
     let para = Paragraph::new(lines)
         .block(block)
-        .alignment(Alignment::Left);
+        .alignment(Alignment::Left)
+        .scroll((scroll, 0));
     frame.render_widget(Clear, rect); // blank whatever's behind the panel
     frame.render_widget(para, rect);
+    scroll
 }
 
 /// The dice-notation reference, drawn over the UI when `?` is pressed.
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
+fn render_help_overlay(frame: &mut Frame, area: Rect, scroll: u16) -> u16 {
     let lines = vec![
         heading("Dice"),
         syntax_row("3d6", "three six-sided dice"),
@@ -643,11 +650,11 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         )),
         close_hint(),
     ];
-    overlay_panel(frame, area, " 🎲  dice notation ", lines);
+    overlay_panel(frame, area, " 🎲  dice notation ", lines, scroll)
 }
 
 /// The roll-history pane: recent rolls, newest first.
-fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
+fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect, scroll: u16) -> u16 {
     let mut lines: Vec<Line> = Vec::new();
 
     if app.history.is_empty() {
@@ -656,10 +663,9 @@ fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        // Newest first; show at most what the frame can hold.
-        let shown = (area.height as usize).saturating_sub(4).max(1);
-        let skipped = app.history.len().saturating_sub(shown);
-        for (n, e) in app.history.iter().rev().take(shown).enumerate() {
+        // Newest first; the whole list is laid out and the pane scrolls (↑/↓)
+        // when it overflows the frame, so older rolls stay reachable.
+        for (n, e) in app.history.iter().rev().enumerate() {
             let idx = app.history.len() - n; // 1-based, counting from the newest
             let faces = e
                 .values
@@ -682,22 +688,16 @@ fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ]));
         }
-        if skipped > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  … and {skipped} older"),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
     }
 
     lines.push(Line::raw(""));
     lines.push(close_hint());
-    overlay_panel(frame, area, " 🎲  history ", lines);
+    overlay_panel(frame, area, " 🎲  history ", lines, scroll)
 }
 
 /// The statistics pane: theoretical odds for the current expression plus a
 /// summary of the rolls actually made this session.
-fn render_stats_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_stats_overlay(frame: &mut Frame, app: &mut App, area: Rect, scroll: u16) -> u16 {
     let lines = match app.stats() {
         Ok(s) => stats_lines(&s),
         Err(e) => vec![
@@ -713,7 +713,7 @@ fn render_stats_overlay(frame: &mut Frame, app: &mut App, area: Rect) {
             close_hint(),
         ],
     };
-    overlay_panel(frame, area, " 🎲  statistics ", lines);
+    overlay_panel(frame, area, " 🎲  statistics ", lines, scroll)
 }
 
 /// Lay out the statistics into display lines: a header, the theoretical
@@ -814,12 +814,42 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
     cell
 }
 
-/// The editable dice expression, with a block cursor.
+/// The editable dice expression: a fixed prompt, then the expression with a
+/// block caret (reverse-video over the character it covers, a solid block at the
+/// end of the line). The expression scrolls horizontally to keep the caret in
+/// view when it's wider than the row, so mid-line editing never runs off-screen.
+/// Every span borrows `app.input`, so drawing the line allocates nothing.
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
-    let p = Paragraph::new(Line::from(vec![
-        Span::styled("dice ▸ ", Style::default().fg(Color::Cyan).bold()),
-        Span::raw(app.input.clone()),
-        Span::styled("█", Style::default().fg(Color::Cyan)),
-    ]));
-    frame.render_widget(p, area);
+    const PROMPT: &str = "dice ▸ ";
+    let [prompt_area, text_area] = Layout::horizontal([
+        Constraint::Length(PROMPT.chars().count() as u16),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            PROMPT,
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        prompt_area,
+    );
+
+    let at = app.cursor_byte();
+    let (before, rest) = app.input.split_at(at);
+    // The cell under the caret: the character it covers, or a blank at line end.
+    let (under, after) = match rest.chars().next() {
+        Some(c) => (&rest[..c.len_utf8()], &rest[c.len_utf8()..]),
+        None => (" ", ""),
+    };
+
+    // Scroll so the caret column stays inside the text area — pinned to the
+    // right edge once the expression overflows it.
+    let caret_col = Span::raw(before).width() as u16;
+    let scroll_x = caret_col.saturating_sub(text_area.width.saturating_sub(1));
+    let line = Line::from(vec![
+        Span::raw(before),
+        Span::styled(under, Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::raw(after),
+    ]);
+    frame.render_widget(Paragraph::new(line).scroll((0, scroll_x)), text_area);
 }
