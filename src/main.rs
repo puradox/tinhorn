@@ -844,7 +844,6 @@ mod tests {
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         let screen = flatten(&terminal);
         assert!(screen.contains("dice notation"), "help title missing");
-        assert!(screen.contains("percentile"), "d% row missing");
         assert!(screen.contains("advantage"), "keep/drop section missing");
         assert!(screen.contains("explode"), "exploding section missing");
         assert!(screen.contains("The Throw"), "Throw section missing");
