@@ -125,18 +125,6 @@ stats odds — all backed by one shared rule. Key routing is tested so a
 hotkey can never swallow a letter you need to type, and the foley synthesis
 is unit-tested for range, pitch ordering, and loudness scaling.
 
-## The demo GIF
-
-The README's GIF is built from real captured frames. If a change alters what
-the TUI shows, re-record:
-
-```sh
-DEMO_OUT=/tmp/demo.json cargo test record_demo -- --ignored
-uv run --with pillow python docs/render_demo.py   # writes docs/demo.gif
-```
-
-The JSON dump also carries per-frame sound events for the HTML demo player.
-
 ## Licensing
 
 Unless you explicitly state otherwise, any contribution intentionally
