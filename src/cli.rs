@@ -1,16 +1,16 @@
 //! Command-line interface and the one-shot (non-animated) output path.
 //!
-//! When `roll` is given an expression together with an output flag — or when its
-//! stdout isn't a terminal — it skips the bouncing-dice TUI entirely, evaluates
-//! the roll once, prints a result, and exits. This is what makes `roll` usable in
-//! scripts and pipelines. Three output shapes: a bare total (default), a verbose
-//! breakdown (`-v`), and machine-readable JSON (`--json`).
+//! When `tinhorn` is given an expression together with an output flag — or when
+//! its stdout isn't a terminal — it skips the bouncing-dice TUI entirely,
+//! evaluates the roll once, prints a result, and exits. This is what makes
+//! `tinhorn` usable in scripts and pipelines. Three output shapes: a bare total
+//! (default), a verbose breakdown (`-v`), and machine-readable JSON (`--json`).
 //!
 //! A staked roll (`d20+5 vs 15`) under an explicit `-p`/`-v` also *exits* with
 //! the verdict — 0 on success, 1 on failure — so a shell script can branch on
-//! a saving throw: `roll -p d20+4 vs 14 && echo "the potion works"`. The
+//! a saving throw: `tinhorn -p d20+4 vs 14 && echo "the potion works"`. The
 //! implicit piped-stdout mode and `--json` always exit 0 on clean output:
-//! `roll d20 vs 15 | tee log` in a `set -e` script must not abort just
+//! `tinhorn d20 vs 15 | tee log` in a `set -e` script must not abort just
 //! because the die came up short, and JSON consumers read `success` instead.
 
 use std::io::{self, Write};
@@ -22,15 +22,15 @@ use rand::SeedableRng;
 use crate::app::{evaluate, Outcome};
 use crate::parse;
 
-/// A terminal dice roller with bouncing dice.
+/// A terminal dice roller you actually throw.
 ///
 /// With no expression it opens the interactive animation. Given an expression
 /// and an output flag (or a piped stdout) it prints a result and exits.
 #[derive(Parser, Debug)]
-#[command(name = "roll", version, about, long_about = None)]
+#[command(name = "tinhorn", version, about, long_about = None)]
 pub struct Cli {
     /// Dice expression, e.g. `3d6`, `2d20kh1`, `4d6dl1+2`. Multiple words are
-    /// joined, so `roll d6 + d8` and `roll "d6+d8"` are equivalent.
+    /// joined, so `tinhorn d6 + d8` and `tinhorn "d6+d8"` are equivalent.
     #[arg(value_name = "EXPRESSION", trailing_var_arg = true)]
     pub expr: Vec<String>,
 
@@ -52,7 +52,7 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
 
-    /// Start the interactive mode muted (Ctrl-M toggles sound at runtime).
+    /// Start the interactive mode muted (Ctrl-Q toggles sound at runtime).
     #[arg(long)]
     pub mute: bool,
 }
@@ -70,7 +70,7 @@ pub fn run_one_shot(cli: &Cli, expr: &str) -> io::Result<()> {
     let roll = match parse::parse(expr) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("roll: {e}");
+            eprintln!("tinhorn: {e}");
             std::process::exit(2);
         }
     };
@@ -98,7 +98,7 @@ pub fn run_one_shot(cli: &Cli, expr: &str) -> io::Result<()> {
     // A staked roll reports its verdict through the exit code (0 = success,
     // 1 = failure) so scripts can branch on the check itself — but only when
     // the caller explicitly asked for `-p`/`-v`. The automatic non-tty
-    // one-shot (`roll d20 vs 15 | tee`) and `--json` keep exit 0, so piping
+    // one-shot (`tinhorn d20 vs 15 | tee`) and `--json` keep exit 0, so piping
     // output can never read as the program failing.
     if (cli.print || cli.verbose) && outcome.success == Some(false) {
         out.flush()?;
@@ -270,10 +270,10 @@ mod tests {
 
     #[test]
     fn expression_joins_args() {
-        let cli = Cli::parse_from(["roll", "d6", "+", "d8"]);
+        let cli = Cli::parse_from(["tinhorn", "d6", "+", "d8"]);
         assert_eq!(cli.expression(), "d6 + d8");
         // Stakes survive the join too: `roll d20 vs 15` needs no quotes.
-        let cli = Cli::parse_from(["roll", "d20", "vs", "15"]);
+        let cli = Cli::parse_from(["tinhorn", "d20", "vs", "15"]);
         assert_eq!(cli.expression(), "d20 vs 15");
     }
 

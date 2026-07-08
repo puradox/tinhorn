@@ -4,8 +4,14 @@
 //! caused it: impact speed sets loudness, die size sets pitch (a d4 clicks, a
 //! d20 thunks), the cup rattle follows the sway, and a natural 20 gets one
 //! bright ring. Synthesis is pure (`synth`) so it's unit-testable; only the
-//! thin [`Foley`] wrapper touches the audio device, and it degrades to
+//! thin [`Foley`] wrapper touches the audio output, and it degrades to
 //! silence when there isn't one (ssh, CI, `--mute`).
+//!
+//! On macOS with a duplex default output (a USB interface with mic inputs),
+//! the OS raises a one-time *microphone* prompt for any process that starts
+//! playback — even Apple's `afplay`. That's the OS, not this code (no input
+//! path exists here); the README's Sound section documents it, and the lazy
+//! init in `main.rs::run` keeps `--mute` sessions from ever asking.
 
 use rodio::buffer::SamplesBuffer;
 use rodio::{DeviceSinkBuilder, MixerDeviceSink};
@@ -27,8 +33,17 @@ pub struct Foley {
 impl Foley {
     /// Open the default output device, or `None` when there isn't one — the
     /// dice just roll quietly.
+    ///
+    /// Deliberately NOT `open_default_sink()`: its fallback enumerates every
+    /// audio device (microphones included), which is its own way to draw the
+    /// macOS microphone prompt, and it eprintln!s over the TUI on failure.
+    /// If the one default output device won't open, silence is the correct
+    /// fallback.
     pub fn new() -> Option<Foley> {
-        let mut sink = DeviceSinkBuilder::open_default_sink().ok()?;
+        let mut sink = DeviceSinkBuilder::from_default_device()
+            .ok()?
+            .open_stream()
+            .ok()?;
         // rodio logs to stderr on drop by default; in a TUI that's garbage
         // sprayed over the restored terminal.
         sink.log_on_drop(false);

@@ -1,15 +1,16 @@
-//! roll — a terminal dice roller whose dice bounce around the screen.
+//! tinhorn — a terminal dice roller whose dice bounce around the screen.
 //!
 //! Two modes:
-//!   roll              # interactive: type an expression and watch it bounce
-//!   roll 3d6          # interactive, rolling 3d6 immediately
-//!   roll -p 3d6       # one-shot: print the result and exit (for scripting)
-//!   roll 3d6 | cat    # one-shot too — a non-TTY stdout switches modes
-//!   roll --json 3d6   # one-shot, machine-readable JSON breakdown
-//!   roll --seed 42 3d6  # reproducible roll
+//!   tinhorn              # interactive: type an expression and shake the cup
+//!   tinhorn 3d6          # interactive, rolling 3d6 immediately
+//!   tinhorn -p 3d6       # one-shot: print the result and exit (for scripting)
+//!   tinhorn 3d6 | cat    # one-shot too — a non-TTY stdout switches modes
+//!   tinhorn --json 3d6   # one-shot, machine-readable JSON breakdown
+//!   tinhorn --seed 42 3d6  # reproducible roll
 //!
-//! Interactive keys: Enter roll · Tab shake/throw · ? help · Ctrl-H history ·
-//! Ctrl-S stats · Ctrl-M mute · Esc quit
+//! Interactive keys: Enter rolls in the current mode · Tab cycles the mode
+//! (shake → roll → insta) · ? help · Ctrl-H history · Ctrl-S stats ·
+//! Ctrl-Q mute · Esc quit
 
 mod app;
 mod cli;
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use app::{App, Pane};
+use app::{App, Pane, RollMode};
 use cli::Cli;
 
 const FRAME: Duration = Duration::from_millis(16); // ~60 fps
@@ -58,56 +59,19 @@ fn main() -> io::Result<()> {
     }
 
     // Interactive: launch the animated TUI. The dice are audible unless muted
-    // (`--mute` starts muted; Ctrl-M toggles) or there's no output device
-    // (Foley::new degrades to None silently).
-    let sound = foley::Foley::new();
+    // (`--mute` starts muted; Ctrl-Q toggles) or there's no output device —
+    // audio opens lazily inside `run`, on the first sound that needs playing.
     let mut terminal = ratatui::init();
-    let keys = KeyGuard::engage();
 
     let mut app = match cli.seed {
         Some(seed) => App::with_seed(expr, seed),
         None => App::new(expr),
     };
     app.muted = cli.mute;
-    app.mute_key = keys.enhanced;
-    let result = run(&mut terminal, &mut app, sound.as_ref());
+    let result = run(&mut terminal, &mut app);
 
-    drop(keys);
     ratatui::restore();
     result
-}
-
-/// Enables the enhanced keyboard protocol where the terminal supports it, so
-/// Ctrl-M is distinguishable from Enter (legacy encoding makes them the same
-/// CR byte). Undone in Drop — panic paths included, which ratatui's own
-/// panic hook knows nothing about — so the flag can never leak into the
-/// user's shell. `enhanced == false` just means the mute chord is
-/// unavailable, never a broken terminal.
-struct KeyGuard {
-    enhanced: bool,
-}
-
-impl KeyGuard {
-    fn engage() -> Self {
-        let supported = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-        let enhanced = supported
-            && crossterm::execute!(
-                io::stdout(),
-                event::PushKeyboardEnhancementFlags(
-                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                )
-            )
-            .is_ok();
-        KeyGuard { enhanced }
-    }
-}
-
-impl Drop for KeyGuard {
-    fn drop(&mut self) {
-        if self.enhanced {
-            let _ = crossterm::execute!(io::stdout(), event::PopKeyboardEnhancementFlags);
-        }
-    }
 }
 
 /// What the event loop should do after handling a key.
@@ -143,10 +107,10 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
             app.pane = toggle(app.pane, Pane::Stats);
             return Action::Continue;
         }
-        // Mute is global too. Reaching us as Char('m')+CTRL requires the
-        // enhanced keyboard protocol (pushed at startup where supported) —
-        // legacy terminals send Ctrl-M as a bare CR, i.e. Enter.
-        KeyCode::Char('m') if ctrl => {
+        // Mute is global too. Q for "quiet" — Ctrl-M was the obvious chord,
+        // but on legacy encodings Ctrl-M *is* Enter (ASCII CR), so it can
+        // never be a hotkey; Ctrl-Q arrives cleanly in every terminal.
+        KeyCode::Char('q') if ctrl => {
             app.muted = !app.muted;
             return Action::Continue;
         }
@@ -176,8 +140,15 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
 
     match code {
         KeyCode::Esc => return Action::Quit,
-        KeyCode::Enter => app.roll(),
-        KeyCode::Tab => app.start_shake(),
+        // Enter rolls in the current mode; Tab cycles the mode, in the order
+        // the ceremony shrinks (shake → roll → insta). The Throw stays the
+        // house default: a second Enter mid-shake (handled above) releases.
+        KeyCode::Enter => match app.mode {
+            RollMode::Shake => app.start_shake(),
+            RollMode::Roll => app.roll(),
+            RollMode::Insta => app.insta_roll(),
+        },
+        KeyCode::Tab => app.mode = app.mode.next(),
         KeyCode::Backspace => {
             app.input.pop();
         }
@@ -187,12 +158,15 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
     Action::Continue
 }
 
-fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    sound: Option<&foley::Foley>,
-) -> io::Result<()> {
+fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut last = Instant::now();
+
+    // Audio opens lazily, on the first sound that actually needs playing. A
+    // `--mute` session never touches the audio APIs at all — on some macOS
+    // setups even opening playback draws a microphone permission prompt, and
+    // a muted session shouldn't be the one to draw it.
+    let mut sound: Option<foley::Foley> = None;
+    let mut sound_tried = false;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -223,7 +197,11 @@ fn run(
         // sound like a fistful of dice.
         let mut clicks = 0usize;
         for ev in app.take_sounds() {
-            let Some(f) = sound else { break };
+            if !sound_tried {
+                sound_tried = true;
+                sound = foley::Foley::new();
+            }
+            let Some(f) = &sound else { break };
             if matches!(
                 ev,
                 app::SoundEvent::Impact { .. } | app::SoundEvent::Knock { .. }
@@ -294,12 +272,15 @@ mod tests {
     }
 
     #[test]
-    fn tab_shakes_and_enter_throws() {
+    fn enter_shakes_then_throws_by_default() {
         let mut app = App::new(String::new());
         type_str(&mut app, "2d20kh1");
 
-        // Tab picks the cup up; nothing is rolled yet.
-        assert_eq!(handle_key(&mut app, KeyCode::Tab, false), Action::Continue);
+        // Enter picks the cup up; nothing is rolled yet.
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter, false),
+            Action::Continue
+        );
         assert!(app.shaking());
         assert!(app.dice.is_empty(), "shaking must not roll");
 
@@ -312,8 +293,8 @@ mod tests {
         assert!(!app.shaking());
         assert!(app.dice.is_empty(), "a cancelled shake must not roll");
 
-        // Shake again and release with Enter: now the roll happens.
-        handle_key(&mut app, KeyCode::Tab, false);
+        // Shake again and release with a second Enter: now the roll happens.
+        handle_key(&mut app, KeyCode::Enter, false);
         assert_eq!(
             handle_key(&mut app, KeyCode::Enter, false),
             Action::Continue
@@ -323,13 +304,45 @@ mod tests {
     }
 
     #[test]
+    fn tab_cycles_the_roll_mode() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+        type_str(&mut app, "2d6");
+
+        // The full ritual is the default.
+        assert_eq!(app.mode, RollMode::Shake);
+
+        // One Tab: a plain animated roll — no cup, dice still bounce.
+        assert_eq!(handle_key(&mut app, KeyCode::Tab, false), Action::Continue);
+        assert_eq!(app.mode, RollMode::Roll);
+        assert_eq!(app.input, "2d6", "Tab must not type or roll");
+        handle_key(&mut app, KeyCode::Enter, false);
+        assert!(!app.shaking(), "roll mode must not shake");
+        assert_eq!(app.dice.len(), 2);
+        assert!(!app.all_settled(), "a plain roll still animates");
+
+        // Two Tabs in: insta — the dice land settled between two frames.
+        handle_key(&mut app, KeyCode::Tab, false);
+        assert_eq!(app.mode, RollMode::Insta);
+        handle_key(&mut app, KeyCode::Enter, false);
+        assert!(!app.shaking(), "insta must not shake");
+        assert_eq!(app.dice.len(), 2);
+        assert!(app.all_settled(), "insta must land already at rest");
+
+        // A third Tab wraps back to the cup.
+        handle_key(&mut app, KeyCode::Tab, false);
+        assert_eq!(app.mode, RollMode::Shake);
+    }
+
+    #[test]
     fn shaking_renders_the_cup_and_power_meter() {
         let mut app = App::new(String::new());
         let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
 
         type_str(&mut app, "3d6");
-        handle_key(&mut app, KeyCode::Tab, false);
+        handle_key(&mut app, KeyCode::Enter, false);
         app.update(0.3);
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
@@ -361,37 +374,38 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_m_toggles_mute_everywhere() {
+    fn ctrl_q_toggles_mute_everywhere() {
         let mut app = App::new(String::new());
         assert!(!app.muted, "sound starts on");
 
-        // Plain toggle, and the chord must not type an 'm'.
+        // Plain toggle, and the chord must not type a 'q'.
         type_str(&mut app, "3d6");
         assert_eq!(
-            handle_key(&mut app, KeyCode::Char('m'), true),
+            handle_key(&mut app, KeyCode::Char('q'), true),
             Action::Continue
         );
         assert!(app.muted);
-        assert_eq!(app.input, "3d6", "the chord must not type 'm'");
+        assert_eq!(app.input, "3d6", "the chord must not type 'q'");
 
-        // Works while a pane is open (and leaves the pane alone)…
+        // Works while a pane is open (and leaves the pane alone — the chord
+        // must not act as the pane-closing bare 'q')…
         app.pane = Pane::Stats;
-        handle_key(&mut app, KeyCode::Char('m'), true);
+        handle_key(&mut app, KeyCode::Char('q'), true);
         assert!(!app.muted);
         assert_eq!(app.pane, Pane::Stats);
         app.pane = Pane::None;
 
         // …and mid-shake, without throwing or cancelling.
-        handle_key(&mut app, KeyCode::Tab, false);
+        handle_key(&mut app, KeyCode::Enter, false);
         assert!(app.shaking());
-        handle_key(&mut app, KeyCode::Char('m'), true);
+        handle_key(&mut app, KeyCode::Char('q'), true);
         assert!(app.muted);
         assert!(app.shaking(), "muting must not disturb the shake");
 
-        // A bare 'm' (no ctrl) still just types.
+        // A bare 'q' (no ctrl) still just types.
         app.cancel_shake();
-        type_str(&mut app, "m");
-        assert_eq!(app.input, "3d6m");
+        type_str(&mut app, "q");
+        assert_eq!(app.input, "3d6q");
     }
 
     #[test]
@@ -422,7 +436,7 @@ mod tests {
         terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
 
         type_str(&mut app, "d6");
-        handle_key(&mut app, KeyCode::Tab, false);
+        handle_key(&mut app, KeyCode::Enter, false);
         app.update(0.3);
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
@@ -445,10 +459,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_with_a_bad_expression_errors_instead_of_shaking() {
+    fn enter_with_a_bad_expression_errors_instead_of_shaking() {
         let mut app = App::new(String::new());
         type_str(&mut app, "garbage");
-        handle_key(&mut app, KeyCode::Tab, false);
+        handle_key(&mut app, KeyCode::Enter, false);
         assert!(!app.shaking());
         assert!(app.error.is_some(), "the typo surfaces at pickup");
         // The input stays editable — the very next key must reach it.
@@ -504,7 +518,7 @@ mod tests {
 
         assert!(app.all_settled(), "dice did not settle within the budget");
         let screen = flatten(&terminal);
-        assert!(screen.contains("roll"), "missing title");
+        assert!(screen.contains("tinhorn"), "missing title");
         assert!(screen.contains("total"), "missing total label");
         // The settled d6 squares should be on screen.
         assert!(screen.contains("┌────┐"), "no die boxes rendered");
@@ -659,7 +673,7 @@ mod tests {
             for _ in 0..12 {
                 step(&mut app, &mut terminal, &mut frames);
             }
-            handle_key(&mut app, KeyCode::Tab, false);
+            handle_key(&mut app, KeyCode::Enter, false);
             for _ in 0..(shake_secs * 60.0) as usize {
                 step(&mut app, &mut terminal, &mut frames);
             }
