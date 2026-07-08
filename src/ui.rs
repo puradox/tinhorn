@@ -611,8 +611,8 @@ fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, mut lines: Vec<Line
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let lines = vec![
         heading("Dice"),
-        syntax_row("3d6", "three six-sided dice"),
-        syntax_row("d20", "one die (count defaults to 1)"),
+        syntax_row("3d6", "three six-sided dice (d6 = 1d6)"),
+        syntax_row("d%", "percentile — shorthand for d100"),
         syntax_row("d6+d8", "combine different dice"),
         syntax_row("2d20-1", "add or subtract a flat modifier"),
         Line::raw(""),

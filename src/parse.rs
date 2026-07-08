@@ -7,6 +7,7 @@
 //!   "d6,d12"     -> commas work as separators
 //!   "2d20-1"     -> dice plus a flat modifier
 //!   "d20 + 5"    -> whitespace is ignored
+//!   "d%"         -> percentile: shorthand for d100
 //!
 //! Per-term modifiers (written immediately after the `dN`, in any order):
 //!   "2d20kh1"    -> keep the highest 1 (advantage); "kl1" keeps the lowest
@@ -22,6 +23,7 @@
 //!   expr  := term ( sep? term )* [ ('vs'|'VS') n ]
 //!   sep   := '+' | '-' | ',' | whitespace
 //!   term  := [count] ('d'|'D') sides termmod*   |   integer
+//!   sides := digits | '%'                       ('%' means 100)
 //!   termmod := ('kh'|'kl'|'dh'|'dl') [n]
 //!            |  '!' [ ('>'|'<'|'=') n ]
 //!            |  '*' n
@@ -151,14 +153,23 @@ pub fn parse(input: &str) -> Result<Roll, String> {
         if i < n && (chars[i] == 'd' || chars[i] == 'D') {
             // Dice term: [count]d<sides>[mods...]
             i += 1; // consume 'd'
-            let sides_start = i;
-            while i < n && chars[i].is_ascii_digit() {
+            let sides: u32 = if i < n && chars[i] == '%' {
+                // Percentile: 'd%' is the tabletop spelling of a d100.
                 i += 1;
-            }
-            let sides_str: String = chars[sides_start..i].iter().collect();
-            if sides_str.is_empty() {
-                return Err("expected a number of sides after 'd' (e.g. d6)".to_string());
-            }
+                100
+            } else {
+                let sides_start = i;
+                while i < n && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let sides_str: String = chars[sides_start..i].iter().collect();
+                if sides_str.is_empty() {
+                    return Err("expected a number of sides after 'd' (e.g. d6 or d%)".to_string());
+                }
+                sides_str
+                    .parse()
+                    .map_err(|_| format!("'{sides_str}' is not a valid number of sides"))?
+            };
 
             let count: u32 = if num_str.is_empty() {
                 1
@@ -167,9 +178,6 @@ pub fn parse(input: &str) -> Result<Roll, String> {
                     .parse()
                     .map_err(|_| format!("'{num_str}' is not a valid dice count"))?
             };
-            let sides: u32 = sides_str
-                .parse()
-                .map_err(|_| format!("'{sides_str}' is not a valid number of sides"))?;
 
             if sides == 0 {
                 return Err("a die needs at least 1 side".to_string());
@@ -397,6 +405,28 @@ mod tests {
         let r = parse("2D6").unwrap();
         assert_eq!(term(&r, 0).count, 2);
         assert_eq!(term(&r, 0).sides, 6);
+    }
+
+    #[test]
+    fn percentile_shorthand() {
+        // 'd%' is a d100, count and case behave like any other die.
+        let r = parse("d%").unwrap();
+        assert_eq!(term(&r, 0).count, 1);
+        assert_eq!(term(&r, 0).sides, 100);
+
+        let r = parse("2D%+5").unwrap();
+        assert_eq!(term(&r, 0).count, 2);
+        assert_eq!(term(&r, 0).sides, 100);
+        assert_eq!(r.modifier, 5);
+
+        // Term modifiers and stakes attach exactly as they would to 'd100'.
+        let r = parse("2d%kh1 vs 60").unwrap();
+        assert_eq!(term(&r, 0).mods, vec![TermMod::KeepHigh(1)]);
+        assert_eq!(r.target, Some(60));
+
+        // '%' anywhere else is still an error.
+        assert!(parse("%").is_err());
+        assert!(parse("3%").is_err());
     }
 
     #[test]
