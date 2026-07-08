@@ -127,10 +127,15 @@ is unit-tested for range, pitch ordering, and loudness scaling.
 
 ## The demo GIF
 
-The README's GIF is built from real captured frames:
-`DEMO_OUT=/tmp/demo.json cargo test record_demo -- --ignored` dumps rendered
-frames plus per-frame sound events as JSON, ready for re-rendering by the
-demo player. If a change alters what the TUI shows, re-record.
+The README's GIF is built from real captured frames. If a change alters what
+the TUI shows, re-record:
+
+```sh
+DEMO_OUT=/tmp/demo.json cargo test record_demo -- --ignored
+uv run --with pillow python docs/render_demo.py   # writes docs/demo.gif
+```
+
+The JSON dump also carries per-frame sound events for the HTML demo player.
 
 ## Licensing
 
