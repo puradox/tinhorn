@@ -90,11 +90,13 @@ tinhorn --mute           # start silent (Ctrl-Q toggles at runtime)
 | ------------------ | -------------------------------------------------- |
 | `Enter`            | roll, per the mode (shake: press again to throw)   |
 | `Tab`              | cycle the mode — shake → roll → insta              |
+| type / `Backspace` | edit the dice expression                           |
+| `←` `→` (`Home`/`End`) | move the caret in the expression (jump to ends) |
+| `↑` `↓`            | scroll an open pane that's taller than the screen  |
 | `?`                | toggle the dice-notation help overlay              |
 | `Ctrl-H`           | toggle the roll-history pane                       |
 | `Ctrl-S`           | toggle the statistics pane                         |
 | `Ctrl-Q`           | mute / unmute — Q for quiet                        |
-| type / `Backspace` | edit the dice expression                           |
 | `Esc` / `Ctrl-C`   | quit (`Esc` closes a pane or shake first)          |
 
 Three roll modes cycle on `Tab`: **shake** (drop into the cup and catch the
