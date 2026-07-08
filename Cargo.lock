@@ -944,19 +944,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roll"
-version = "0.1.0"
-dependencies = [
- "clap",
- "crossterm",
- "rand",
- "ratatui",
- "rodio",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1165,6 +1152,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tinhorn"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "rand",
+ "ratatui",
+ "rodio",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

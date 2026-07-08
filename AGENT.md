@@ -1,17 +1,19 @@
-# CLAUDE.md
+# AGENT.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
 
-`roll` is a terminal dice roller. Type dice in standard notation and watch each
-die bounce around a physics arena as the 2D silhouette of its polyhedron until it
-settles and the total is tallied. It has two modes from a single binary:
+`tinhorn` is a terminal dice roller. Type dice in standard notation, shake the
+cup, and watch each die bounce around a physics arena as the 2D silhouette of
+its polyhedron until it settles and the total is tallied. (A *tinhorn* was a
+small-time gambler, named for the tin cup they rattled their dice in.) It has
+two modes from a single binary:
 
 - **Interactive TUI** (default): the bouncing-dice animation, built on ratatui.
 - **One-shot CLI**: given an expression plus an output flag — or whenever stdout
   isn't a terminal — it skips the TUI, evaluates once, prints, and exits, so it
-  drops into scripts and pipes (`roll 3d6 | cat`).
+  drops into scripts and pipes (`tinhorn 3d6 | cat`).
 
 ## Commands
 
@@ -45,10 +47,14 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 - **`app`** — state plus the physics simulation and the roll evaluator.
   - `App` holds the dice, input line, `Pane` (Help/History/Stats overlays),
     history, session stats, the Throw state (shake clock, last release), crit
-    particles, and the pending `SoundEvent` queue. `App::roll()` starts an
-    animated roll; `start_shake()`/`throw()` are the Throw (Tab: shake the cup,
-    release timing shapes only the launch); `update(dt)` steps the physics;
-    `all_settled()` reports convergence.
+    particles, the `RollMode` (what Enter does; Tab cycles Shake → Roll →
+    Insta), and the pending `SoundEvent` queue. `App::roll()` starts an
+    animated roll; `start_shake()`/`throw()` are the Throw — the default mode
+    (Enter shakes the cup, a second Enter releases; release timing shapes only
+    the launch); `insta_roll()` fast-forwards the same simulation to rest
+    between two frames (same RNG draws, so totals are seed-identical across
+    all three modes); `update(dt)` steps the physics; `all_settled()` reports
+    convergence.
   - Physics: each `Die` is an AABB with position/velocity under gravity, wall
     bounces with restitution, friction/drag, per-frame die-vs-die AABB
     separation, and roll-off so dice spread instead of stacking neatly.
@@ -85,7 +91,11 @@ elapsed `dt`, then plays whatever sounds the physics queued.
   knocks, settles, cup rattle, crit ring, verdicts); `synth()` renders them from
   physics parameters (die size → pitch, impact speed → loudness) with no assets;
   `Foley` plays them via rodio, degrading silently with no audio device. On by
-  default; `--mute` starts muted, Ctrl-M toggles.
+  default; `--mute` starts muted, Ctrl-Q toggles. Audio initializes **lazily**
+  in `main.rs::run` on the first audible sound — a muted session never touches
+  audio APIs at all (macOS raises a one-time microphone prompt for playback on
+  duplex output devices; that's the OS, even `afplay` draws it — don't chase
+  it).
 
 ## Conventions worth knowing
 
@@ -93,10 +103,11 @@ elapsed `dt`, then plays whatever sounds the physics queued.
   so it's unit-tested). Pane hotkeys use chords/`?` (Ctrl-H history, Ctrl-S stats,
   `?` help) specifically so bare `h`/`s` stay typeable for notation like `kh`/`dh`.
   Don't add a plain-letter hotkey — it will eat characters users need to type.
-  Space is a notation separator, which is why the Throw uses Tab. Ctrl-M needs
-  the enhanced keyboard protocol (`KeyGuard` pushes it where supported); on
-  legacy encodings Ctrl-M *is* Enter, so the help bar only advertises the chord
-  when it can actually arrive.
+  Enter rolls in the current mode; Tab cycles the mode (shake → roll →
+  insta); Space stays a notation separator. Mute is Ctrl-Q ("quiet") — never
+  move it to Ctrl-M: on legacy encodings (e.g. Apple Terminal) Ctrl-M *is*
+  Enter (ASCII CR), so it can't be a hotkey anywhere, which is also why there
+  is no enhanced-keyboard machinery in the codebase.
 - **Roll semantics live in two places that must stay in lockstep**: the animated
   path in `app` and `evaluate`. A test would fail if they diverge, but keep them
   together when editing rules (explode/keep-drop/multiply order). Cross-cutting
@@ -112,3 +123,33 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 - Demo recordings: `DEMO_OUT=/tmp/d.json cargo test record_demo -- --ignored`
   dumps real rendered frames + per-frame sound events as JSON for the HTML demo
   player; `cargo test audible -- --ignored` plays the foley palette out loud.
+- Audio opens the **default output device only** (`foley.rs::Foley::new`).
+  Never call rodio's `open_default_sink()` or enumerate devices: the fallback
+  walks every audio device including microphones, which is its own way to
+  draw the macOS mic prompt, and it prints to stderr over the TUI. There is
+  no input path in this program; if the default device won't open, go silent.
+  Note: on macOS with a duplex default output (USB interface, headset), the
+  OS raises a one-time microphone prompt for ANY playback — even `afplay`.
+  That is not fixable in code (a bespoke AudioUnit backend was tried and
+  reverted); the README documents it. Don't reinvestigate.
+- The README is user-facing only; design notes, test docs, and the invariant
+  list for humans live in `CONTRIBUTING.md`. When a module description or
+  invariant changes, update CONTRIBUTING.md alongside this file.
+
+## Voice & tone — "the honest tinhorn"
+
+The name is self-deprecating (a tinhorn talks big at small stakes); the brand
+inverts it: talks like a small-time hustler, delivers scrupulous fairness.
+Tagline register: *all rattle, honest dice.* Four rules for all user-facing
+copy (README, help overlay, arena titles, release notes, launch posts):
+
+1. **Wry, never cosplay.** A dusty phrase as seasoning — "the arena hands
+   down the verdict", "a timid lob" — never cowboy dialect.
+2. **Sensory, not abstract.** Everything is heard and felt: clatter, thunk,
+   shudder. Never "generates random numbers".
+3. **Every brag is checkable.** A fairness or fidelity claim ships with its
+   mechanism (the seedable RNG, the test that pins it, `--seed`). Flavor
+   with no mechanism behind it gets cut.
+4. **Dry where it's plumbing.** stderr, `--help`, JSON, and exit codes stay
+   deadpan and terse. The contrast with the TUI's theater is the charm —
+   don't spend flavor in the scripting surface.

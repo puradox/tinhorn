@@ -217,6 +217,36 @@ pub struct HistoryEntry {
     pub total: i32,
 }
 
+/// How Enter rolls the dice. Tab cycles these, in the order the ceremony
+/// shrinks: the full cup ritual, a plain animated roll, or the result already
+/// at rest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RollMode {
+    Shake,
+    Roll,
+    Insta,
+}
+
+impl RollMode {
+    /// The cycle Tab walks.
+    pub fn next(self) -> RollMode {
+        match self {
+            RollMode::Shake => RollMode::Roll,
+            RollMode::Roll => RollMode::Insta,
+            RollMode::Insta => RollMode::Shake,
+        }
+    }
+
+    /// The word shown next to Enter in the help bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            RollMode::Shake => "shake",
+            RollMode::Roll => "roll",
+            RollMode::Insta => "insta",
+        }
+    }
+}
+
 pub struct App {
     pub input: String,
     pub dice: Vec<Die>,
@@ -229,6 +259,8 @@ pub struct App {
     pub history: Vec<HistoryEntry>,
     /// Which pop-out pane is showing (help / history / stats / none).
     pub pane: Pane,
+    /// What Enter does (shake / roll / insta); Tab cycles it.
+    pub mode: RollMode,
     /// Set the first frame after every die settles, so the roll is recorded into
     /// `history` exactly once rather than every frame thereafter.
     recorded: bool,
@@ -251,17 +283,12 @@ pub struct App {
     /// Noises the simulation wants made, oldest first. The event loop drains
     /// this every frame; headless callers can ignore it (it self-caps).
     pub sounds: Vec<SoundEvent>,
-    /// Foley gate, toggled with Ctrl-M (and seeded by `--mute`). Enforced by
+    /// Foley gate, toggled with Ctrl-Q (and seeded by `--mute`). Enforced by
     /// [`Self::take_sounds`] so every drain site inherits the rule.
     pub muted: bool,
     /// The last computed stats, keyed by (expression, history length) — the
     /// two values the sampler is seeded from, so a hit is exact.
     stats_cache: Option<(String, usize, Stats)>,
-    /// Whether the terminal can deliver Ctrl-M as its own key (enhanced
-    /// keyboard protocol). The help bar only advertises the mute chord when
-    /// it can actually arrive — on legacy encodings Ctrl-M *is* Enter, and
-    /// teaching it would make "mute" roll the dice.
-    pub mute_key: bool,
     /// Count of dice an exploding term has spawned so far this roll, indexed by
     /// term. Explosions happen over the course of the animation, so the cap has
     /// to be enforced across frames rather than in one up-front loop.
@@ -290,6 +317,7 @@ impl App {
             error: None,
             history: Vec::new(),
             pane: Pane::None,
+            mode: RollMode::Shake,
             recorded: false,
             arena_w: 0.0,
             arena_h: 0.0,
@@ -302,7 +330,6 @@ impl App {
             sounds: Vec::new(),
             muted: false,
             stats_cache: None,
-            mute_key: false,
             explosions: Vec::new(),
             rng,
         };
@@ -342,6 +369,36 @@ impl App {
             Err(e) => {
                 self.error = Some(e);
             }
+        }
+    }
+
+    /// Roll with the theater skipped: same parse, same RNG draws, same
+    /// physics and explosions — the arena just runs to rest between two
+    /// frames, so insta totals are bit-identical to animated ones under the
+    /// same seed. The mid-air racket is dropped; the landing still speaks
+    /// (one settle tick, plus any crit/fumble/verdict).
+    pub fn insta_roll(&mut self) {
+        self.roll();
+        if self.error.is_some() {
+            return;
+        }
+        // The snapshot test's budget: explosions settle one at a time, so a
+        // chain needs room. A convergence bug still ends, just unsettled.
+        for _ in 0..40_000 {
+            self.update(1.0 / 60.0);
+            if self.all_settled() {
+                break;
+            }
+        }
+        self.particles.clear();
+        self.sounds.retain(|s| {
+            matches!(
+                s,
+                SoundEvent::Crit | SoundEvent::Fumble | SoundEvent::Success | SoundEvent::Failure
+            )
+        });
+        if let Some(d) = self.dice.first() {
+            self.sounds.insert(0, SoundEvent::Settle { sides: d.sides });
         }
     }
 
@@ -1644,10 +1701,10 @@ mod tests {
             sounds: Vec::new(),
             muted: false,
             stats_cache: None,
-            mute_key: false,
             explosions: Vec::new(),
             history: Vec::new(),
             pane: Pane::None,
+            mode: RollMode::Shake,
             recorded: false,
             rng: StdRng::seed_from_u64(seed),
         };
@@ -1661,6 +1718,32 @@ mod tests {
         for _ in 0..frames {
             app.update(1.0 / 60.0);
         }
+    }
+
+    #[test]
+    fn insta_rolls_the_same_dice_as_the_animation_under_the_same_seed() {
+        // Exploding included: explosions draw from the RNG mid-flight, so
+        // this only passes if insta runs the very same simulation.
+        let expr = "4d6!kh3+2";
+
+        let mut animated = seeded(expr, 9);
+        for _ in 0..40_000 {
+            animated.update(1.0 / 60.0);
+            if animated.all_settled() {
+                break;
+            }
+        }
+        assert!(animated.all_settled());
+
+        // Same seed, untouched by the empty-input parse error at build time.
+        let mut insta = seeded("", 9);
+        insta.input = expr.to_string();
+        insta.insta_roll();
+
+        assert!(insta.all_settled(), "insta must land settled");
+        let a: Vec<u32> = animated.dice.iter().map(|d| d.final_value).collect();
+        let b: Vec<u32> = insta.dice.iter().map(|d| d.final_value).collect();
+        assert_eq!(a, b, "insta must roll exactly the animation's dice");
     }
 
     #[test]

@@ -1,8 +1,22 @@
 [package]
-name = "roll"
+name = "tinhorn"
 version = "0.1.0"
 edition = "2021"
-description = "A TUI dice roller with bouncing dice"
+description = "A fancy dice roller: shake the dice, watch em' fly, hear it bounce."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/puradox/tinhorn"
+readme = "README.md"
+keywords = ["dice", "roll", "rpg", "ttrpg"]
+categories = ["command-line-utilities", "games"]
+exclude = [
+    "docs/",
+    ".conductor/",
+    ".github/",
+    "AGENT.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "TODO.md",
+]
 
 [dependencies]
 ratatui = "0.29"

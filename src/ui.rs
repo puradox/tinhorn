@@ -73,19 +73,21 @@ fn throw_tier(power: f32) -> ThrowTier {
 
 fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = if app.shaking() {
-        " 🎲  roll — shaking… ".to_string()
+        " 🎲  tinhorn — shaking… ".to_string()
     } else if app.all_settled() {
-        " 🎲  roll — settled ".to_string()
+        " 🎲  tinhorn — settled ".to_string()
     } else if app.spawned {
-        // Name the throw for what it was; a plain Enter roll just "rolls".
+        // Name the throw for what it was; a plain Tab roll just "rolls".
         match app.last_throw.map(|t| throw_tier(t.power)) {
-            Some(ThrowTier::Lob) => " 🎲  roll — a timid lob… ".to_string(),
-            Some(ThrowTier::Toss) => " 🎲  roll — a clean toss… ".to_string(),
-            Some(ThrowTier::Rocket | ThrowTier::Peak) => " 🎲  roll — a rocket throw… ".to_string(),
-            None => " 🎲  roll — rolling… ".to_string(),
+            Some(ThrowTier::Lob) => " 🎲  tinhorn — a timid lob… ".to_string(),
+            Some(ThrowTier::Toss) => " 🎲  tinhorn — a clean toss… ".to_string(),
+            Some(ThrowTier::Rocket | ThrowTier::Peak) => {
+                " 🎲  tinhorn — a rocket throw… ".to_string()
+            }
+            None => " 🎲  tinhorn — rolling… ".to_string(),
         }
     } else {
-        " 🎲  roll ".to_string()
+        " 🎲  tinhorn ".to_string()
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -370,7 +372,7 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.dice.is_empty() {
         let p = Paragraph::new(Span::styled(
-            "type a dice expression below and press Enter",
+            "type a dice expression below — Enter does the rest",
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(p, inner);
@@ -522,9 +524,9 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         let mut spans = vec![
             Span::styled(" › ", Style::default().fg(Color::Cyan)),
             key("Enter"),
-            Span::raw(" roll  "),
+            Span::raw(format!(" {}  ", app.mode.label())),
             key("Tab"),
-            Span::raw(" shake  "),
+            Span::raw(" mode  "),
             key("?"),
             Span::raw(" help  "),
             key("^H"),
@@ -532,17 +534,12 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             key("^S"),
             Span::raw(" stats  "),
         ];
-        // Only teach the mute chord where the terminal can actually deliver
-        // it — on legacy encodings Ctrl-M IS Enter, and following this hint
-        // would roll the dice instead.
-        if app.mute_key {
-            spans.push(key("^M"));
-            spans.push(Span::raw(if app.muted {
-                " unmute 🔇  "
-            } else {
-                " mute  "
-            }));
-        }
+        spans.push(key("^Q"));
+        spans.push(Span::raw(if app.muted {
+            " unmute 🔇  "
+        } else {
+            " mute  "
+        }));
         spans.push(key("Esc"));
         spans.push(Span::raw(" quit"));
         Line::from(spans)
@@ -634,9 +631,12 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         syntax_row("d20+5 vs 15", "roll against a target — meet it, beat it"),
         Line::raw(""),
         heading("The Throw"),
-        syntax_row("Tab", "pick up & shake; Enter throws — harder at the peak"),
+        syntax_row(
+            "Enter",
+            "shake the cup; Enter again throws — harder at the peak",
+        ),
+        syntax_row("Tab", "cycle Enter's mode: shake → roll → insta"),
         syntax_row("Esc", "put them down. Power never touches the values."),
-        Line::raw(""),
         Line::from(Span::styled(
             "  Separators: +  -  ,  space  or just write dice next to each other.",
             Style::default().fg(Color::DarkGray),
@@ -652,7 +652,7 @@ fn render_history_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
     if app.history.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no rolls yet — press Enter to roll some dice",
+            "  no rolls yet — shake some dice loose with Enter",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
