@@ -1,64 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 22" width="480" height="352" shape-rendering="crispEdges">
-  <title>tinhorn — a tin cup throwing dice</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 108" width="480" height="216">
+  <title>tinhorn — a dice cup for your terminal</title>
 
-  <!-- rattle sparks around the cup -->
-  <g fill="#E3A93C">
-    <rect x="2" y="8" width="1" height="1"/>
-    <rect x="1" y="11" width="1" height="1"/>
-    <rect x="13" y="11" width="1" height="1"/>
-  </g>
+  <!-- the terminal window -->
+  <rect x="28" y="6" width="184" height="96" rx="8" fill="#26292E" stroke="#5F6973" stroke-width="1"/>
+  <circle cx="44" cy="19" r="3" fill="#5F6973"/>
+  <circle cx="56" cy="19" r="3" fill="#5F6973"/>
+  <circle cx="68" cy="19" r="3" fill="#E3A93C"/>
+  <line x1="28" y1="29" x2="212" y2="29" stroke="#3A3F45" stroke-width="1"/>
 
-  <!-- the tin cup: flared rim, straight body, pressed rib, base -->
-  <g>
-    <rect x="3"  y="9"  width="9" height="1" fill="#C7CFD6"/>
-    <rect x="4"  y="10" width="7" height="8" fill="#9DA7B0"/>
-    <rect x="4"  y="10" width="1" height="8" fill="#C7CFD6"/>
-    <rect x="10" y="10" width="1" height="8" fill="#78828C"/>
-    <rect x="4"  y="13" width="7" height="1" fill="#78828C"/>
-    <rect x="4"  y="18" width="7" height="1" fill="#5F6973"/>
-  </g>
+  <!-- the command -->
+  <text x="44" y="58" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+        font-size="15" font-weight="bold">
+    <tspan fill="#8A93A0">$ </tspan><tspan fill="#EFE6D6">tin</tspan><tspan fill="#E3A93C">horn</tspan></text>
 
-  <!-- flight trail out of the cup -->
-  <g fill="#8A93A0">
-    <rect x="10" y="6" width="1" height="1" opacity="0.30"/>
-    <rect x="13" y="4" width="1" height="1" opacity="0.45"/>
-    <rect x="16" y="3" width="1" height="1" opacity="0.60"/>
-  </g>
+  <!-- block cursor: an amber d6 showing a three -->
+  <rect x="129" y="45" width="14" height="14" fill="#E3A93C"/>
+  <rect x="131.5" y="47.5" width="3" height="3" fill="#33302B"/>
+  <rect x="134.5" y="50.5" width="3" height="3" fill="#33302B"/>
+  <rect x="137.5" y="53.5" width="3" height="3" fill="#33302B"/>
 
-  <!-- a small d4 just clearing the rim -->
-  <g>
-    <rect x="7" y="5" width="1" height="1" fill="#D9CDBA"/>
-    <rect x="6" y="6" width="3" height="1" fill="#C9BCA4"/>
-  </g>
-
-  <!-- the d6: bone white, five pips, self-shadowed pixel style -->
-  <g>
-    <rect x="19" y="1" width="5" height="5" fill="#EFE6D6"/>
-    <rect x="19" y="5" width="5" height="1" fill="#C9BCA4"/>
-    <rect x="23" y="1" width="1" height="5" fill="#C9BCA4"/>
-    <g fill="#33302B">
-      <rect x="20" y="2" width="1" height="1"/>
-      <rect x="22" y="2" width="1" height="1"/>
-      <rect x="21" y="3" width="1" height="1"/>
-      <rect x="20" y="4" width="1" height="1"/>
-      <rect x="22" y="4" width="1" height="1"/>
-    </g>
-  </g>
-
-  <!-- the d20: amber pixel hexagon, shaded toward its base -->
-  <g>
-    <rect x="24" y="7"  width="2" height="1" fill="#E3A93C"/>
-    <rect x="23" y="8"  width="4" height="1" fill="#E3A93C"/>
-    <rect x="22" y="9"  width="6" height="1" fill="#E3A93C"/>
-    <rect x="22" y="10" width="6" height="1" fill="#E3A93C"/>
-    <rect x="23" y="11" width="4" height="1" fill="#C68F2B"/>
-    <rect x="24" y="12" width="2" height="1" fill="#B27E22"/>
-  </g>
-
-  <!-- wordmark -->
-  <text x="15" y="21.4" text-anchor="middle"
-        font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
-        font-size="3.1" font-weight="bold" letter-spacing="0.1">
-    <tspan fill="#8A93A0">tin</tspan><tspan fill="#E3A93C">horn</tspan>
-  </text>
+  <!-- the program answers for itself -->
+  <text x="44" y="76" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace"
+        font-size="9" fill="#8A93A0">a dice cup for your terminal</text>
 </svg>

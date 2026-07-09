@@ -155,7 +155,8 @@ elapsed `dt`, then plays whatever sounds the physics queued.
 
 The name is self-deprecating (a tinhorn talks big at small stakes); the brand
 inverts it: talks like a small-time hustler, delivers scrupulous fairness.
-Tagline register: *all rattle, honest dice.* Four rules for all user-facing
+Tagline: *a dice cup for your terminal* — the name doesn't say what the app
+does, so the tagline must. Four rules for all user-facing
 copy (README, help overlay, arena titles, release notes, launch posts):
 
 1. **Wry, never cosplay.** A dusty phrase as seasoning — "the arena hands

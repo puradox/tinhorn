@@ -2,7 +2,7 @@
 name = "tinhorn"
 version = "0.1.2"
 edition = "2021"
-description = "A fancy dice roller: shake the dice, watch em' fly, hear it bounce."
+description = "A dice cup for your terminal: shake the cup, watch dice fly, hear them land."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/puradox/tinhorn"
 readme = "README.md"
