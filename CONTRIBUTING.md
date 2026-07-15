@@ -34,8 +34,9 @@ Five small modules behind a 60 fps event loop:
 
 - **`parse`** — a hand-written parser that turns notation into a `Roll`: a list
   of **dice terms** (each a count, a side count, and its modifiers — keep/drop,
-  explode, multiply) plus an integer flat modifier and the optional `vs`
-  target. Pure and unit-tested.
+  explode, multiply) plus an integer flat modifier and the optional `Stake` (a
+  target with a `Goal`: meet-or-beat `> N` / `vs N`, or roll-under `< N`). Pure
+  and unit-tested.
 - **`app`** — the state plus a tiny physics simulation. Each die is an
   axis-aligned box with position/velocity; the engine applies gravity, bounces
   off the four walls with restitution, rubs off speed with floor friction and air
@@ -136,7 +137,8 @@ pinned by tests that power shapes the launch but never the values, that the
 expression is locked at pickup, that a fresh shake starts clean, and that
 insta mode rolls the same dice as the animation under the same seed. Stakes
 are tested across the TUI verdict, the CLI exit code, JSON fields, and the
-stats odds — all backed by one shared rule. Key routing is tested so a
+stats odds — all backed by one shared rule — in both directions, meet-or-beat
+(`> N` / `vs N`) and roll-under (`< N`). Key routing is tested so a
 hotkey can never swallow a letter you need to type, and the foley synthesis
 is unit-tested for range, pitch ordering, and loudness scaling.
 

@@ -27,8 +27,8 @@ And what'll it cost you to see all this? Not one thin dime!
 - **Your throw.** Shake the cup and catch the meter at its peak. Put some
   arm into it!
 - **Set the stakes.** Call your number — `d20+5 vs 15` — and the arena hands
-  down the verdict, margin and all. The stats pane quotes you fair odds before
-  you take the bet.
+  down the verdict, margin and all. Playing it low? `d20 < 10` flips the bet
+  to roll-under. The stats pane quotes you fair odds before you take it.
 - **Sound from thin air.** Every click, knock, and thunk synthesized live
   from the very impact that made it. No samples anywhere on the premises.
 - **[Fancy notation.](#dice-notation)** Advantage, drop-the-lowest,
@@ -89,45 +89,70 @@ tallied at once).
 
 ## Dice notation
 
-A roll is a sequence of **dice terms** and optional **flat modifiers**, in any
-combination. Terms can be separated by `+`, `,`, whitespace, or simply written
-next to each other.
+A roll is a sequence of **dice terms** and optional **flat modifiers**,
+separated by `+`, `,`, whitespace, or simply written next to each other. A term
+can carry **modifiers** (keep/drop, explode, multiply) written right after its
+`dN`; these apply in pool order — **explode → keep/drop → multiply** — and
+stack. Add **stakes** to check the total against a target.
 
-| Input         | Meaning                           |
-| ------------- | --------------------------------- |
-| `3d6`         | three six-sided dice              |
-| `d%`          | percentile — shorthand for `d100` |
-| `d6+d8`       | one d6 and one d8                 |
-| `2d20-1`      | two d20 with a −1 modifier        |
-| `d20+5 vs 15` | staked: succeed on a total ≥ 15   |
+### The basics
 
-`d6` means `1d6`. Sizes are capped (≤ 60 dice, ≤ 1000 sides) so a fat-fingered
-`999d99999` can't wedge the renderer. A `vs` target must come last — `d20 vs
-4d6` is an error, not a surprise — and there's at most one per roll.
+| Input    | Meaning                           |
+| -------- | --------------------------------- |
+| `3d6`    | three six-sided dice              |
+| `d20`    | one die — `d6` means `1d6`        |
+| `d%`     | percentile — shorthand for `d100` |
+| `d6+d8`  | one d6 and one d8, summed         |
+| `2d20-1` | dice plus a flat `+`/`−` modifier |
 
-### Per-die modifiers
+Sizes are capped (≤ 60 dice, ≤ 1000 sides) so a fat-fingered `999d99999` can't
+wedge the renderer.
 
-A dice term can carry modifiers written right after the `dN`. They apply in
-pool order — **explode → keep/drop → multiply** — and can be stacked.
+### Keep / drop
 
-| Input       | Meaning                                                |
-| ----------- | ------------------------------------------------------ |
-| `2d20kh1`   | **advantage** — roll two d20, keep the highest 1       |
-| `2d20kl1`   | **disadvantage** — keep the lowest 1                   |
-| `4d6dl1`    | drop the lowest 1 (the classic ability-score roll)     |
-| `4d6dh1`    | drop the highest 1                                     |
-| `3d6!`      | **exploding** — a max face rolls another die (repeats) |
-| `d10!>8`    | explode on any face `> 8` (`<` and `=` work too)       |
-| `4d6*2`     | multiply _this term's_ kept sum by 2                   |
-| `4d6!kh3*2` | stack them: explode, keep the best 3, then double      |
+| Input     | Meaning                                            |
+| --------- | -------------------------------------------------- |
+| `2d20kh1` | **advantage** — roll two d20, keep the highest 1   |
+| `2d20kl1` | **disadvantage** — keep the lowest 1               |
+| `4d6dl1`  | drop the lowest 1 (the classic ability-score roll) |
+| `4d6dh1`  | drop the highest 1                                 |
 
 `kh`/`kl`/`dh`/`dl` default to 1 (`2d20kh` = `2d20kh1`) and clamp to the pool
 size. Dropped dice are still thrown and bounce around — you watch advantage
 discard the lower d20 — but they're rendered dimmed and left out of the total.
+
+### Stakes
+
+Call a target and the arena hands down a verdict — margin and all. At most one
+per roll, and it must come last: `d20 > 4d6` is an error, not a surprise.
+
+| Input        | Meaning                                    |
+| ------------ | ------------------------------------------ |
+| `d20+5 > 15` | **meet or beat** — succeed on a total ≥ 15 |
+| `d20 vs 15`  | the same; `vs` is the word alias for `>`   |
+| `d20 < 10`   | **roll-under** — succeed on a total ≤ 10   |
+
+Both comparisons are inclusive: you win *on* the number.
+
+### Exploding
+
+| Input    | Meaning                                     |
+| -------- | ------------------------------------------- |
+| `3d6!`   | a max face rolls another die (repeats)      |
+| `d10!>8` | explode on any face `> 8` (`<` and `=` too) |
+
 Exploding plays out live: a die that _settles_ on a qualifying face drops one
-more die into the arena, which can explode in turn — capped at 40 extra dice per
-term so `d2!` can't grow without bound. A multiplier binds to its own term: in
-`3d6*2 + d8` only the d6 sum is doubled.
+more die into the arena, which can explode in turn — capped at 40 extra dice
+per term so `d2!` can't grow without bound.
+
+### Multiply
+
+| Input       | Meaning                                           |
+| ----------- | ------------------------------------------------- |
+| `4d6*2`     | multiply _this term's_ kept sum by 2              |
+| `4d6!kh3*2` | stack them: explode, keep the best 3, then double |
+
+A multiplier binds to its own term: in `3d6*2 + d8` only the d6 sum is doubled.
 
 ## Scripting (one-shot mode)
 
@@ -151,8 +176,9 @@ branch on the check itself; `--json` and piped output always exit 0, and a
 parse error goes to stderr and exits 2.
 
 The `--json` output carries every die and its flags, the per-term subtotals,
-the flat modifier, the total, and — when staked — `target`, `success`, and
-`margin`.
+the flat modifier, the total, and — when staked — `target`, `goal`
+(`over` or `under`), `success`, and `margin` (how far the check was made or
+missed by, whichever way the stake runs).
 
 ## Contributing
 

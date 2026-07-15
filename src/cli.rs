@@ -143,11 +143,14 @@ pub fn format_verbose(o: &Outcome) -> String {
 
     let _ = writeln!(s, "  total      {}", o.total);
 
-    // The staked verdict, spelled out with the same wording as the TUI chip
-    // (the exit code carries it for scripts).
-    if let (Some(target), Some(success), Some(margin)) = (o.target, o.success, o.margin) {
+    // The staked verdict, spelled out with the same wording — and the same
+    // `vs`/`vs ≤` label — as the TUI chip (the exit code carries it for scripts).
+    if let (Some(target), Some(goal), Some(success), Some(margin)) =
+        (o.target, o.goal, o.success, o.margin)
+    {
+        let stake = parse::Stake { target, goal };
         let verdict = crate::app::verdict_text(success, margin).to_lowercase();
-        let _ = writeln!(s, "  vs {target:<7} {verdict}");
+        let _ = writeln!(s, "  {:<10} {verdict}", stake.label());
     }
     s
 }
@@ -311,5 +314,30 @@ mod tests {
         // Unstaked JSON omits the stake keys entirely.
         let v: serde_json::Value = serde_json::to_value(outcome("3d6", 1)).unwrap();
         assert!(v.get("target").is_none());
+        assert!(v.get("goal").is_none());
+    }
+
+    #[test]
+    fn roll_under_outcome_and_output() {
+        // A roll-under stake (`< N`) succeeds at or below the target; the
+        // margin is how far under, and every surface reads the flipped direction.
+        for seed in 0..50 {
+            let o = outcome("d20 < 10", seed);
+            assert_eq!(o.target, Some(10));
+            assert_eq!(o.success, Some(o.total <= 10), "seed {seed}");
+            assert_eq!(o.margin, Some(10 - o.total), "seed {seed}");
+        }
+        // JSON spells the direction out; verbose shows the `≤` chip.
+        let o = outcome("d20 < 10", 3);
+        let v: serde_json::Value = serde_json::to_value(&o).unwrap();
+        assert_eq!(v["goal"], "under");
+        let text = format_verbose(&o);
+        assert!(text.contains("vs ≤10"), "roll-under label missing:\n{text}");
+
+        // Meet-or-beat serializes its own direction; `vs` and `>` are aliases.
+        for expr in ["d20 vs 10", "d20 > 10"] {
+            let v: serde_json::Value = serde_json::to_value(outcome(expr, 3)).unwrap();
+            assert_eq!(v["goal"], "over", "{expr}");
+        }
     }
 }

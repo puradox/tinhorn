@@ -3,7 +3,7 @@
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::parse::{self, DiceTerm, Roll, TermMod};
+use crate::parse::{self, DiceTerm, Goal, Roll, Stake, TermMod};
 
 /// Width / height of a die "box" in terminal cells: ┌───┐ / │ N │ / └───┘
 pub const DIE_W: f32 = 6.0;
@@ -89,14 +89,23 @@ impl Die {
     }
 }
 
-/// THE statement of the meet-or-beat rule: `(success, margin)` for a total
-/// checked against a `vs` target. Every consumer — the TUI verdict, the
-/// headless [`evaluate`], the stats pane's success odds — must call this,
-/// never restate the comparison, so the rule can only ever change in one
-/// place. Margin is computed in i64 so an absurd-but-parseable target
-/// (i32::MIN) can't overflow the subtraction.
-pub fn check(total: i32, target: i32) -> (bool, i32) {
-    let margin = (total as i64 - target as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+/// THE statement of the staked-check rule: `(success, margin)` for a total
+/// checked against a [`Stake`]. Every consumer — the TUI verdict, the headless
+/// [`evaluate`], the stats pane's success odds — must call this, never restate
+/// the comparison, so the rule can only ever change in one place.
+///
+/// `margin` is "how much you made it by": positive on success, negative on
+/// failure, whichever way the stake runs. Meet-or-beat measures `total −
+/// target`; roll-under measures `target − total`. Either way `success` is
+/// `margin >= 0`, so [`verdict_text`] reads the same for both directions. The
+/// subtraction is done in i64 so an absurd-but-parseable target (i32::MIN)
+/// can't overflow.
+pub fn check(total: i32, stake: Stake) -> (bool, i32) {
+    let raw = match stake.goal {
+        Goal::Over => total as i64 - stake.target as i64,
+        Goal::Under => stake.target as i64 - total as i64,
+    };
+    let margin = raw.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     (margin >= 0, margin)
 }
 
@@ -262,8 +271,8 @@ pub struct App {
     pub pane_scroll: u16,
     pub dice: Vec<Die>,
     pub modifier: i32,
-    /// `vs N` from the current roll: the total must meet or beat this.
-    pub target: Option<i32>,
+    /// The stakes from the current roll (`vs N`), when it's staked.
+    pub stake: Option<Stake>,
     pub error: Option<String>,
     /// Completed rolls, newest last. Capped so a long session can't grow without
     /// bound; the history pane shows the most recent slice.
@@ -326,7 +335,7 @@ impl App {
             pane_scroll: 0,
             dice: Vec::new(),
             modifier: 0,
-            target: None,
+            stake: None,
             error: None,
             history: Vec::new(),
             pane: Pane::None,
@@ -436,11 +445,11 @@ impl App {
             Ok(Roll {
                 terms,
                 modifier,
-                target,
+                stake,
             }) => {
                 self.error = None;
                 self.modifier = modifier;
-                self.target = target;
+                self.stake = stake;
                 self.explosions = vec![0; terms.len()];
                 let mut dice: Vec<Die> = Vec::new();
                 for (ti, term) in terms.iter().enumerate() {
@@ -672,13 +681,13 @@ impl App {
     }
 
     /// The staked verdict, once everything is settled: [`check`]'s
-    /// `(success, margin)` for the current total against the `vs` target.
+    /// `(success, margin)` for the current total against the `vs` stake.
     pub fn verdict(&self) -> Option<(bool, i32)> {
-        let target = self.target?;
+        let stake = self.stake?;
         if !self.all_settled() {
             return None;
         }
-        Some(check(self.total(), target))
+        Some(check(self.total(), stake))
     }
 
     /// Kept dice that settled on their proudest face — [`crit_face`] on any
@@ -1204,9 +1213,10 @@ impl App {
         let mean = sum as f64 / STAT_SAMPLES as f64;
 
         // A staked expression also gets its odds of succeeding, judged by the
-        // same check() as the real verdict.
-        let success_odds = roll.target.map(|t| {
-            totals.iter().filter(|&&v| check(v, t).0).count() as f64 / STAT_SAMPLES as f64
+        // same check() as the real verdict — so roll-under odds fall as the
+        // target rises, just as the arena's verdict would.
+        let success_odds = roll.stake.map(|s| {
+            totals.iter().filter(|&&v| check(v, s).0).count() as f64 / STAT_SAMPLES as f64
         });
 
         // A coarse histogram over the observed range for the little curve.
@@ -1222,7 +1232,7 @@ impl App {
             min: lo,
             max: hi,
             mean,
-            target: roll.target,
+            stake: roll.stake,
             success_odds,
             dist,
             session,
@@ -1248,9 +1258,9 @@ pub struct Stats {
     pub min: i32,
     pub max: i32,
     pub mean: f64,
-    /// The `vs N` target, when the expression is staked.
-    pub target: Option<i32>,
-    /// Estimated chance the staked roll succeeds (present iff `target` is).
+    /// The stakes (`vs N`), when the expression is staked.
+    pub stake: Option<Stake>,
+    /// Estimated chance the staked roll succeeds (present iff `stake` is).
     pub success_odds: Option<f64>,
     /// Up to a handful of buckets spanning min..=max, for a sparkline-ish curve.
     pub dist: Vec<Bucket>,
@@ -1415,10 +1425,15 @@ pub struct Outcome {
     /// The `vs N` target, when the roll was staked.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<i32>,
-    /// Whether the total met or beat the target (present iff `target` is).
+    /// The stake direction: `over` (meet or beat) or `under` (roll under).
+    /// Present iff `target` is, so JSON consumers read the direction of the
+    /// check rather than guess it from the sign of the margin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Goal>,
+    /// Whether the roll made its stake (present iff `target` is).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
-    /// total − target: how far the check succeeded or failed by.
+    /// How far the check succeeded (≥ 0) or failed (< 0) by, per [`check`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub margin: Option<i32>,
 }
@@ -1501,13 +1516,14 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
     }
 
     // The staked verdict: the same check() App::verdict calls.
-    let checked = roll.target.map(|t| check(total, t));
+    let checked = roll.stake.map(|s| check(total, s));
     Outcome {
         expression: expression.to_string(),
         terms,
         modifier: roll.modifier,
         total,
-        target: roll.target,
+        target: roll.stake.map(|s| s.target),
+        goal: roll.stake.map(|s| s.goal),
         success: checked.map(|(s, _)| s),
         margin: checked.map(|(_, m)| m),
     }
@@ -1779,7 +1795,7 @@ mod tests {
             pane_scroll: 0,
             dice: Vec::new(),
             modifier: 0,
-            target: None,
+            stake: None,
             error: None,
             arena_w: 60.0,
             arena_h: 20.0,
@@ -1988,12 +2004,32 @@ mod tests {
     fn staked_roll_reaches_a_verdict_only_once_settled() {
         for seed in 0..30 {
             let mut app = seeded("d20+2 vs 12", seed);
-            assert_eq!(app.target, Some(12));
+            assert_eq!(app.stake.map(|s| s.target), Some(12));
             assert_eq!(app.verdict(), None, "no verdict while dice are falling");
             settle(&mut app, 6000).expect("never settled");
             let (success, margin) = app.verdict().expect("settled roll must have a verdict");
             assert_eq!(margin, app.total() - 12);
             assert_eq!(success, app.total() >= 12, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_roll_under_verdict_flips_the_comparison() {
+        // Same target, opposite direction: roll-under succeeds when the total
+        // comes in at or below it, and the margin is how far under it landed.
+        for seed in 0..30 {
+            let mut app = seeded("d20 < 10", seed);
+            assert_eq!(
+                app.stake,
+                Some(Stake {
+                    target: 10,
+                    goal: Goal::Under
+                })
+            );
+            settle(&mut app, 6000).expect("never settled");
+            let (success, margin) = app.verdict().expect("settled roll must have a verdict");
+            assert_eq!(success, app.total() <= 10, "seed {seed}");
+            assert_eq!(margin, 10 - app.total(), "seed {seed}");
         }
     }
 

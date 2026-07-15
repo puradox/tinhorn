@@ -435,13 +435,14 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("   "),
     ];
 
-    match (app.target, app.verdict()) {
-        // Settled with stakes: slam the verdict (the wording is shared with
-        // the CLI's verbose breakdown so the two can't drift).
-        (Some(target), Some((success, margin))) => {
+    match (app.stake, app.verdict()) {
+        // Settled with stakes: slam the verdict (the wording — and the stake's
+        // `vs`/`vs ≤` label — is shared with the CLI's verbose breakdown so the
+        // two can't drift).
+        (Some(stake), Some((success, margin))) => {
             let bg = if success { Color::Green } else { Color::Red };
             total_spans.push(Span::styled(
-                format!("vs {target}  "),
+                format!("{}  ", stake.label()),
                 Style::default().fg(Color::Gray),
             ));
             total_spans.push(Span::styled(
@@ -453,9 +454,9 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         // Stakes declared, dice still falling: show what's at stake.
-        (Some(target), None) => {
+        (Some(stake), None) => {
             total_spans.push(Span::styled(
-                format!("vs {target}  (rolling…)"),
+                format!("{}  (rolling…)", stake.label()),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -629,13 +630,13 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, scroll: u16) -> u16 {
         syntax_row("4d6dl1", "drop the lowest 1 (ability scores)"),
         syntax_row("4d6dh1", "drop the highest 1"),
         Line::raw(""),
+        heading("Stakes & multiply"),
+        syntax_row("d20 > 15", "beat a target (or 'vs'); < N rolls under"),
+        syntax_row("4d6*2", "double this term's sum (modifiers stack)"),
+        Line::raw(""),
         heading("Exploding"),
         syntax_row("3d6!", "a max face rolls another die"),
         syntax_row("d10!>8", "explode on any face over 8 (also !=N, !<N)"),
-        Line::raw(""),
-        heading("Multiply & stakes"),
-        syntax_row("4d6*2", "double this term's sum (modifiers stack)"),
-        syntax_row("d20+5 vs 15", "roll against a target — meet it, beat it"),
         Line::raw(""),
         heading("The Throw"),
         syntax_row(
@@ -736,12 +737,15 @@ fn stats_lines(s: &Stats) -> Vec<Line<'static>> {
     ];
 
     // A staked expression leads with what matters: the odds of making it.
-    if let (Some(target), Some(odds)) = (s.target, s.success_odds) {
+    if let (Some(stake), Some(odds)) = (s.stake, s.success_odds) {
         lines.insert(
             1,
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled(format!("vs {target}: "), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{}: ", stake.label()),
+                    Style::default().fg(Color::Gray),
+                ),
                 Span::styled(
                     format!("{:.0}% to succeed", odds * 100.0),
                     Style::default()

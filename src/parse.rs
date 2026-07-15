@@ -17,10 +17,13 @@
 //!   "4d6*2"      -> multiply this term's kept sum by 2
 //!
 //! Stakes (at most one, anywhere a separator could go — conventionally last):
-//!   "d20+5 vs 15" -> roll against a target: total >= 15 succeeds
+//!   "d20+5 > 15"  -> meet or beat a target: total >= 15 succeeds
+//!   "d20+5 vs 15" -> the same thing; 'vs' is an alias for '>'
+//!   "d20 < 10"    -> roll-under: total <= 10 succeeds
+//! Both comparisons are inclusive — you win *on* the number.
 //!
 //! Grammar (loosely):
-//!   expr  := term ( sep? term )* [ ('vs'|'VS') n ]
+//!   expr  := term ( sep? term )* [ ('vs'|'VS'|'>'|'<') n ]
 //!   sep   := '+' | '-' | ',' | whitespace
 //!   term  := [count] ('d'|'D') sides termmod*   |   integer
 //!   sides := digits | '%'                       ('%' means 100)
@@ -70,14 +73,49 @@ pub struct DiceTerm {
     pub mods: Vec<TermMod>,
 }
 
+/// Which way a staked roll is won: reach the target from below or from above.
+/// `> N` (and its word alias `vs N`) is meet-or-beat; `< N` flips it to
+/// roll-under. Serialized in `--json` (`"goal": "over"` / `"under"`) so
+/// consumers read the direction rather than re-derive it. See [`super::app::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Goal {
+    /// Meet-or-beat (`>`): the total must reach the target (`total >= target`).
+    Over,
+    /// Roll-under (`<`): the total must come in at or below it (`total <= target`).
+    Under,
+}
+
+/// The stakes on a roll: a target plus the direction the total must reach it
+/// from. Bundling the two makes "a direction only means something when there
+/// is a target" unrepresentable — an unstaked roll is simply `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stake {
+    pub target: i32,
+    pub goal: Goal,
+}
+
+impl Stake {
+    /// The compact chip text, e.g. `vs 15` or `vs ≤10`. Shared by the arena
+    /// verdict chip, the stats pane, and the CLI breakdown so the three can
+    /// never disagree about how a stake is spelled, and so the roll-under `≤`
+    /// is always shown next to its target.
+    pub fn label(&self) -> String {
+        match self.goal {
+            Goal::Over => format!("vs {}", self.target),
+            Goal::Under => format!("vs ≤{}", self.target),
+        }
+    }
+}
+
 /// The fully-parsed request: a sequence of dice terms plus a flat modifier,
 /// and — when the roll has stakes — the target the total is checked against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Roll {
     pub terms: Vec<DiceTerm>,
     pub modifier: i32,
-    /// `vs N`: the roll succeeds when the total meets or beats this.
-    pub target: Option<i32>,
+    /// The stakes (`vs N`), when the roll is staked.
+    pub stake: Option<Stake>,
 }
 
 // Sanity limits so "999d999999" can't wedge the renderer or the RNG loop.
@@ -94,7 +132,7 @@ pub fn parse(input: &str) -> Result<Roll, String> {
     let mut modifier: i32 = 0;
     let mut sign: i32 = 1;
     let mut saw_term = false;
-    let mut target: Option<i32> = None;
+    let mut stake: Option<Stake> = None;
 
     while i < n {
         let c = chars[i];
@@ -105,31 +143,31 @@ pub fn parse(input: &str) -> Result<Roll, String> {
             continue;
         }
 
-        // Stakes: `vs N` names the target the total must meet or beat. Matched
-        // before term parsing so the 'v' can't fall through to "unexpected
+        // Stakes: name a target the total is checked against. `>` (and its
+        // word alias `vs`) is meet-or-beat; `<` is roll-under. Matched before
+        // term parsing so the introducer can't fall through to "unexpected
         // character". The target must end the roll: allowing dice after it
         // would make a contested-roll attempt like `d20 vs 4d6` silently parse
         // as "target 4, plus a d6 for me" — an error beats a misparse.
-        if vs_keyword(&chars, i) {
-            if target.is_some() {
-                return Err("only one 'vs' target per roll".to_string());
+        if let Some(goal) = stake_goal(&chars, &mut i) {
+            if stake.is_some() {
+                return Err("only one target per roll".to_string());
             }
-            i += 2;
             while i < n && chars[i].is_whitespace() {
                 i += 1;
             }
-            let t = parse_required_int(
+            let target = parse_required_int(
                 &chars,
                 &mut i,
-                "expected a target after 'vs' (e.g. d20 vs 15)",
+                "expected a target after 'vs' / '>' / '<' (e.g. d20 vs 15 or d20 < 10)",
             )?;
             while i < n && chars[i].is_whitespace() {
                 i += 1;
             }
             if i < n {
-                return Err("the 'vs' target must come last (e.g. d20+5 vs 15)".to_string());
+                return Err("the target must come last (e.g. d20+5 vs 15)".to_string());
             }
-            target = Some(t);
+            stake = Some(Stake { target, goal });
             continue;
         }
         if c == '+' {
@@ -218,13 +256,33 @@ pub fn parse(input: &str) -> Result<Roll, String> {
     Ok(Roll {
         terms,
         modifier,
-        target,
+        stake,
     })
 }
 
 /// Match the stakes keyword `vs` at `pos` without consuming (case-insensitive).
 fn vs_keyword(chars: &[char], pos: usize) -> bool {
     matches!(chars.get(pos), Some('v' | 'V')) && matches!(chars.get(pos + 1), Some('s' | 'S'))
+}
+
+/// Detect a stake introducer at `i` and, on a match, consume it and name the
+/// direction: `>` (and its word alias `vs`) is meet-or-beat ([`Goal::Over`]),
+/// `<` is roll-under ([`Goal::Under`]). Both are inclusive — a total equal to
+/// the target wins either way — so there is no separate `>=`/`<=`. Returns
+/// `None` and leaves `i` untouched when no introducer is present, so the
+/// character falls through to the rest of the parse.
+fn stake_goal(chars: &[char], i: &mut usize) -> Option<Goal> {
+    if vs_keyword(chars, *i) {
+        *i += 2;
+        return Some(Goal::Over);
+    }
+    let goal = match chars.get(*i) {
+        Some('>') => Goal::Over,
+        Some('<') => Goal::Under,
+        _ => return None,
+    };
+    *i += 1;
+    Some(goal)
 }
 
 /// Consume any run of term modifiers (`kh`/`kl`/`dh`/`dl`/`!`/`*`) sitting right
@@ -422,7 +480,13 @@ mod tests {
         // Term modifiers and stakes attach exactly as they would to 'd100'.
         let r = parse("2d%kh1 vs 60").unwrap();
         assert_eq!(term(&r, 0).mods, vec![TermMod::KeepHigh(1)]);
-        assert_eq!(r.target, Some(60));
+        assert_eq!(
+            r.stake,
+            Some(Stake {
+                target: 60,
+                goal: Goal::Over
+            })
+        );
 
         // '%' anywhere else is still an error.
         assert!(parse("%").is_err());
@@ -502,23 +566,75 @@ mod tests {
 
     #[test]
     fn stakes_target() {
-        // The canonical form, with and without spaces, any case.
-        for expr in ["d20+5 vs 15", "d20+5vs15", "d20+5 VS 15"] {
+        // Meet-or-beat: `vs` and `>` are the same, with or without spaces, any
+        // case. `vs` is just the word alias for `>`.
+        for expr in [
+            "d20+5 vs 15",
+            "d20+5vs15",
+            "d20+5 VS 15",
+            "d20+5 > 15",
+            "d20+5>15",
+        ] {
             let r = parse(expr).unwrap();
-            assert_eq!(r.target, Some(15), "{expr}");
+            assert_eq!(
+                r.stake,
+                Some(Stake {
+                    target: 15,
+                    goal: Goal::Over
+                }),
+                "{expr}"
+            );
             assert_eq!(r.modifier, 5, "{expr}");
         }
-        // No stakes: target is absent.
-        assert_eq!(parse("3d6").unwrap().target, None);
+        // No stakes: the stake is absent.
+        assert_eq!(parse("3d6").unwrap().stake, None);
         // The target may be negative (weird, but well-defined).
-        assert_eq!(parse("d6 vs -2").unwrap().target, Some(-2));
+        assert_eq!(
+            parse("d6 vs -2").unwrap().stake,
+            Some(Stake {
+                target: -2,
+                goal: Goal::Over
+            })
+        );
+    }
+
+    #[test]
+    fn stakes_roll_under() {
+        // `<` is roll-under, spaced or not, and the target still ends the roll.
+        for expr in ["d20 < 15", "d20<15", "2d6<7"] {
+            let goal = parse(expr).unwrap().stake.map(|s| s.goal);
+            assert_eq!(goal, Some(Goal::Under), "{expr}");
+        }
+        assert_eq!(
+            parse("d20 < 15").unwrap().stake,
+            Some(Stake {
+                target: 15,
+                goal: Goal::Under
+            })
+        );
+        // Roll-under against a negative target still parses (the `-` is the
+        // number's sign, not another operator).
+        assert_eq!(
+            parse("d6 < -2").unwrap().stake,
+            Some(Stake {
+                target: -2,
+                goal: Goal::Under
+            })
+        );
     }
 
     #[test]
     fn stakes_errors() {
         assert!(parse("d20 vs").is_err(), "vs needs a number");
+        assert!(parse("d20 >").is_err(), "'>' needs a number");
+        assert!(parse("d20 <").is_err(), "roll-under still needs a number");
         assert!(parse("d20 vs 10 vs 12").is_err(), "one target only");
+        assert!(parse("d20 > 10 < 5").is_err(), "one target only");
         assert!(parse("vs 15").is_err(), "stakes with no dice is not a roll");
+        assert!(
+            parse("< 15").is_err(),
+            "roll-under with no dice is not a roll"
+        );
         // The target ends the roll: trailing terms are an error, not a bonus
         // die quietly added to the roller's own pool.
         assert!(
