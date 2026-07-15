@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/puradox/tinhorn/compare/v0.1.2...v0.1.3) - 2026-07-15
+
+### Added
+
+- *(parse)* add roll-under stakes with > and < operators ([#16](https://github.com/puradox/tinhorn/pull/16))
+
+### Other
+
+- *(brand)* adopt the terminal-prompt logo and new tagline ([#14](https://github.com/puradox/tinhorn/pull/14))
+
 ## [0.1.2](https://github.com/puradox/tinhorn/compare/v0.1.1...v0.1.2) - 2026-07-08
 
 ### Added
