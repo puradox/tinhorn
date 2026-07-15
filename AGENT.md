@@ -38,11 +38,13 @@ polls for a key for up to one frame budget, advances the physics by the real
 elapsed `dt`, then plays whatever sounds the physics queued.
 
 - **`parse`** — hand-written parser: notation → `Roll` (a `Vec<DiceTerm>` + flat
-  `i32` modifier + optional `vs` target for staked rolls). Each `DiceTerm` is
+  `i32` modifier + optional `Stake` for staked rolls). Each `DiceTerm` is
   count, sides, and modifiers (`TermMod`: keep/drop, explode with a `Compare`,
   multiply). Pure and unit-tested. Sizes are capped (≤ 60 dice, ≤ 1000 sides) so
   a huge expression can't wedge the renderer; the `vs` target must come last and
-  is range-checked into `i32`.
+  is range-checked into `i32`. A `Stake` bundles that target with a `Goal`
+  (`Over` for `>` and its word alias `vs`, `Under` for the roll-under `<`) so a
+  direction can only exist alongside a target; both comparisons are inclusive.
 
 - **`app`** — state plus the physics simulation and the roll evaluator.
   - `App` holds the dice, input line, `Pane` (Help/History/Stats overlays),
@@ -69,8 +71,10 @@ elapsed `dt`, then plays whatever sounds the physics queued.
     base pool → per-term multiply → flat modifier. This is the shared contract:
     the one-shot CLI and the TUI must agree, so changes to roll rules belong here
     and in the animated path together.
-  - Single-source rule helpers back both paths: `check()` (the `vs` meet-or-beat
-    verdict, also used by the stats pane's success odds), `verdict_text()` (the
+  - Single-source rule helpers back both paths: `check()` (the `vs` verdict for
+    either `Goal` — meet-or-beat or roll-under — returning a direction-aware
+    margin, also used by the stats pane's success odds), `Stake::label()` (the
+    `vs`/`vs ≤` chip text shared by TUI and CLI), `verdict_text()` (the
     SUCCESS/FAIL wording shared by TUI chip and CLI), and `crit_face()`/
     `fumble_face()` (any die maxing / rolling 1; drives particles, sounds, and
     the `crit`/`fumble` flags in JSON). Never restate these comparisons inline.
