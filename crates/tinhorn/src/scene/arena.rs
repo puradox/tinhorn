@@ -19,6 +19,38 @@ fn col(c: Rgb) -> Color {
     Color::srgb_u8(c.0, c.1, c.2)
 }
 
+/// Wrap a baked `render3d` texture (RGBA, row-major) as a Bevy sRGB image — the
+/// same procedural generators the software renderer uses, straight onto Bevy
+/// materials (the plan's "wrap as `Image::new`" path).
+fn tex_image(t: &crate::render3d::texture::Texture) -> Image {
+    Image::new(
+        Extent3d {
+            width: t.width,
+            height: t.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        t.data.clone(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// A lit material showing a baked texture as-is (white base, so the texture's own
+/// colours come through rather than being multiplied down).
+fn textured(
+    materials: &mut Assets<StandardMaterial>,
+    image: Handle<Image>,
+    rough: f32,
+) -> Handle<StandardMaterial> {
+    materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(image),
+        perceptual_roughness: rough,
+        ..default()
+    })
+}
+
 // Furniture tones the tray palette doesn't carry (approximating render_arena).
 const RAIL: Rgb = Rgb(128, 86, 58); // lighter wood along the wall tops
 const TABLE: Rgb = Rgb(92, 60, 40); // mahogany table slab
@@ -49,8 +81,10 @@ pub fn spawn(
         })
     };
 
-    // --- Green-baize felt bed, its surface at the physics floor. ---
-    let felt = matte(materials, style.floor, 0.95);
+    // --- Green-baize felt bed (mottled pile + recess AO baked in), its surface
+    //     at the physics floor. ---
+    let felt_tex = images.add(tex_image(&crate::ui::felt_texture(style.floor)));
+    let felt = textured(materials, felt_tex, 0.95);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(HX * 2.0, 0.25, HZ * 2.0))),
         MeshMaterial3d(felt),
@@ -121,8 +155,9 @@ pub fn spawn(
         Transform::from_xyz(0.0, rug_y + 0.01, 1.0),
     ));
 
-    // --- Broad room floor of lit oak, well below the rug. ---
-    let floor = matte(materials, OAK, 0.85);
+    // --- Broad room floor of lit oak floorboards, well below the rug. ---
+    let floor_tex = images.add(tex_image(&crate::ui::floor_texture(OAK)));
+    let floor = textured(materials, floor_tex, 0.85);
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(46.0, 0.1, 46.0))),
         MeshMaterial3d(floor),
@@ -146,12 +181,9 @@ pub fn spawn(
         Transform::from_xyz(0.0, rug_y + 13.0, -13.0),
     ));
 
-    // --- Heavy oxblood stage curtains flanking the backdrop. ---
-    let curtain = materials.add(StandardMaterial {
-        base_color: col(CURTAIN),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
+    // --- Heavy oxblood stage curtains flanking the backdrop (velvet streak). ---
+    let velvet = images.add(tex_image(&crate::ui::velvet_texture(CURTAIN)));
+    let curtain = textured(materials, velvet, 0.9);
     for side in [-1.0f32, 1.0] {
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(3.2, 12.0, 0.4))),

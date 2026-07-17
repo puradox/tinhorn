@@ -173,7 +173,7 @@ fn grain_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture>
 /// Cached by colour; `wall_dist` is the UV distance at which the recess shadow
 /// fades out. UVs run `u` across the width, `v` from the back wall (0) to the
 /// open front (1).
-fn felt_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
+pub(crate) fn felt_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
     use crate::render3d::texture::Texture;
 
     static CACHE: TexCache = TexCache::new();
@@ -219,7 +219,7 @@ fn felt_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> 
 /// subtle on purpose: the drape's *geometry* (free-hanging scalloped edge +
 /// corrugated folds) does the talking; this only keeps the cloth from reading
 /// flat. Cached by colour.
-fn velvet_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
+pub(crate) fn velvet_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
     use crate::render3d::texture::Texture;
 
     static CACHE: TexCache = TexCache::new();
@@ -253,7 +253,7 @@ fn velvet_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture
 /// frame the bold seam lines are what actually read as "a floor" rather than a
 /// flat brown field. Planks run along the texture's `v`; seams sit at regular `u`.
 /// Cached by colour.
-fn floor_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
+pub(crate) fn floor_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
     use crate::render3d::texture::Texture;
 
     static CACHE: TexCache = TexCache::new();
