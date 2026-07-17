@@ -882,8 +882,9 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter, false);
         assert!(app.all_settled());
 
-        // The 3D die renders as half-blocks in the arena, and its value is burned
-        // in — proving the whole render3d → blit → overlay path reaches the buffer.
+        // With no GPU pixels here, the arena blit is empty, but the overlay path
+        // still burns the settled die's value onto the buffer — proving the
+        // sim → overlay path reaches the frame without the Bevy render.
         terminal
             .draw(|f| {
                 ui::render_bevy(f, &mut app, &[], 0, 0);

@@ -1,9 +1,8 @@
 //! The static casino-tray furniture for the Bevy arena — the felt bed, the
 //! mahogany tray walls and rails, the wood table, the room floor, the gradient
-//! backdrop, the stage curtains, the poker-chip stacks, and the rug. Ported from
-//! the software `ui::render_arena`, reusing its [`ArenaStyle`] palette so the two
-//! renderers share one look. Real geometry lit by the same key/rim as the dice;
-//! shadow maps replace the old baked contact shadows.
+//! backdrop, the stage curtains, the poker-chip stacks, and the rug. Real Bevy
+//! geometry drawn from the [`ArenaStyle`] palette, lit by the same key/rim as
+//! the dice; shadow maps cast the dice's contact shadows onto the felt.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
@@ -16,12 +15,12 @@ use crate::paint::Rgb;
 use crate::ui::ArenaStyle;
 use tinhorn_core::physics::{HX, HY, HZ};
 
-/// `render3d` palette colour → Bevy sRGB colour.
+/// palette colour → Bevy sRGB colour.
 fn col(c: Rgb) -> Color {
     Color::srgb_u8(c.0, c.1, c.2)
 }
 
-/// Wrap a baked `render3d` texture (RGBA, row-major) as a Bevy sRGB image — the
+/// Wrap a baked procedural texture (RGBA, row-major) as a Bevy sRGB image — the
 /// same procedural generators the software renderer uses, straight onto Bevy
 /// materials (the plan's "wrap as `Image::new`" path).
 fn tex_image(t: &crate::paint::Texture) -> Image {
@@ -83,7 +82,7 @@ fn textured_tiled(
     })
 }
 
-// Furniture tones the tray palette doesn't carry (approximating render_arena).
+// Furniture tones the tray palette doesn't carry (from the old software palette).
 const RAIL: Rgb = Rgb(128, 86, 58); // lighter wood along the wall tops
 const TABLE: Rgb = Rgb(92, 60, 40); // mahogany table slab
 const APRON: Rgb = Rgb(74, 47, 31); // its shadowed front/side apron
@@ -375,7 +374,7 @@ fn curtain_mesh(w: f32, h: f32, folds: u32) -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// Lerp two `render3d` colours in sRGB byte space.
+/// Lerp two palette colours in sRGB byte space.
 fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     Rgb(l(a.0, b.0), l(a.1, b.1), l(a.2, b.2))

@@ -347,7 +347,7 @@ const PALETTE: [Rgb; 8] = [
     Rgb(230, 130, 230),
 ];
 
-/// The render3d colour for die palette slot `idx`.
+/// The colour for die palette slot `idx`.
 pub(crate) fn die_rgb(idx: usize) -> Rgb {
     PALETTE[idx % PALETTE.len()]
 }
@@ -517,7 +517,7 @@ pub(crate) fn number_scale(die_w: f32, die_h: f32, n_digits: i32) -> i32 {
 }
 
 /// Draw one die's number into the arena at the frame's shared `scale` — computed
-/// once in [`render_arena`] so every die reads the same, never a mix of a big
+/// once for the whole roll so every die reads the same, never a mix of a big
 /// number on the nearest die and single cells on the rest. Scale 0 is the crisp
 /// single-cell overlay (small dice, or the whole roll on a narrow terminal); ≥1
 /// renders the digits as an outlined [`DIGIT_FONT`] glyph sitting on the
@@ -689,8 +689,8 @@ fn draw_big_number(
     }
 }
 
-/// The arena: the actual roll as tumbling polyhedra, rendered through the
-/// vendored render3d pipeline. Each die spins while airborne and freezes when it
+/// The arena: the actual roll as tumbling polyhedra, rendered from the Bevy
+/// scene. Each die spins while airborne and freezes when it
 /// settles; the instant it does, its RNG-decided value is "burned" onto the face
 /// pointing at you. Position comes from the sim; the RNG-decided values and total
 /// are untouched — the renderer only shows them off.
@@ -718,8 +718,7 @@ fn arena_title(app: &App) -> String {
 /// every die (riding the face that points at us — anchored to that face, faded
 /// edge-on, burned to the RNG value on settle; skipped while shaking, dice in the
 /// cup), crit/fumble particles, the shake power meter, the release echo, and the
-/// idle hint. Shared by the software `render_arena` and the Bevy path, so both
-/// draw the identical ceremony; `camera` MUST be the one the arena was rendered
+/// idle hint. Drawn over the Bevy-rendered arena;
 /// through, so the numbers and bursts land on their dice.
 fn draw_arena_overlays(
     frame: &mut Frame,
@@ -771,10 +770,10 @@ fn draw_arena_overlays(
     }
 }
 
-/// Compose the full interactive frame for the **Bevy** arena: the same four-row
-/// layout and chrome as [`render`], but the arena panel is the CPU-read Bevy
-/// render blitted as half-blocks (fg = upper pixel, bg = lower) rather than the
-/// software `render_arena`. `pixels` is the row-padded RGBA8 readback of a
+/// Compose the full interactive frame for the **Bevy** arena: a four-row layout
+/// (result panel, arena, input line, help bar) whose arena panel is the CPU-read
+/// Bevy render blitted as half-blocks (fg = upper pixel, bg = lower).
+/// `pixels` is the row-padded RGBA8 readback of a
 /// `img_w`×`img_h` image sized to this arena's inner cell grid, so the blit is
 /// 1:1 and the overlays (projected through the same `live_camera`) land on their
 /// dice. Returns the arena inner size so the scene can size its render target.
@@ -852,7 +851,7 @@ const ARENA_SS: u32 = 2;
 /// upper pixel, bg = lower). The render is supersampled — `img_w`/`img_h` are
 /// `ARENA_SS×` the `inner.width`/`inner.height*2` grid — so each output subpixel
 /// box-averages an `ss`×`ss` block, smoothing the boxy edges. Then a warm-graded
-/// radial vignette (the software `render3d_view::vignette`) pulls the eye in. A
+/// radial vignette (the old software renderer's vignette) pulls the eye in. A
 /// no-op until the first readback of the right size lands.
 fn blit_bevy_arena(
     buf: &mut ratatui::buffer::Buffer,
@@ -977,7 +976,7 @@ fn draw_particle(buf: &mut ratatui::buffer::Buffer, inner: Rect, p: &Particle) {
 }
 
 /// The throw's power meter, drawn while shaking (the Throw). The cup itself is
-/// now a real 3D tumbler in the arena scene ([`dice::cup`](crate::render3d::dice::cup));
+/// now a real 3D tumbler in the arena scene (`tinhorn_core::dice_geom::cup`);
 /// this is just the instrument read-out above it — fixed and centred so your eye
 /// can time the release against it, colour-coding the power you'd catch right now.
 fn draw_power_meter(buf: &mut ratatui::buffer::Buffer, inner: Rect, app: &App) {
