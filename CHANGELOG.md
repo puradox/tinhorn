@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/puradox/tinhorn/compare/v0.1.3...v0.1.4) - 2026-07-17
+
+### Added
+
+- *(render)* tumble dice as real 3D polyhedra in a rendered tray ([#17](https://github.com/puradox/tinhorn/pull/17))
+
 ## [0.1.3](https://github.com/puradox/tinhorn/compare/v0.1.2...v0.1.3) - 2026-07-15
 
 ### Added
