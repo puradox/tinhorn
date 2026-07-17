@@ -18,11 +18,13 @@ use std::time::Duration;
 
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::RenderTarget;
-use bevy::pbr::{DistanceFog, FogFalloff};
+use bevy::camera::{Hdr, RenderTarget};
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::pbr::{DistanceFog, FogFalloff, ScreenSpaceAmbientOcclusion};
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::view::Msaa;
 use bevy::window::{ExitCondition, WindowPlugin};
 use bevy_ratatui::event::KeyMessage;
 use bevy_ratatui::{RatatuiContext, RatatuiPlugins};
@@ -216,19 +218,27 @@ fn setup(
         ArenaCamera,
         Camera3d::default(),
         RenderTarget::from(handle.clone()),
+        // Realism the CPU rasterizer never had: render HDR and tonemap it
+        // filmically (highlights roll off instead of clipping), 4× MSAA for clean
+        // edges, and screen-space ambient occlusion to ground the dice in the
+        // felt and darken the tray's inner corners.
+        Hdr,
+        Tonemapping::TonyMcMapface,
+        Msaa::Sample4,
+        ScreenSpaceAmbientOcclusion::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: std::f32::consts::FRAC_PI_4,
             ..default()
         }),
         Transform::from_translation(convert::vec3(cam.position))
             .looking_at(convert::vec3(cam.target), Vec3::Y),
-        // Low ambient so the warm key light can carve a spotlit pool on the felt
-        // (the drama the software renderer gets from per-fragment falloff). The
-        // room stays visible because its floor/backdrop are *unlit*, not because
-        // ambient floods everything flat.
+        // Low, slightly cool ambient so the warm key light can carve a spotlit
+        // pool on the felt (the drama the software renderer gets from per-fragment
+        // falloff). The room stays visible because its floor/backdrop are *unlit*,
+        // not because ambient floods everything flat.
         AmbientLight {
-            color: Color::srgb(0.5, 0.55, 0.7),
-            brightness: 90.0,
+            color: Color::srgb(0.42, 0.48, 0.62),
+            brightness: 70.0,
             ..default()
         },
         // Recede far geometry into the room; a warm colour so the floor's far
@@ -254,7 +264,7 @@ fn setup(
         ArenaKeyLight,
         PointLight {
             color: Color::srgb(1.0, 0.86, 0.66),
-            intensity: 5_000_000.0,
+            intensity: 9_000_000.0,
             range: 60.0,
             shadow_maps_enabled: true,
             ..default()
@@ -384,7 +394,7 @@ fn sync_dice_scene(
         let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(die.sides)));
         let material = materials.add(StandardMaterial {
             base_color: die_color(die),
-            perceptual_roughness: 0.4,
+            perceptual_roughness: 0.28,
             ..default()
         });
         commands.spawn((
@@ -435,7 +445,7 @@ fn choreograph(
     if let Ok(mut light) = key_light.single_mut() {
         // Brighten with hard-impact energy and a crit flare.
         let boost = 1.0 + app.impact_energy() * 0.6 + app.flash() * 1.5;
-        light.intensity = 5_000_000.0 * boost;
+        light.intensity = 9_000_000.0 * boost;
     }
 }
 
