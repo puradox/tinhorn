@@ -56,11 +56,10 @@ pub struct Cli {
     #[arg(long)]
     pub mute: bool,
 
-    /// Render the interactive arena with the experimental Bevy backend (Stage-2
-    /// spike). Needs a build with `--features bevy`; ignored in one-shot mode.
-    /// `TINHORN_BEVY=1` does the same. Hidden while the old renderer is default.
-    #[arg(long, hide = true)]
-    pub bevy: bool,
+    /// Use the legacy software renderer for the interactive arena instead of the
+    /// default Bevy backend. (Ignored in one-shot mode, which never renders.)
+    #[arg(long)]
+    pub legacy_render: bool,
 }
 
 impl Cli {

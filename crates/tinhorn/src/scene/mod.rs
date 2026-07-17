@@ -1,15 +1,17 @@
-//! Stage-2 Bevy visual spike: a handful of dice, the shared arena camera, and a
-//! shadow-casting light, rendered headless by Bevy into an offscreen image,
-//! read back to the CPU with Bevy 0.19's built-in `gpu_readback`, and blitted
-//! into the terminal as half-blocks through `bevy_ratatui`'s `RatatuiContext`.
+//! The Bevy dice arena — the default interactive renderer.
 //!
-//! This is deliberately minimal — fixed dice poses, one HalfBlock strategy, no
-//! chrome — its only job is to prove the pipeline end to end (headless Bevy →
-//! texture → CPU → ratatui) and be the tuning surface for later parity work. It
-//! reuses the *same* dice geometry ([`dice_geom`]) and camera framing
-//! ([`view_math`]) as the shipping software renderer, so what it draws is the
-//! real arena's dice, not stand-ins. Everything here is compiled only under the
-//! `bevy` feature; nothing on the one-shot CLI path can reach it.
+//! `App` (the core sim) is the single source of truth; the Bevy entities are a
+//! pure view of it (Architecture decision 2). Each frame the input system feeds
+//! keys to the shared `handle_key`, `advance_sim` steps the physics,
+//! `sync_dice_scene` mirrors `app.dice` into `DieView` entities, the camera and
+//! lights choreograph off the sim's envelopes, and `draw_ui` composes the CPU
+//! read-back of the Bevy render (blitted as half-blocks) with all of tinhorn's
+//! ratatui chrome via [`ui::render_bevy`]. The render target autoresizes to the
+//! arena panel so the blit is 1:1 and the burned-number overlays land on their
+//! dice.
+//!
+//! Only the interactive/snapshot paths reach here; the one-shot CLI never
+//! constructs a Bevy `App`, so scripting stays GPU-free.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,61 +25,53 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, T
 use bevy::window::{ExitCondition, WindowPlugin};
 use bevy_ratatui::event::KeyMessage;
 use bevy_ratatui::{RatatuiContext, RatatuiPlugins};
-use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::Rect;
-use ratatui::style::{Color as TColor, Style};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyEventKind, KeyModifiers};
+use ratatui::style::Color as TColor;
 
-use tinhorn_core::app::{App as DiceApp, Die, crit_face, fumble_face};
+use tinhorn_core::app::{App as DiceApp, Die, SoundEvent, crit_face, fumble_face};
 use tinhorn_core::{dice_geom, physics, view_math};
+
+use crate::foley::Foley;
+use crate::{Action, handle_key, ui};
 
 mod convert;
 
-/// Offscreen render-target resolution. A wide-ish 8:5 so the arena framing (which
-/// derives its distance from the view aspect) matches a typical terminal; the
-/// blit downsamples this to whatever cell grid the terminal offers.
-const RENDER_W: u32 = 480;
-const RENDER_H: u32 = 300;
+/// Impact/knock sounds voiced per frame; more is mush (mirrors the legacy loop).
+const MAX_CLICKS_PER_FRAME: usize = 8;
 
-/// wgpu requires texture→buffer copies to pad each row to this many bytes, and
-/// Bevy's readback hands back the *padded* buffer verbatim — so the blit reads
-/// with this stride, not `width * 4`.
-const ROW_ALIGN: usize = 256;
+/// Fixed terminal size the headless snapshot composes into (cols × rows).
+const SNAP_COLS: u16 = 100;
+const SNAP_ROWS: u16 = 38;
 
-/// Build and run the Bevy arena. Blocks until the user quits (`q`/Esc). Only
-/// called from the interactive path, never one-shot, so entering raw mode and
-/// initialising a GPU here can't affect scripting.
-pub fn run(expr: String, seed: Option<u64>) {
-    // Headless self-validation: `TINHORN_BEVY_SNAPSHOT=<path>` renders the same
-    // scene to a PNG instead of the terminal, then exits. No RatatuiContext, so
-    // no TTY is required — this is how the render is checked in CI or from a
-    // non-interactive shell (open the PNG to eyeball the dice, felt, and shadows).
+/// Entry point (interactive or headless snapshot). Only called off the
+/// interactive CLI path, never one-shot.
+pub fn run(expr: String, seed: Option<u64>, muted: bool) {
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
-        run_snapshot(&expr, seed, PathBuf::from(path));
+        run_snapshot(&expr, seed, muted, PathBuf::from(path));
     } else {
-        run_interactive(&expr, seed);
+        run_interactive(&expr, seed, muted);
     }
 }
 
-/// The scene, minus the presentation layer: the headless render plugins, the
-/// core sim as the single source of truth, and the systems that advance it and
-/// mirror its dice into Bevy entities. Shared by the interactive and snapshot
-/// paths. `bevy_window` is pulled in transitively by the render features, so
-/// DefaultPlugins carries a WindowPlugin (and, without winit, no loop driver):
-/// render headless — no primary window, and don't exit just because there are
-/// none — and drive the update loop ourselves at ~60 fps.
-fn base_app(expr: &str, seed: Option<u64>) -> App {
-    // `App` (the core sim) owns the dice and the physics; the Bevy entities are a
-    // pure view of it, so all roll logic and the seed contract stay in core.
+/// The scene shared by both paths: headless render plugins, the sim, and the
+/// systems that step it and mirror it into the scene. `bevy_window` is enabled
+/// transitively, so DefaultPlugins carries a WindowPlugin and no loop driver —
+/// render headless (no primary window, don't exit when there are none) and drive
+/// the loop ourselves at ~60 fps.
+fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
     let mut sim = match seed {
         Some(s) => DiceApp::with_seed(expr.to_string(), s),
         None => DiceApp::new(expr.to_string()),
     };
-    // The sim's arena size feeds its launch/particle geometry; pick a cell grid
-    // whose aspect matches the render target so throws arc through the frame.
+    sim.muted = muted;
+    // `App::with_seed`/`new` already roll a non-empty expression on construction
+    // (exactly as the legacy TUI's `-- 3d6` does), consuming the seed once — so we
+    // must NOT roll again here, or the Bevy path would diverge from `evaluate`.
+    // A sensible arena size until the first frame reports the real one.
     sim.arena_w = 64.0;
     sim.arena_h = 20.0;
-    sim.roll(); // kick off an animated roll so the dice tumble on screen
 
     let mut app = App::new();
     app.add_plugins((
@@ -90,30 +84,42 @@ fn base_app(expr: &str, seed: Option<u64>) -> App {
     ))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
     .insert_resource(Sim(sim))
+    .insert_resource(ArenaView { w: 0, h: 0 })
     .init_resource::<ArenaImage>()
     .add_systems(Startup, setup)
-    .add_systems(Update, (advance_sim, sync_dice_scene).chain());
+    .add_systems(
+        Update,
+        (
+            resize_arena,
+            advance_sim,
+            sync_dice_scene,
+            sync_cup,
+            choreograph,
+        )
+            .chain(),
+    );
     app
 }
 
-/// The real path: terminal context + input + per-frame blit.
-fn run_interactive(expr: &str, seed: Option<u64>) {
-    let mut app = base_app(expr, seed);
+/// The interactive path: terminal context, input, per-frame compose, sound.
+fn run_interactive(expr: &str, seed: Option<u64>, muted: bool) {
+    let mut app = base_app(expr, seed, muted);
     app.add_plugins(RatatuiPlugins::default())
-        .add_systems(Update, (handle_input, draw_arena))
+        .insert_resource(Sound(None))
+        .add_systems(PreUpdate, input_system)
+        .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
         .run();
 }
 
-/// The validation path: render until the roll settles, dump a PNG, exit.
-fn run_snapshot(expr: &str, seed: Option<u64>, path: PathBuf) {
-    let mut app = base_app(expr, seed);
+/// The validation path: render until the roll settles, dump a full-frame PNG.
+fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
+    let mut app = base_app(expr, seed, muted);
     app.insert_resource(Snapshot { path, frames: 0 })
-        .add_systems(Update, save_snapshot)
+        .add_systems(Update, save_snapshot.after(choreograph))
         .run();
 }
 
-/// The core sim — the single source of truth. Bevy reads it; only the input
-/// system writes it (a later stage).
+/// The core sim — the single source of truth. Only the input system writes it.
 #[derive(Resource)]
 struct Sim(DiceApp);
 
@@ -121,12 +127,52 @@ struct Sim(DiceApp);
 #[derive(Component)]
 struct DieView(usize);
 
-/// The CPU-side copy of the rendered arena, refreshed every frame by the readback
-/// observer. `pixels` is row-padded RGBA8 (see [`ROW_ALIGN`]).
+/// Marks the arena camera (its transform choreographs; its target resizes).
+#[derive(Component)]
+struct ArenaCamera;
+
+/// Marks the tin cup (shown only while shaking).
+#[derive(Component)]
+struct CupView;
+
+/// The lazily-spawned audio player; `None` until the first audible sound.
+#[derive(Resource)]
+struct Sound(Option<Foley>);
+
+/// The arena panel's desired render size in pixels (cols × rows*2), reported by
+/// the compose step; the render target tracks it so the blit is 1:1.
+#[derive(Resource)]
+struct ArenaView {
+    w: u32,
+    h: u32,
+}
+
+/// The CPU-side copy of the rendered arena, refreshed by the readback observer.
+/// `pixels` is row-padded RGBA8 for a `w`×`h` image (see [`aligned_row_bytes`]).
 #[derive(Resource, Default)]
 struct ArenaImage {
     handle: Handle<Image>,
     pixels: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// A render-target image of `w`×`h`, usable as a camera target and read back.
+fn arena_image(w: u32, h: u32) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::all(),
+    );
+    image.texture_descriptor.usage |=
+        TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
+    image
 }
 
 fn setup(
@@ -136,32 +182,19 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut arena: ResMut<ArenaImage>,
 ) {
-    // 1. The image the camera renders into and we read back each frame.
-    let size = Extent3d {
-        width: RENDER_W,
-        height: RENDER_H,
-        depth_or_array_layers: 1,
-    };
-    let mut image = Image::new_fill(
-        size,
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::all(),
-    );
-    image.texture_descriptor.usage |=
-        TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING;
-    let handle = images.add(image);
+    // Render target the camera draws into and we read back each frame.
+    let (w, h) = (SNAP_COLS as u32, SNAP_ROWS as u32 * 2);
+    let handle = images.add(arena_image(w, h));
     arena.handle = handle.clone();
+    arena.w = w;
+    arena.h = h;
 
-    // 2. Camera, posed by the shared core framing (settled overhead read), aimed
-    //    at the offscreen image. Same fov the framing math assumes.
-    let aspect = RENDER_W as f32 / RENDER_H as f32;
+    // Camera → image, posed for now by the settled framing; `choreograph` moves it.
+    let aspect = w as f32 / h as f32;
     let cam = view_math::arena_camera(glam::Vec3::ZERO, aspect, 1.0);
     commands.spawn((
+        ArenaCamera,
         Camera3d::default(),
-        // In Bevy 0.19 the camera's destination is a `RenderTarget` component,
-        // not a `Camera` field.
         RenderTarget::from(handle.clone()),
         Projection::Perspective(PerspectiveProjection {
             fov: std::f32::consts::FRAC_PI_4,
@@ -169,7 +202,6 @@ fn setup(
         }),
         Transform::from_translation(convert::vec3(cam.position))
             .looking_at(convert::vec3(cam.target), Vec3::Y),
-        // AmbientLight is a per-camera component in 0.19.
         AmbientLight {
             color: Color::srgb(0.6, 0.7, 0.9),
             brightness: 220.0,
@@ -177,14 +209,14 @@ fn setup(
         },
     ));
 
-    // 3. Read the render target back to the CPU every frame (Bevy 0.19 built-in).
+    // Read the render target back to the CPU each frame (Bevy 0.19 built-in).
     commands
         .spawn(Readback::texture(handle))
         .observe(on_readback);
 
-    // 4. Warm key light with shadow maps (the payoff over the old baked contact
-    //    shadows), a cool rim, and a little fill (ambient sits on the camera).
+    // Warm key light with shadow maps, a cool rim.
     commands.spawn((
+        ArenaKeyLight,
         PointLight {
             color: Color::srgb(1.0, 0.86, 0.66),
             intensity: 5_000_000.0,
@@ -203,7 +235,7 @@ fn setup(
         Transform::from_xyz(-2.0, 3.0, -3.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // 5. Green-baize felt floor: a thin slab set at the tray bottom.
+    // Green-baize felt floor.
     let felt = materials.add(StandardMaterial {
         base_color: Color::srgb(0.05, 0.30, 0.12),
         perceptual_roughness: 0.95,
@@ -215,7 +247,43 @@ fn setup(
         Transform::from_xyz(0.0, -physics::HY - 0.15, 0.0),
     ));
 
-    // The dice themselves are spawned and posed by `sync_dice_scene` from the sim.
+    // The tin cup, hidden until a shake begins.
+    let cup_mesh = meshes.add(convert::dice_mesh(&dice_geom::cup()));
+    let cup_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.72, 0.74, 0.78),
+        metallic: 0.6,
+        perceptual_roughness: 0.35,
+        ..default()
+    });
+    commands.spawn((
+        CupView,
+        Mesh3d(cup_mesh),
+        MeshMaterial3d(cup_mat),
+        Transform::from_xyz(0.0, -physics::HY + 0.7, physics::HZ * 0.2)
+            .with_scale(Vec3::splat(1.1)),
+        Visibility::Hidden,
+    ));
+}
+
+/// Marks the warm key light so its intensity can flinch on hard impacts.
+#[derive(Component)]
+struct ArenaKeyLight;
+
+/// Feed keys to the shared, pure `handle_key`; quit on its `Quit` verdict.
+fn input_system(
+    mut keys: MessageReader<KeyMessage>,
+    mut sim: ResMut<Sim>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    for key in keys.read() {
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if handle_key(&mut sim.0, key.code, ctrl) == Action::Quit {
+            exit.write_default();
+        }
+    }
 }
 
 /// Step the core sim by real elapsed time; its fixed-step accumulator keeps the
@@ -224,9 +292,35 @@ fn advance_sim(time: Res<Time>, mut sim: ResMut<Sim>) {
     sim.0.update(time.delta_secs());
 }
 
+/// Resize the render target (and repoint the camera + readback) when the arena
+/// panel's size changes, so the blit stays 1:1 and overlays align.
+fn resize_arena(
+    view: Res<ArenaView>,
+    mut arena: ResMut<ArenaImage>,
+    mut images: ResMut<Assets<Image>>,
+    mut camera: Query<&mut RenderTarget, With<ArenaCamera>>,
+    mut readback: Query<&mut Readback>,
+) {
+    if view.w == 0 || (view.w == arena.w && view.h == arena.h) {
+        return;
+    }
+    let old = arena.handle.clone();
+    let handle = images.add(arena_image(view.w, view.h));
+    if let Ok(mut target) = camera.single_mut() {
+        *target = RenderTarget::from(handle.clone());
+    }
+    if let Ok(mut rb) = readback.single_mut() {
+        *rb = Readback::texture(handle.clone());
+    }
+    images.remove(&old);
+    arena.handle = handle;
+    arena.w = view.w;
+    arena.h = view.h;
+    arena.pixels.clear(); // stale for the new size; wait for the next readback
+}
+
 /// Mirror `sim.0.dice` into the scene: spawn a mesh+material per new die, copy
-/// each existing view's pose and colour every frame, and despawn any view whose
-/// die has been cleared.
+/// each existing view's pose and colour every frame, despawn cleared ones.
 fn sync_dice_scene(
     mut commands: Commands,
     sim: Res<Sim>,
@@ -251,9 +345,7 @@ fn sync_dice_scene(
                 }
                 has_view[view.0] = true;
             }
-            None => {
-                commands.entity(entity).despawn();
-            }
+            None => commands.entity(entity).despawn(),
         }
     }
 
@@ -274,6 +366,90 @@ fn sync_dice_scene(
             die_transform(die),
         ));
     }
+}
+
+/// Show the cup only while shaking; sway it on the shared shake clock.
+fn sync_cup(sim: Res<Sim>, mut cup: Query<(&mut Visibility, &mut Transform), With<CupView>>) {
+    let Ok((mut visibility, mut transform)) = cup.single_mut() else {
+        return;
+    };
+    if sim.0.shaking() {
+        *visibility = Visibility::Visible;
+        let sway = sim.0.cup_offset() * physics::HX * 0.6;
+        *transform = Transform::from_xyz(sway, -physics::HY + 0.7, physics::HZ * 0.2)
+            .with_scale(Vec3::splat(1.1));
+    } else {
+        *visibility = Visibility::Hidden;
+    }
+}
+
+/// Move the arena camera each frame to match the shared `live_camera` framing (so
+/// the burned-number overlays, projected through the same call, stay in register),
+/// and flinch the key light on hard impacts / a crit flare.
+fn choreograph(
+    sim: Res<Sim>,
+    mut camera: Query<&mut Transform, With<ArenaCamera>>,
+    mut key_light: Query<&mut PointLight, With<ArenaKeyLight>>,
+) {
+    let app = &sim.0;
+    let aspect = view_math::arena_aspect(app.arena_w, app.arena_h);
+    let cam = view_math::live_camera(
+        app.camera_shake(),
+        aspect,
+        app.focus(),
+        app.clock(),
+        app.flash(),
+    );
+    if let Ok(mut transform) = camera.single_mut() {
+        *transform = Transform::from_translation(convert::vec3(cam.position))
+            .looking_at(convert::vec3(cam.target), Vec3::Y);
+    }
+    if let Ok(mut light) = key_light.single_mut() {
+        // Brighten with hard-impact energy and a crit flare.
+        let boost = 1.0 + app.impact_energy() * 0.6 + app.flash() * 1.5;
+        light.intensity = 5_000_000.0 * boost;
+    }
+}
+
+/// Compose the interactive frame (Bevy arena blit + all chrome) into the terminal,
+/// and report the arena panel size back so the render target can track it.
+fn draw_ui(
+    mut context: ResMut<RatatuiContext>,
+    mut sim: ResMut<Sim>,
+    arena: Res<ArenaImage>,
+    mut view: ResMut<ArenaView>,
+) -> Result {
+    let mut reported = (view.w, view.h);
+    context.draw(|frame| {
+        let (w, h) = ui::render_bevy(frame, &mut sim.0, &arena.pixels, arena.w, arena.h);
+        if w > 0 {
+            reported = (w as u32, h as u32);
+        }
+    })?;
+    view.w = reported.0;
+    view.h = reported.1;
+    Ok(())
+}
+
+/// Drain the sim's queued sounds into the lazily-spawned player (capping the
+/// per-frame click storm), exactly as the legacy loop does.
+fn drain_sounds(mut sim: ResMut<Sim>, mut sound: ResMut<Sound>) {
+    let mut clicks = 0usize;
+    for ev in sim.0.take_sounds() {
+        let player = sound.0.get_or_insert_with(Foley::spawn);
+        if matches!(ev, SoundEvent::Impact { .. } | SoundEvent::Knock { .. }) {
+            clicks += 1;
+            if clicks > MAX_CLICKS_PER_FRAME {
+                continue;
+            }
+        }
+        player.play(ev);
+    }
+}
+
+/// Copy each completed GPU readback into the CPU-side arena image.
+fn on_readback(readback: On<ReadbackComplete>, mut arena: ResMut<ArenaImage>) {
+    arena.pixels = readback.event().data.clone();
 }
 
 /// World transform for a die: its sim pose, scaled to the die's world radius.
@@ -303,94 +479,35 @@ fn die_color(die: &Die) -> Color {
     tints[die.color_idx % tints.len()]
 }
 
-/// Copy each completed GPU readback into the CPU-side arena image.
-fn on_readback(readback: On<ReadbackComplete>, mut arena: ResMut<ArenaImage>) {
-    arena.pixels = readback.event().data.clone();
-}
-
-/// Quit on `q` or Esc (raw mode swallows Ctrl-C's default handling).
-fn handle_input(mut keys: MessageReader<KeyMessage>, mut exit: MessageWriter<AppExit>) {
-    for key in keys.read() {
-        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-            exit.write_default();
-        }
-    }
-}
-
-/// Paint the latest readback into the terminal each frame.
-fn draw_arena(mut context: ResMut<RatatuiContext>, arena: Res<ArenaImage>) -> Result {
-    context.draw(|frame| {
-        let area = frame.area();
-        blit_half_blocks(&arena.pixels, RENDER_W, RENDER_H, frame.buffer_mut(), area);
-    })?;
-    Ok(())
-}
-
-/// Downsample the row-padded RGBA8 render into terminal half-block cells (fg =
-/// upper pixel, bg = lower). A no-op until the first readback lands.
-fn blit_half_blocks(pixels: &[u8], iw: u32, ih: u32, buf: &mut Buffer, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let stride = aligned_row_bytes(iw);
-    if pixels.len() < stride * ih as usize {
-        return; // no frame read back yet
-    }
-    let sample = |x: u32, y: u32| -> (u8, u8, u8) {
-        let x = x.min(iw - 1) as usize;
-        let y = y.min(ih - 1) as usize;
-        let i = y * stride + x * 4;
-        (pixels[i], pixels[i + 1], pixels[i + 2])
-    };
-    for row in 0..area.height {
-        for col in 0..area.width {
-            let ix = ((col as f32 + 0.5) / area.width as f32 * iw as f32) as u32;
-            let iy_upper =
-                ((row as f32 * 2.0 + 0.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
-            let iy_lower =
-                ((row as f32 * 2.0 + 1.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
-            let up = sample(ix, iy_upper);
-            let lo = sample(ix, iy_lower);
-            let cell = &mut buf[(area.x + col, area.y + row)];
-            cell.set_char('▀');
-            cell.set_style(
-                Style::default()
-                    .fg(TColor::Rgb(up.0, up.1, up.2))
-                    .bg(TColor::Rgb(lo.0, lo.1, lo.2)),
-            );
-        }
-    }
-}
-
-/// Bytes per padded image row (wgpu's 256-byte copy alignment).
-fn aligned_row_bytes(width: u32) -> usize {
-    let bytes = width as usize * 4;
-    bytes.div_ceil(ROW_ALIGN) * ROW_ALIGN
-}
-
-/// Where to write the headless snapshot, and how many frames have elapsed.
-#[derive(Resource)]
-struct Snapshot {
-    path: PathBuf,
-    frames: u32,
-}
-
-/// Wait for the readback to land AND the roll to come to rest, then write the
-/// arena image to a PNG and exit. The validation counterpart of [`draw_arena`];
-/// snapshotting the *settled* roll makes the PNG a stable regression reference.
+/// Render the full composed frame (arena + chrome) into a `TestBackend`, and once
+/// the roll has settled and the render target has synced to the composed arena
+/// size, encode it to a PNG and exit. Its validation counterpart is [`draw_ui`].
 fn save_snapshot(
     mut snapshot: ResMut<Snapshot>,
+    mut sim: ResMut<Sim>,
     arena: Res<ArenaImage>,
-    sim: Res<Sim>,
+    mut view: ResMut<ArenaView>,
     mut exit: MessageWriter<AppExit>,
 ) {
     snapshot.frames += 1;
 
-    // The first readback is a few frames out (render → copy → map_async → the
-    // next extract triggers ReadbackComplete). Wait for a warmup, a landed
-    // readback, and the dice to settle — or a hard frame cap so it can't hang.
-    let ready = !arena.pixels.is_empty();
-    let done = snapshot.frames >= 16 && ready && sim.0.all_settled();
+    let mut terminal = Terminal::new(TestBackend::new(SNAP_COLS, SNAP_ROWS)).unwrap();
+    let mut reported = (view.w, view.h);
+    terminal
+        .draw(|frame| {
+            let (w, h) = ui::render_bevy(frame, &mut sim.0, &arena.pixels, arena.w, arena.h);
+            if w > 0 {
+                reported = (w as u32, h as u32);
+            }
+        })
+        .unwrap();
+    view.w = reported.0;
+    view.h = reported.1;
+
+    // Only capture once the render target matches the composed arena panel (so the
+    // blit filled it), a readback landed, and the roll settled — or at a hard cap.
+    let synced = arena.w == reported.0 && arena.h == reported.1 && !arena.pixels.is_empty();
+    let done = snapshot.frames >= 20 && synced && sim.0.all_settled();
     if !done && snapshot.frames < 600 {
         return;
     }
@@ -398,21 +515,93 @@ fn save_snapshot(
         eprintln!("tinhorn: roll didn't settle in 600 frames; snapshotting anyway");
     }
 
-    match save_png(&arena.pixels, RENDER_W, RENDER_H, &snapshot.path) {
+    // The PNG shows the arena visuals; a text dump (arena half-blocks blanked so
+    // the burned numbers and chrome stand out) makes the whole UI readable in a
+    // non-interactive shell.
+    print_frame_text(terminal.backend().buffer());
+    match save_frame_png(terminal.backend().buffer(), &snapshot.path) {
         Ok(()) => eprintln!("tinhorn: wrote snapshot {}", snapshot.path.display()),
         Err(err) => eprintln!("tinhorn: failed to write snapshot: {err}"),
     }
     exit.write_default();
 }
 
-/// Strip the readback's per-row padding into tight RGBA8 and encode a PNG.
-fn save_png(padded: &[u8], w: u32, h: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let stride = aligned_row_bytes(w);
-    let row = w as usize * 4;
-    let mut rgba = Vec::with_capacity(row * h as usize);
-    for y in 0..h as usize {
-        rgba.extend_from_slice(&padded[y * stride..y * stride + row]);
+/// Dump a composed frame as text (the `▀` arena fill blanked to spaces, so the
+/// burned die numbers and the chrome read clearly) for headless validation.
+fn print_frame_text(buf: &ratatui::buffer::Buffer) {
+    let area = *buf.area();
+    let mut out = String::from("\n");
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let sym = buf[(area.x + x, area.y + y)].symbol();
+            out.push_str(if sym == "▀" { " " } else { sym });
+        }
+        out.push('\n');
     }
-    image::save_buffer(path, &rgba, w, h, image::ExtendedColorType::Rgba8)?;
+    println!("{out}");
+}
+
+#[derive(Resource)]
+struct Snapshot {
+    path: PathBuf,
+    frames: u32,
+}
+
+/// Encode a composed ratatui buffer as a PNG (two stacked pixels per cell for the
+/// `▀` half-block cells; a flat cell colour otherwise), so the whole UI — arena
+/// and chrome — can be eyeballed from a non-interactive shell.
+fn save_frame_png(
+    buf: &ratatui::buffer::Buffer,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let area = *buf.area();
+    let (pw, ph) = (area.width as usize, area.height as usize * 2);
+    let mut px = vec![0u8; pw * ph * 4];
+    for cy in 0..area.height {
+        for cx in 0..area.width {
+            let cell = &buf[(area.x + cx, area.y + cy)];
+            let (top, bot) = if cell.symbol() == "▀" {
+                (color_rgb(cell.fg), color_rgb(cell.bg))
+            } else {
+                (color_rgb(cell.fg), color_rgb(cell.fg))
+            };
+            for (row, [r, g, b]) in [(cy as usize * 2, top), (cy as usize * 2 + 1, bot)] {
+                let i = (row * pw + cx as usize) * 4;
+                px[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+    image::save_buffer(
+        path,
+        &px,
+        pw as u32,
+        ph as u32,
+        image::ExtendedColorType::Rgba8,
+    )?;
     Ok(())
+}
+
+/// Map a ratatui `Color` to RGB for the PNG (named colours to their terminal-ish
+/// tones, RGB passthrough, everything else to the dark terminal background).
+fn color_rgb(c: TColor) -> [u8; 3] {
+    match c {
+        TColor::Rgb(r, g, b) => [r, g, b],
+        TColor::Black => [0, 0, 0],
+        TColor::White => [230, 230, 230],
+        TColor::Red => [200, 70, 70],
+        TColor::Green => [70, 190, 90],
+        TColor::Yellow => [220, 200, 60],
+        TColor::Blue => [80, 120, 230],
+        TColor::Magenta => [200, 90, 200],
+        TColor::Cyan => [70, 190, 200],
+        TColor::Gray => [160, 160, 160],
+        TColor::DarkGray => [90, 90, 90],
+        TColor::LightGreen => [130, 230, 130],
+        TColor::LightMagenta => [230, 130, 230],
+        TColor::LightYellow => [240, 230, 140],
+        TColor::LightRed => [230, 120, 120],
+        TColor::LightBlue => [130, 170, 240],
+        TColor::LightCyan => [140, 220, 230],
+        _ => [13, 17, 23],
+    }
 }

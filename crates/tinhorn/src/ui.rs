@@ -786,23 +786,7 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
     use crate::render3d::transform::Transform;
     use crate::render3d_view::{self, RenderMode};
 
-    let title = if app.shaking() {
-        " 🎲  tinhorn — shaking… ".to_string()
-    } else if app.all_settled() {
-        " 🎲  tinhorn — settled ".to_string()
-    } else if app.spawned {
-        // Name the throw for what it was; a plain Tab roll just "rolls".
-        match app.last_throw.map(|t| throw_tier(t.power)) {
-            Some(ThrowTier::Lob) => " 🎲  tinhorn — a timid lob… ".to_string(),
-            Some(ThrowTier::Toss) => " 🎲  tinhorn — a clean toss… ".to_string(),
-            Some(ThrowTier::Rocket | ThrowTier::Peak) => {
-                " 🎲  tinhorn — a rocket throw… ".to_string()
-            }
-            None => " 🎲  tinhorn — rolling… ".to_string(),
-        }
-    } else {
-        " 🎲  tinhorn ".to_string()
-    };
+    let title = arena_title(app);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -1578,11 +1562,44 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         RenderMode::HalfBlock,
     );
 
-    // A number on every die, riding the face that points at us. `draw_die_number`
-    // reads that face from the die's live orientation, anchors the digit to its
-    // centre (so it sits on the top face, not the die's middle), fades it while
-    // airborne as the face turns edge-on (ink on the tumbling solid), and burns it
-    // to the RNG's value on settle. Skipped while shaking — the dice are in the cup.
+    draw_arena_overlays(frame, app, inner, &camera);
+}
+
+/// The arena block title: names what the dice are doing (shaking, a named throw,
+/// settled, idle). Shared by the software `render_arena` and the Bevy path.
+fn arena_title(app: &App) -> String {
+    if app.shaking() {
+        " 🎲  tinhorn — shaking… ".to_string()
+    } else if app.all_settled() {
+        " 🎲  tinhorn — settled ".to_string()
+    } else if app.spawned {
+        // Name the throw for what it was; a plain Tab roll just "rolls".
+        match app.last_throw.map(|t| throw_tier(t.power)) {
+            Some(ThrowTier::Lob) => " 🎲  tinhorn — a timid lob… ".to_string(),
+            Some(ThrowTier::Toss) => " 🎲  tinhorn — a clean toss… ".to_string(),
+            Some(ThrowTier::Rocket | ThrowTier::Peak) => {
+                " 🎲  tinhorn — a rocket throw… ".to_string()
+            }
+            None => " 🎲  tinhorn — rolling… ".to_string(),
+        }
+    } else {
+        " 🎲  tinhorn ".to_string()
+    }
+}
+
+/// The 2D ceremony that rides on top of the rendered arena: a burned number on
+/// every die (riding the face that points at us — anchored to that face, faded
+/// edge-on, burned to the RNG value on settle; skipped while shaking, dice in the
+/// cup), crit/fumble particles, the shake power meter, the release echo, and the
+/// idle hint. Shared by the software `render_arena` and the Bevy path, so both
+/// draw the identical ceremony; `camera` MUST be the one the arena was rendered
+/// through, so the numbers and bursts land on their dice.
+fn draw_arena_overlays(
+    frame: &mut Frame,
+    app: &App,
+    inner: Rect,
+    camera: &crate::render3d::camera::Camera,
+) {
     if !app.shaking() {
         let (cols, rows) = (inner.width as f32, inner.height as f32);
         // One number size for the whole roll, so the dice read the same — never a
@@ -1590,8 +1607,9 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         // reference die at the felt centre, fit it within the read-face (not the
         // whole die box), and reserve room for the widest value any die here can
         // show, so a two-digit d20 lands at the same scale a one-digit d6 uses.
-        let ref_center = Vec3::new(0.0, -crate::physics::HY + crate::physics::DIE_R, 0.0);
-        let (ref_w, ref_h) = die_screen_extent(&camera, ref_center, cols, rows);
+        let ref_center =
+            crate::render3d::math::Vec3::new(0.0, -crate::physics::HY + crate::physics::DIE_R, 0.0);
+        let (ref_w, ref_h) = die_screen_extent(camera, ref_center, cols, rows);
         let max_digits = app
             .dice
             .iter()
@@ -1600,13 +1618,10 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or(1);
         let num_scale = number_scale(ref_w * FACE_FRAC_W, ref_h * FACE_FRAC_H, max_digits);
         for die in &app.dice {
-            draw_die_number(frame, inner, &camera, die, cols, rows, num_scale);
+            draw_die_number(frame, inner, camera, die, cols, rows, num_scale);
         }
     }
 
-    // The rest of the ceremony, reused from the 2D arena so 3D mode is a full
-    // replacement: crit/fumble particles, the rattling cup + power meter while a
-    // shake is in progress, and the frozen release echo just after a throw.
     {
         let buf = frame.buffer_mut();
         for p in &app.particles {
@@ -1627,6 +1642,110 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         ))
         .alignment(Alignment::Center);
         frame.render_widget(hint, inner);
+    }
+}
+
+/// Compose the full interactive frame for the **Bevy** arena: the same four-row
+/// layout and chrome as [`render`], but the arena panel is the CPU-read Bevy
+/// render blitted as half-blocks (fg = upper pixel, bg = lower) rather than the
+/// software `render_arena`. `pixels` is the row-padded RGBA8 readback of a
+/// `img_w`×`img_h` image sized to this arena's inner cell grid, so the blit is
+/// 1:1 and the overlays (projected through the same `live_camera`) land on their
+/// dice. Returns the arena inner size so the scene can size its render target.
+pub fn render_bevy(
+    frame: &mut Frame,
+    app: &mut App,
+    pixels: &[u8],
+    img_w: u32,
+    img_h: u32,
+) -> (u16, u16) {
+    let area = frame.area();
+    let chunks = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let arena_area = chunks[0];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(arena_title(app).bold());
+    let inner = block.inner(arena_area);
+    frame.render_widget(block, arena_area);
+
+    let mut view = (0u16, 0u16);
+    if inner.width >= 4 && inner.height >= 3 {
+        // Feed the arena size to the sim (launch/particle geometry reads it) and
+        // report it back so the render target can track it.
+        app.arena_w = inner.width as f32;
+        app.arena_h = inner.height as f32;
+        view = (inner.width, inner.height * 2);
+
+        blit_bevy_arena(frame.buffer_mut(), inner, pixels, img_w, img_h);
+
+        let aspect = crate::render3d_view::arena_aspect(inner.width as f32, inner.height as f32);
+        let camera = crate::render3d_view::live_camera(
+            app.camera_shake(),
+            aspect,
+            app.focus(),
+            app.clock(),
+            app.flash(),
+        );
+        draw_arena_overlays(frame, app, inner, &camera);
+    }
+
+    render_results(frame, app, chunks[1]);
+    render_input(frame, app, chunks[2]);
+    render_help(frame, app, chunks[3]);
+
+    let scroll = app.pane_scroll;
+    match app.pane {
+        Pane::None => {}
+        Pane::Help => app.pane_scroll = render_help_overlay(frame, area, scroll),
+        Pane::History => app.pane_scroll = render_history_overlay(frame, app, area, scroll),
+        Pane::Stats => app.pane_scroll = render_stats_overlay(frame, app, area, scroll),
+    }
+
+    view
+}
+
+/// Blit a row-padded RGBA8 Bevy render (sized to `inner`'s half-block grid, so
+/// `img_w == inner.width` and `img_h == inner.height*2`) into `inner` as
+/// half-block cells: each cell takes its two stacked pixels as fg (upper) and bg
+/// (lower). A no-op until the first readback of the right size lands.
+fn blit_bevy_arena(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    pixels: &[u8],
+    img_w: u32,
+    img_h: u32,
+) {
+    let stride = (img_w as usize * 4).div_ceil(256) * 256; // wgpu 256-byte row pad
+    if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
+        return;
+    }
+    let sample = |x: u32, y: u32| -> (u8, u8, u8) {
+        let x = x.min(img_w - 1) as usize;
+        let y = y.min(img_h - 1) as usize;
+        let i = y * stride + x * 4;
+        (pixels[i], pixels[i + 1], pixels[i + 2])
+    };
+    for row in 0..inner.height {
+        for col in 0..inner.width {
+            let ix = (col as u32).min(img_w - 1);
+            let up = sample(ix, row as u32 * 2);
+            let lo = sample(ix, row as u32 * 2 + 1);
+            let cell = &mut buf[(inner.x + col, inner.y + row)];
+            cell.set_char('▀');
+            cell.set_style(
+                Style::default()
+                    .fg(Color::Rgb(up.0, up.1, up.2))
+                    .bg(Color::Rgb(lo.0, lo.1, lo.2)),
+            );
+        }
     }
 }
 

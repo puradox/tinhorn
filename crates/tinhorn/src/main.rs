@@ -25,10 +25,8 @@ mod render3d;
 mod render3d_view;
 mod ui;
 
-// The experimental Bevy arena (Stage-2 spike). Compiled only under `--features
-// bevy`, so a default build/`cargo install` never links Bevy and this module —
-// and the whole engine — is absent from the shipped binary.
-#[cfg(feature = "bevy")]
+// The Bevy dice arena — the default interactive renderer. Always linked; the
+// one-shot CLI path simply never constructs a Bevy `App`.
 mod scene;
 
 use std::io::{self, IsTerminal};
@@ -60,11 +58,10 @@ fn main() -> io::Result<()> {
     // Headless Bevy snapshot: an explicit request to render the arena to a PNG
     // (`TINHORN_BEVY_SNAPSHOT=<path>`), used to validate the renderer in CI or a
     // non-interactive shell. Checked *before* the one-shot short-circuit precisely
-    // because it has no TTY — but it is opt-in and feature-gated, so ordinary
-    // scripting (no env var, default build) still never touches a GPU.
-    #[cfg(feature = "bevy")]
+    // because it deliberately has no TTY; ordinary scripting (no env var) never
+    // sets it, so pipes still take the GPU-free one-shot path below.
     if std::env::var_os("TINHORN_BEVY_SNAPSHOT").is_some() {
-        scene::run(expr, cli.seed);
+        scene::run(expr, cli.seed, cli.mute);
         return Ok(());
     }
 
@@ -82,25 +79,17 @@ fn main() -> io::Result<()> {
         return cli::run_one_shot(&cli, &expr);
     }
 
-    // Experimental Bevy arena, opt-in via `--bevy` or `TINHORN_BEVY=1`. Reached
-    // only in interactive mode — placed *after* the one-shot short-circuit above,
-    // so scripting and pipes never construct a Bevy `App` or touch a GPU.
-    if cli.bevy || std::env::var_os("TINHORN_BEVY").is_some() {
-        #[cfg(feature = "bevy")]
-        {
-            scene::run(expr, cli.seed);
-            return Ok(());
-        }
-        #[cfg(not(feature = "bevy"))]
-        {
-            eprintln!("tinhorn: --bevy needs a build with `--features bevy`");
-            std::process::exit(2);
-        }
+    // Interactive: the Bevy arena is the default renderer; `--legacy-render`
+    // selects the old software TUI. Reached only here, after the one-shot
+    // short-circuit, so scripting and pipes never construct a Bevy `App`.
+    if !cli.legacy_render {
+        scene::run(expr, cli.seed, cli.mute);
+        return Ok(());
     }
 
-    // Interactive: launch the animated TUI. The dice are audible unless muted
-    // (`--mute` starts muted; Ctrl-Q toggles) or there's no output device —
-    // audio spawns lazily inside `run`, on the first sound that needs playing.
+    // Legacy software TUI. The dice are audible unless muted (`--mute` starts
+    // muted; Ctrl-Q toggles) or there's no output device — audio spawns lazily
+    // inside `run`, on the first sound that needs playing.
     let mut terminal = ratatui::init();
 
     let mut app = match cli.seed {
