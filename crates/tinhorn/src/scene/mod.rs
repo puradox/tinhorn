@@ -399,10 +399,13 @@ fn sync_dice_scene(
         let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(die.sides)));
         // Glossy resin: a low roughness + lifted reflectance so each die catches a
         // crisp specular highlight from the warm key, reading as moulded plastic.
+        // A faint colour-matched emissive keeps the dice vivid even in the dim
+        // edges of the lamp-pool, so they never dull to mud in the shadow.
         let material = materials.add(StandardMaterial {
             base_color: die_color(die),
-            perceptual_roughness: 0.22,
-            reflectance: 0.6,
+            emissive: die_emissive(die),
+            perceptual_roughness: 0.2,
+            reflectance: 0.62,
             ..default()
         });
         commands.spawn((
@@ -516,6 +519,15 @@ fn die_color(die: &Die) -> Color {
     }
     let c = ui::die_rgb(die.color_idx);
     Color::srgb_u8(c.0, c.1, c.2)
+}
+
+/// A faint self-glow in the die's own colour, so it stays vivid in the dim edges
+/// of the lamp-pool instead of muddying into shadow. Dropped dice don't glow.
+fn die_emissive(die: &Die) -> LinearRgba {
+    if !die.kept {
+        return LinearRgba::BLACK;
+    }
+    die_color(die).to_linear() * 0.18
 }
 
 /// Render the full composed frame (arena + chrome) into a `TestBackend`, and once

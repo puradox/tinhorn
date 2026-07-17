@@ -337,14 +337,14 @@ pub(crate) fn backdrop_texture() -> std::sync::Arc<crate::paint::Texture> {
 /// their ratatui colour from the same slot ([`die_color`]), so a chip and the
 /// die it stands for can never disagree about a colour.
 const PALETTE: [Rgb; 8] = [
-    Rgb(60, 200, 210),
-    Rgb(220, 200, 60),
-    Rgb(70, 200, 90),
-    Rgb(210, 90, 210),
-    Rgb(220, 70, 70),
-    Rgb(80, 130, 240),
-    Rgb(130, 230, 130),
-    Rgb(230, 130, 230),
+    Rgb(24, 214, 230),  // cyan
+    Rgb(248, 206, 20),  // amber
+    Rgb(36, 214, 74),   // green
+    Rgb(228, 44, 228),  // magenta
+    Rgb(244, 40, 40),   // red
+    Rgb(48, 108, 255),  // blue
+    Rgb(120, 246, 120), // lime
+    Rgb(246, 108, 246), // pink
 ];
 
 /// The colour for die palette slot `idx`.
