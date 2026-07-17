@@ -13,11 +13,14 @@
 //! jump) · ↑/↓ scroll an open pane · ? help · Ctrl-H history · Ctrl-S stats ·
 //! Ctrl-Q mute · Esc quit
 
-mod app;
+// The roll semantics and 3D dice simulation live in the `tinhorn-core` library
+// (shared with the future chronicle web embed). Re-exported at the crate root so
+// the binary's modules keep referring to `crate::app` / `crate::parse` /
+// `crate::physics` unchanged.
+pub use tinhorn_core::{app, parse, physics};
+
 mod cli;
 mod foley;
-mod parse;
-mod physics;
 mod render3d;
 mod render3d_view;
 mod ui;

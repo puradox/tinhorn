@@ -1,34 +1,23 @@
-[package]
-name = "tinhorn"
-version = "0.1.4"
-edition = "2021"
-description = "A dice cup for your terminal: shake the cup, watch dice fly, hear them land."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/puradox/tinhorn"
-readme = "README.md"
-keywords = ["dice", "roll", "rpg", "ttrpg"]
-categories = ["command-line-utilities", "games"]
-exclude = [
-    "docs/",
-    ".conductor/",
-    ".github/",
-    "AGENT.md",
-    "CLAUDE.md",
-    "CONTRIBUTING.md",
-    "TODO.md",
-]
+[workspace]
+resolver = "2"
+members = ["crates/tinhorn-core", "crates/tinhorn"]
 
-[dependencies]
-ratatui = "0.30"
-crossterm = "0.29"
+# Shared dependency pins, referenced by each crate with `{ workspace = true }`.
+# One place to bump a version, and the two crates can never drift apart.
+[workspace.dependencies]
+tinhorn-core = { path = "crates/tinhorn-core", version = "0.1.4" }
 rand = "0.8"
-clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 glam = "0.33"
 rapier3d = "0.34"
+ratatui = "0.30"
+crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 
+# The animation wants LTO; kept at the workspace root so it applies to the
+# whole build.
 [profile.release]
 opt-level = 3
 lto = true

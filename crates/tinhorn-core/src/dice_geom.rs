@@ -1,4 +1,10 @@
-//! Dice meshes for the six standard polyhedra (d4, d6, d8, d10, d12, d20).
+//! Dice geometry for the six standard polyhedra (d4, d6, d8, d10, d12, d20),
+//! as plain glam data.
+//!
+//! This is the single source of the dice shapes. The physics collider for a die
+//! is the convex hull of [`mesh_for`]'s vertices (see `app::mesh_points`), and
+//! the terminal renderer builds its own `Mesh` from the same data — so the die
+//! you see and the die the sim bounces are one shape.
 //!
 //! All six are built by one robust helper, [`polyhedron`], which takes each face
 //! as an *unordered* set of its corner points and does the fiddly parts itself:
@@ -9,8 +15,53 @@
 
 use std::sync::Arc;
 
-use crate::render3d::math::Vec3;
-use crate::render3d::mesh::{Mesh, Vertex};
+use glam::Vec3;
+
+/// A single vertex with position, normal, and texture coordinates. A plain data
+/// carrier — the renderer copies these into its own vertex type.
+#[derive(Debug, Clone, Copy)]
+pub struct Vertex {
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub uv: [f32; 2],
+}
+
+impl Vertex {
+    pub fn new(position: Vec3, normal: Vec3) -> Self {
+        Self {
+            position,
+            normal,
+            uv: [0.0, 0.0],
+        }
+    }
+
+    pub fn with_uv(mut self, u: f32, v: f32) -> Self {
+        self.uv = [u, v];
+        self
+    }
+}
+
+/// An indexed triangle mesh in the die's own unit (circumradius-1) space.
+#[derive(Debug, Clone)]
+pub struct Mesh {
+    pub vertices: Vec<Vertex>,
+    /// Triangle indices (length must be a multiple of 3).
+    pub indices: Vec<u32>,
+}
+
+impl Mesh {
+    pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
+        debug_assert!(
+            indices.len().is_multiple_of(3),
+            "indices length must be a multiple of 3"
+        );
+        Self { vertices, indices }
+    }
+
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
 
 /// The golden ratio — the icosahedron and dodecahedron are built from it.
 const PHI: f32 = 1.618_034;

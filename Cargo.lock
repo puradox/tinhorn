@@ -2223,11 +2223,21 @@ dependencies = [
  "crossterm",
  "glam 0.33.2",
  "rand",
- "rapier3d",
  "ratatui",
  "rodio",
  "serde",
  "serde_json",
+ "tinhorn-core",
+]
+
+[[package]]
+name = "tinhorn-core"
+version = "0.1.4"
+dependencies = [
+ "glam 0.33.2",
+ "rand",
+ "rapier3d",
+ "serde",
 ]
 
 [[package]]
