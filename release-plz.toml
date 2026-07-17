@@ -1,0 +1,23 @@
+# release-plz configuration.
+#
+# Since the repo became a two-crate workspace (`tinhorn-core` + `tinhorn`),
+# release-plz's DEFAULT git-tag format changed from `v{version}` to the
+# per-package `{package}-v{version}` — so a release would tag `tinhorn-v0.1.5`
+# *and* `tinhorn-core-v0.1.5` and cut a GitHub Release for each. That breaks
+# `cd.yml`, whose trigger is guarded by `startsWith(tag_name, 'v')` and which
+# builds a single `tinhorn` binary. The per-package overrides below keep the
+# release surface exactly as it was before the split.
+
+[[package]]
+name = "tinhorn"
+# The binary crate keeps the historical `vX.Y.Z` tag and its GitHub Release, so
+# `cd.yml`'s `startsWith(tag, 'v')` guard still fires and the uploaded archives
+# stay named `tinhorn-vX.Y.Z-<target>` (taiki-e's `$tag`).
+git_tag_name = "v{{ version }}"
+
+[[package]]
+name = "tinhorn-core"
+# The library still bumps and publishes to crates.io, but gets no GitHub Release
+# — there is no binary to attach, and `cd.yml` should fire exactly once (for the
+# binary). It still gets its own `tinhorn-core-v{version}` git tag.
+git_release_enable = false
