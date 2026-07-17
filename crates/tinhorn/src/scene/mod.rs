@@ -19,6 +19,7 @@ use std::time::Duration;
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
+use bevy::pbr::{DistanceFog, FogFalloff};
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
@@ -36,6 +37,7 @@ use tinhorn_core::{dice_geom, physics, view_math};
 use crate::foley::Foley;
 use crate::{Action, handle_key, ui};
 
+mod arena;
 mod convert;
 
 /// Impact/knock sounds voiced per frame; more is mush (mirrors the legacy loop).
@@ -112,11 +114,29 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool) {
 }
 
 /// The validation path: render until the roll settles, dump a full-frame PNG.
+/// `TINHORN_SNAP_COLS`/`TINHORN_SNAP_ROWS` override the composed terminal size
+/// (bigger reads more detail into the PNG).
 fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
+    let dim = |key: &str, default: u16| -> u16 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
     let mut app = base_app(expr, seed, muted);
-    app.insert_resource(Snapshot { path, frames: 0 })
-        .add_systems(Update, save_snapshot.after(choreograph))
-        .run();
+    app.insert_resource(Snapshot {
+        path,
+        frames: 0,
+        cols: dim("TINHORN_SNAP_COLS", SNAP_COLS),
+        rows: dim("TINHORN_SNAP_ROWS", SNAP_ROWS),
+        // `TINHORN_SNAP_FRAME=N` captures at frame N (mid-roll / establishing
+        // framing) instead of waiting for the roll to settle.
+        at_frame: std::env::var("TINHORN_SNAP_FRAME")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+    })
+    .add_systems(Update, save_snapshot.after(choreograph))
+    .run();
 }
 
 /// The core sim — the single source of truth. Only the input system writes it.
@@ -203,8 +223,19 @@ fn setup(
         Transform::from_translation(convert::vec3(cam.position))
             .looking_at(convert::vec3(cam.target), Vec3::Y),
         AmbientLight {
-            color: Color::srgb(0.6, 0.7, 0.9),
-            brightness: 220.0,
+            color: Color::srgb(0.72, 0.72, 0.8),
+            brightness: 420.0,
+            ..default()
+        },
+        // Recede far geometry into the room; a warm colour so the floor's far
+        // reaches and the drapes ease into the room rather than into black. Start
+        // pushed past the mid-ground so the felt, dice, and near room stay crisp.
+        DistanceFog {
+            color: Color::srgb_u8(40, 28, 22),
+            falloff: FogFalloff::Linear {
+                start: 22.0,
+                end: 55.0,
+            },
             ..default()
         },
     ));
@@ -235,17 +266,10 @@ fn setup(
         Transform::from_xyz(-2.0, 3.0, -3.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    // Green-baize felt floor.
-    let felt = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.30, 0.12),
-        perceptual_roughness: 0.95,
-        ..default()
-    });
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(physics::HX * 2.0, 0.3, physics::HZ * 2.0))),
-        MeshMaterial3d(felt),
-        Transform::from_xyz(0.0, -physics::HY - 0.15, 0.0),
-    ));
+    // The static casino-tray furniture: felt bed, mahogany walls + rails, the
+    // wood table + apron, the rug, the room floor, the gradient backdrop, the
+    // curtains, and the poker-chip stacks.
+    arena::spawn(&mut commands, &mut meshes, &mut materials, &mut images);
 
     // The tin cup, hidden until a shake begins.
     let cup_mesh = meshes.add(convert::dice_mesh(&dice_geom::cup()));
@@ -491,7 +515,7 @@ fn save_snapshot(
 ) {
     snapshot.frames += 1;
 
-    let mut terminal = Terminal::new(TestBackend::new(SNAP_COLS, SNAP_ROWS)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(snapshot.cols, snapshot.rows)).unwrap();
     let mut reported = (view.w, view.h);
     terminal
         .draw(|frame| {
@@ -507,7 +531,10 @@ fn save_snapshot(
     // Only capture once the render target matches the composed arena panel (so the
     // blit filled it), a readback landed, and the roll settled — or at a hard cap.
     let synced = arena.w == reported.0 && arena.h == reported.1 && !arena.pixels.is_empty();
-    let done = snapshot.frames >= 20 && synced && sim.0.all_settled();
+    let done = match snapshot.at_frame {
+        Some(n) => snapshot.frames >= n && synced,
+        None => snapshot.frames >= 20 && synced && sim.0.all_settled(),
+    };
     if !done && snapshot.frames < 600 {
         return;
     }
@@ -545,6 +572,9 @@ fn print_frame_text(buf: &ratatui::buffer::Buffer) {
 struct Snapshot {
     path: PathBuf,
     frames: u32,
+    cols: u16,
+    rows: u16,
+    at_frame: Option<u32>,
 }
 
 /// Encode a composed ratatui buffer as a PNG (two stacked pixels per cell for the
