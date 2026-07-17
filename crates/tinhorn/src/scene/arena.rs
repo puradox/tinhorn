@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::mesh::Indices;
 use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
 
-use crate::render3d::color::Rgb;
+use crate::paint::Rgb;
 use crate::ui::ArenaStyle;
 use tinhorn_core::physics::{HX, HY, HZ};
 
@@ -24,7 +24,7 @@ fn col(c: Rgb) -> Color {
 /// Wrap a baked `render3d` texture (RGBA, row-major) as a Bevy sRGB image — the
 /// same procedural generators the software renderer uses, straight onto Bevy
 /// materials (the plan's "wrap as `Image::new`" path).
-fn tex_image(t: &crate::render3d::texture::Texture) -> Image {
+fn tex_image(t: &crate::paint::Texture) -> Image {
     Image::new(
         Extent3d {
             width: t.width,
@@ -69,7 +69,7 @@ fn repeat(mut img: Image) -> Image {
 fn textured_tiled(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
-    tex: &crate::render3d::texture::Texture,
+    tex: &crate::paint::Texture,
     rough: f32,
     scale: Vec2,
 ) -> Handle<StandardMaterial> {

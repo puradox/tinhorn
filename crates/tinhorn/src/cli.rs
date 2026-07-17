@@ -55,11 +55,6 @@ pub struct Cli {
     /// Start the interactive mode muted (Ctrl-Q toggles sound at runtime).
     #[arg(long)]
     pub mute: bool,
-
-    /// Use the legacy software renderer for the interactive arena instead of the
-    /// default Bevy backend. (Ignored in one-shot mode, which never renders.)
-    #[arg(long)]
-    pub legacy_render: bool,
 }
 
 impl Cli {
