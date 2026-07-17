@@ -28,7 +28,8 @@ use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as TColor, Style};
 
-use tinhorn_core::{dice_geom, parse, physics, view_math};
+use tinhorn_core::app::{App as DiceApp, Die, crit_face, fumble_face};
+use tinhorn_core::{dice_geom, physics, view_math};
 
 mod convert;
 
@@ -47,28 +48,37 @@ const ROW_ALIGN: usize = 256;
 /// called from the interactive path, never one-shot, so entering raw mode and
 /// initialising a GPU here can't affect scripting.
 pub fn run(expr: String, seed: Option<u64>) {
-    // The spike shows fixed poses rather than a seeded animated roll, so the seed
-    // isn't consumed yet; kept in the signature for when the sim drives the scene.
-    let _ = seed;
-
     // Headless self-validation: `TINHORN_BEVY_SNAPSHOT=<path>` renders the same
     // scene to a PNG instead of the terminal, then exits. No RatatuiContext, so
     // no TTY is required — this is how the render is checked in CI or from a
     // non-interactive shell (open the PNG to eyeball the dice, felt, and shadows).
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
-        run_snapshot(&expr, PathBuf::from(path));
+        run_snapshot(&expr, seed, PathBuf::from(path));
     } else {
-        run_interactive(&expr);
+        run_interactive(&expr, seed);
     }
 }
 
-/// The scene, minus the presentation layer: the headless render plugins plus the
-/// `setup` system, shared by the interactive and snapshot paths. `bevy_window`
-/// is pulled in transitively by the render features, so DefaultPlugins carries a
-/// WindowPlugin (and, without winit, no loop driver). Render headless — no
-/// primary window, and don't exit just because there are none — and drive the
-/// update loop ourselves at ~60 fps.
-fn base_app(expr: &str) -> App {
+/// The scene, minus the presentation layer: the headless render plugins, the
+/// core sim as the single source of truth, and the systems that advance it and
+/// mirror its dice into Bevy entities. Shared by the interactive and snapshot
+/// paths. `bevy_window` is pulled in transitively by the render features, so
+/// DefaultPlugins carries a WindowPlugin (and, without winit, no loop driver):
+/// render headless — no primary window, and don't exit just because there are
+/// none — and drive the update loop ourselves at ~60 fps.
+fn base_app(expr: &str, seed: Option<u64>) -> App {
+    // `App` (the core sim) owns the dice and the physics; the Bevy entities are a
+    // pure view of it, so all roll logic and the seed contract stay in core.
+    let mut sim = match seed {
+        Some(s) => DiceApp::with_seed(expr.to_string(), s),
+        None => DiceApp::new(expr.to_string()),
+    };
+    // The sim's arena size feeds its launch/particle geometry; pick a cell grid
+    // whose aspect matches the render target so throws arc through the frame.
+    sim.arena_w = 64.0;
+    sim.arena_h = 20.0;
+    sim.roll(); // kick off an animated roll so the dice tumble on screen
+
     let mut app = App::new();
     app.add_plugins((
         DefaultPlugins.set(WindowPlugin {
@@ -79,49 +89,37 @@ fn base_app(expr: &str) -> App {
         ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
     ))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
-    .insert_resource(DiceList(dice_from_expr(expr)))
+    .insert_resource(Sim(sim))
     .init_resource::<ArenaImage>()
-    .add_systems(Startup, setup);
+    .add_systems(Startup, setup)
+    .add_systems(Update, (advance_sim, sync_dice_scene).chain());
     app
 }
 
 /// The real path: terminal context + input + per-frame blit.
-fn run_interactive(expr: &str) {
-    let mut app = base_app(expr);
+fn run_interactive(expr: &str, seed: Option<u64>) {
+    let mut app = base_app(expr, seed);
     app.add_plugins(RatatuiPlugins::default())
         .add_systems(Update, (handle_input, draw_arena))
         .run();
 }
 
-/// The validation path: render a few frames, dump the arena image to `path`, exit.
-fn run_snapshot(expr: &str, path: PathBuf) {
-    let mut app = base_app(expr);
+/// The validation path: render until the roll settles, dump a PNG, exit.
+fn run_snapshot(expr: &str, seed: Option<u64>, path: PathBuf) {
+    let mut app = base_app(expr, seed);
     app.insert_resource(Snapshot { path, frames: 0 })
         .add_systems(Update, save_snapshot)
         .run();
 }
 
-/// One die per entry, sides parsed from the expression (each term contributes
-/// `count` dice); falls back to a sampler of all six solids. Capped so the row
-/// of dice stays legible in the spike.
-fn dice_from_expr(expr: &str) -> Vec<u32> {
-    let mut sides = Vec::new();
-    if let Ok(roll) = parse::parse(expr) {
-        for term in &roll.terms {
-            for _ in 0..term.count {
-                sides.push(term.sides);
-            }
-        }
-    }
-    if sides.is_empty() {
-        sides = vec![20, 12, 10, 8, 6, 4];
-    }
-    sides.truncate(8);
-    sides
-}
-
+/// The core sim — the single source of truth. Bevy reads it; only the input
+/// system writes it (a later stage).
 #[derive(Resource)]
-struct DiceList(Vec<u32>);
+struct Sim(DiceApp);
+
+/// Tags a Bevy entity as the view of `sim.0.dice[index]`.
+#[derive(Component)]
+struct DieView(usize);
 
 /// The CPU-side copy of the rendered arena, refreshed every frame by the readback
 /// observer. `pixels` is row-padded RGBA8 (see [`ROW_ALIGN`]).
@@ -136,7 +134,6 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    dice: Res<DiceList>,
     mut arena: ResMut<ArenaImage>,
 ) {
     // 1. The image the camera renders into and we read back each frame.
@@ -218,30 +215,92 @@ fn setup(
         Transform::from_xyz(0.0, -physics::HY - 0.15, 0.0),
     ));
 
-    // 6. The dice, in a row on the felt at fixed, slightly-tumbled poses.
-    let n = dice.0.len().max(1);
-    for (i, &sides) in dice.0.iter().enumerate() {
-        let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(sides)));
+    // The dice themselves are spawned and posed by `sync_dice_scene` from the sim.
+}
+
+/// Step the core sim by real elapsed time; its fixed-step accumulator keeps the
+/// physics deterministic regardless of Bevy's frame pacing.
+fn advance_sim(time: Res<Time>, mut sim: ResMut<Sim>) {
+    sim.0.update(time.delta_secs());
+}
+
+/// Mirror `sim.0.dice` into the scene: spawn a mesh+material per new die, copy
+/// each existing view's pose and colour every frame, and despawn any view whose
+/// die has been cleared.
+fn sync_dice_scene(
+    mut commands: Commands,
+    sim: Res<Sim>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut views: Query<(
+        Entity,
+        &DieView,
+        &mut Transform,
+        &MeshMaterial3d<StandardMaterial>,
+    )>,
+) {
+    let dice = &sim.0.dice;
+    let mut has_view = vec![false; dice.len()];
+
+    for (entity, view, mut transform, material) in &mut views {
+        match dice.get(view.0) {
+            Some(die) => {
+                *transform = die_transform(die);
+                if let Some(mut mat) = materials.get_mut(&material.0) {
+                    mat.base_color = die_color(die);
+                }
+                has_view[view.0] = true;
+            }
+            None => {
+                commands.entity(entity).despawn();
+            }
+        }
+    }
+
+    for (i, die) in dice.iter().enumerate() {
+        if has_view[i] {
+            continue;
+        }
+        let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(die.sides)));
         let material = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.92, 0.90, 0.84),
+            base_color: die_color(die),
             perceptual_roughness: 0.4,
             ..default()
         });
-        let t = if n == 1 {
-            0.5
-        } else {
-            i as f32 / (n as f32 - 1.0)
-        };
-        let x = (t - 0.5) * (physics::HX * 1.4);
-        let z = ((i % 2) as f32 - 0.5) * physics::HZ * 0.5;
         commands.spawn((
+            DieView(i),
             Mesh3d(mesh),
             MeshMaterial3d(material),
-            Transform::from_xyz(x, -physics::HY + physics::DIE_R, z)
-                .with_scale(Vec3::splat(physics::DIE_R))
-                .with_rotation(Quat::from_rotation_y(i as f32 * 0.7) * Quat::from_rotation_x(0.4)),
+            die_transform(die),
         ));
     }
+}
+
+/// World transform for a die: its sim pose, scaled to the die's world radius.
+fn die_transform(die: &Die) -> Transform {
+    Transform::from_translation(convert::vec3(die.pos))
+        .with_rotation(convert::quat(die.rot))
+        .with_scale(Vec3::splat(physics::DIE_R))
+}
+
+/// Die colour: dropped dice grey out, a settled crit burns gold and a fumble red,
+/// otherwise a bone ivory faintly tinted per term so multiple terms read apart.
+fn die_color(die: &Die) -> Color {
+    if !die.kept {
+        return Color::srgb(0.34, 0.34, 0.31);
+    }
+    if die.settled && crit_face(die.sides, die.final_value) {
+        return Color::srgb(1.0, 0.84, 0.28);
+    }
+    if die.settled && fumble_face(die.sides, die.final_value) {
+        return Color::srgb(0.82, 0.22, 0.2);
+    }
+    let tints = [
+        Color::srgb(0.92, 0.90, 0.84),
+        Color::srgb(0.85, 0.89, 0.92),
+        Color::srgb(0.92, 0.87, 0.85),
+    ];
+    tints[die.color_idx % tints.len()]
 }
 
 /// Copy each completed GPU readback into the CPU-side arena image.
@@ -316,24 +375,27 @@ struct Snapshot {
     frames: u32,
 }
 
-/// Wait for the render and the async GPU readback to settle, write the arena
-/// image to a PNG, and exit. The validation counterpart of [`draw_arena`].
+/// Wait for the readback to land AND the roll to come to rest, then write the
+/// arena image to a PNG and exit. The validation counterpart of [`draw_arena`];
+/// snapshotting the *settled* roll makes the PNG a stable regression reference.
 fn save_snapshot(
     mut snapshot: ResMut<Snapshot>,
     arena: Res<ArenaImage>,
+    sim: Res<Sim>,
     mut exit: MessageWriter<AppExit>,
 ) {
     snapshot.frames += 1;
 
     // The first readback is a few frames out (render → copy → map_async → the
-    // next extract triggers ReadbackComplete); wait for pixels AND a short warmup.
+    // next extract triggers ReadbackComplete). Wait for a warmup, a landed
+    // readback, and the dice to settle — or a hard frame cap so it can't hang.
     let ready = !arena.pixels.is_empty();
-    if snapshot.frames < 16 || !ready {
-        if snapshot.frames > 300 {
-            eprintln!("tinhorn: no frame read back after 300 frames; giving up");
-            exit.write_default();
-        }
+    let done = snapshot.frames >= 16 && ready && sim.0.all_settled();
+    if !done && snapshot.frames < 600 {
         return;
+    }
+    if snapshot.frames >= 600 {
+        eprintln!("tinhorn: roll didn't settle in 600 frames; snapshotting anyway");
     }
 
     match save_png(&arena.pixels, RENDER_W, RENDER_H, &snapshot.path) {
