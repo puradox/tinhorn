@@ -1,56 +1,45 @@
-//! Application state and the little physics engine that bounces the dice.
+//! Application state, the roll evaluator, and the glue that drives the dice
+//! through the 3D rigid-body sim in [`crate::physics`] (Rapier).
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::parse::{self, DiceTerm, Goal, Roll, Stake, TermMod};
+use crate::physics::{self, Physics};
+use glam::{Quat, Vec3};
+use rapier3d::prelude::RigidBodyHandle;
 
-/// Width / height of a die "box" in terminal cells: ┌───┐ / │ N │ / └───┘
-pub const DIE_W: f32 = 6.0;
-pub const DIE_H: f32 = 4.0;
-
-// Physics tuning (units are terminal cells and seconds).
-const GRAVITY: f32 = 60.0;
-const WALL_RESTITUTION: f32 = 0.72;
-const FLOOR_RESTITUTION: f32 = 0.5;
-const FLOOR_FRICTION: f32 = 0.7;
-const AIR_DRAG: f32 = 0.4;
-const TUMBLE_INTERVAL: f32 = 0.05; // how often a mid-air die shows a new face
-const SETTLE_SPEED_SQ: f32 = 6.0; // below this (and supported) a die comes to rest
-const MIN_BOUNCE_VY: f32 = 3.5; // smaller floor bounces are killed so dice actually stop
-const DIE_RESTITUTION: f32 = 0.2; // bounciness when two dice strike each other (dice aren't bouncy)
-const CONTACT_EPS: f32 = 0.7; // vertical gap within which a die counts as resting on another
-const COLLISION_ITERS: usize = 8; // separation passes per frame (stacks need a few)
-const STUCK_TIMEOUT: f32 = 0.4; // a die stopped this long with no proper rest settles in place
-const TOPPLE_FACTOR: f32 = 1.4; // how strongly an off-centre landing rolls a die off the one below
-const TOPPLE_MAX: f32 = 20.0; // cap on a single topple kick so a hard slam can't fling a die away
-const MIN_SLIDE_VX: f32 = 2.5; // sideways speed below this is killed on contact so piles settle
-const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long settles in place no matter what
+// Tuning. The rigid-body sim lives in `physics`; these are the bits `app` still
+// owns: the crit/fumble particle gravity, the airborne cap, and the ceremony.
+const GRAVITY: f32 = 60.0; // 2D particle-burst gravity (cells/s²), not the dice
+const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long is frozen in place
 const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so the pool can't run away
 
 // The Throw: shake-the-cup tuning. Power rises from 0 the moment the cup is
 // picked up and oscillates forever, so the release timing is the whole game.
 const SHAKE_POWER_RATE: f32 = 3.9; // rad/s: a full 0→1→0 power cycle ≈ 1.6 s
-const CUP_SWAY_RATE: f32 = 7.0; // rad/s: how fast the cup rattles side to side
-const THROW_SPEED_MIN: f32 = 26.0; // a zero-power lob still clears the cup's lip
-const THROW_SPEED_MAX: f32 = 95.0; // a full-power throw crosses the arena and works the walls
+/// rad/s: how fast the cup rattles side to side. `pub(crate)` because the
+/// renderer syncs the cup's bob and lean to the same clock — one rate, so the
+/// drawn shake can't drift off the audible one.
+pub(crate) const CUP_SWAY_RATE: f32 = 7.0;
 const MAX_HISTORY: usize = 200; // most recent rolls kept in memory for the history pane
 const STAT_SAMPLES: usize = 20_000; // Monte-Carlo trials for the statistics pane's odds
 const MAX_SOUNDS: usize = 64; // pending sound events; when nothing drains them, stop queuing
-const KNOCK_BUDGET: usize = 8; // die-vs-die clicks collected per frame; more is inaudible
-const SOUND_SPEED_MIN: f32 = 8.0; // impacts slower than this are silent (they'd be noise)
+const KNOCK_BUDGET: usize = 8; // impact/knock sounds voiced per physics step; more is inaudible
 const CRIT_PARTICLES: usize = 16; // burst size for a natural 20
 const RELEASE_ECHO_SECS: f32 = 1.6; // how long the caught-power verdict lingers on screen
 
-/// One die in flight.
+/// One die in the arena. Its world pose (`pos`, `rot`) is synced from the Rapier
+/// body every physics step; the value fields are the seeded RNG's, decided up
+/// front so the physics only decides where a die lands, never what it reads.
 pub struct Die {
     pub sides: u32,
     pub final_value: u32,
     pub shown: u32,
-    pub x: f32,
-    pub y: f32,
-    pub vx: f32,
-    pub vy: f32,
+    /// World position, synced from the physics body each step.
+    pub pos: Vec3,
+    /// Orientation, synced from the physics body each step.
+    pub rot: Quat,
     pub settled: bool,
     pub color_idx: usize,
     /// Which dice term this die belongs to. Dice in the same term share a `mult`
@@ -59,7 +48,7 @@ pub struct Die {
     /// Per-term multiplier applied to this term's kept sum (1 when no `*N`).
     pub mult: i32,
     /// `false` for a die that was thrown and animated but dropped by keep/drop —
-    /// it still bounces and settles, but is rendered dimmed and left out of the total.
+    /// it still tumbles and settles, but is rendered dimmed and left out of the total.
     pub kept: bool,
     /// The explode condition inherited from this die's term, if it explodes.
     /// When such a die settles on a matching face it spawns one more die — so
@@ -67,26 +56,9 @@ pub struct Die {
     explode: Option<parse::Compare>,
     /// Set once a die has had its chance to explode, so it can't spawn twice.
     exploded: bool,
-    tumble_acc: f32,
-    still_for: f32, // seconds spent slow-but-unsettled; triggers the stuck fallback
-    age: f32,       // seconds since thrown; a hard cap so nothing tumbles forever
-}
-
-impl Die {
-    /// Put the die at a launch position/velocity and reset every piece of its
-    /// flight state. All three launch sites (the rain spawn, the cup throw,
-    /// and explosion spawns) go through here so a new flight-state field can
-    /// never be reset in one and forgotten in another.
-    fn launch_at(&mut self, x: f32, y: f32, vx: f32, vy: f32) {
-        self.x = x;
-        self.y = y;
-        self.vx = vx;
-        self.vy = vy;
-        self.settled = false;
-        self.tumble_acc = 0.0;
-        self.still_for = 0.0;
-        self.age = 0.0;
-    }
+    age: f32, // seconds airborne; a hard cap forces a rest so nothing tumbles forever
+    /// Handle to this die's Rapier rigid body (invalid until spawned).
+    body: RigidBodyHandle,
 }
 
 /// THE statement of the staked-check rule: `(success, margin)` for a total
@@ -131,6 +103,29 @@ pub fn crit_face(sides: u32, value: u32) -> bool {
 /// The fumble rule: a 1 on any die of 2+ sides. See [`crit_face`].
 pub fn fumble_face(sides: u32, value: u32) -> bool {
     sides >= 2 && value == 1
+}
+
+/// A cosmetic up-face number for an airborne die, derived from its orientation
+/// so it flickers as the die tumbles and stills as it slows. No RNG is drawn —
+/// the seed-identical roll contract is untouched — and it never counts toward
+/// anything: the value that matters burns in from `final_value` the instant the
+/// die settles. This is what keeps the outcome a secret until the dice stop.
+fn tumbling_face(rot: Quat, sides: u32) -> u32 {
+    if sides <= 1 {
+        return 1;
+    }
+    let bits = rot.x.to_bits() ^ rot.y.to_bits().rotate_left(11) ^ rot.z.to_bits().rotate_left(22);
+    1 + (bits % sides)
+}
+
+/// The convex-hull points for a die of `sides` — its polyhedron's vertices
+/// (circumradius 1; the physics scales them to the collider size).
+fn mesh_points(sides: u32) -> Vec<Vec3> {
+    crate::render3d::dice::mesh_for(sides)
+        .vertices
+        .iter()
+        .map(|v| v.position)
+        .collect()
 }
 
 /// Something the physics did that deserves a noise. `App` only *emits* these —
@@ -287,14 +282,9 @@ pub struct App {
     pub arena_w: f32,
     pub arena_h: f32,
     pub spawned: bool,
-    needs_spawn: bool,
     /// The shake in progress, if any (the Throw). Power and cup sway are both
     /// functions of its one clock; the throw rolls its locked expression.
     shake: Option<Shake>,
-    /// A throw released but not yet spawned: `(power, cup_x)` captured at the
-    /// moment of release. Consumed by [`Self::spawn`], which launches the dice
-    /// out of the cup instead of raining them from the top.
-    pending_throw: Option<(f32, f32)>,
     /// The most recent release: caught power plus seconds since. Drives the
     /// arena title, the release echo, and the brief impact screen-shake.
     pub last_throw: Option<Throw>,
@@ -314,6 +304,28 @@ pub struct App {
     /// to be enforced across frames rather than in one up-front loop.
     explosions: Vec<usize>,
     rng: StdRng,
+    /// The 3D rigid-body world. Physics decides only where dice land, never the
+    /// values. Stepped on a fixed timestep so insta and animated rolls settle
+    /// bit-identically — the `--seed` contract survives real physics.
+    physics: Physics,
+    /// Leftover real time not yet consumed by a fixed physics step.
+    phys_accum: f32,
+    /// Wall-clock seconds since launch, ticked every `update`. Purely cosmetic —
+    /// drives the arena's gentle idle camera drift; never touches the RNG or sim.
+    clock: f32,
+    /// Crit celebration level (1 → 0), set when a natural crit settles and decayed
+    /// each `update`. Cosmetic: drives the gold light flare and camera punch-in.
+    flash: f32,
+    /// A short envelope of recent die-impact energy (0..~1.5), bumped on each hard
+    /// contact and decayed each `update`. Cosmetic: kicks the overhead key light so
+    /// the table light "flinches" with the physics. Reads impacts, never changes them.
+    impact_energy: f32,
+    /// Camera "reading" focus (0 → 1), keyed to the ceremony: eased toward 1 the
+    /// moment a roll is launched and held through the flight and the settle, back
+    /// to 0 while the cup is shaking. Cosmetic: leans the camera down over the
+    /// tray so you watch the dice come to a readable stop. Never touches the RNG
+    /// or sim.
+    focus: f32,
 }
 
 impl App {
@@ -344,9 +356,7 @@ impl App {
             arena_w: 0.0,
             arena_h: 0.0,
             spawned: false,
-            needs_spawn: false,
             shake: None,
-            pending_throw: None,
             last_throw: None,
             particles: Vec::new(),
             sounds: Vec::new(),
@@ -354,6 +364,12 @@ impl App {
             stats_cache: None,
             explosions: Vec::new(),
             rng,
+            physics: Physics::new(),
+            phys_accum: 0.0,
+            clock: 0.0,
+            flash: 0.0,
+            impact_energy: 0.0,
+            focus: 0.0,
         };
         if !initial.trim().is_empty() {
             app.input = initial.trim().to_string();
@@ -441,6 +457,15 @@ impl App {
     /// Parse the current input and, on success, build a fresh pool of dice.
     /// Actual spawn positions are assigned later, once the arena size is known.
     pub fn roll(&mut self) {
+        if self.build_pool() {
+            self.launch_pool(None); // a plain roll rains the dice from the top
+        }
+    }
+
+    /// Parse the input and build the dice pool — values decided up front. No
+    /// bodies are spawned yet; [`Self::launch_pool`] does that. Returns `false`
+    /// on a parse error (stored in `self.error`).
+    fn build_pool(&mut self) -> bool {
         match parse::parse(&self.input) {
             Ok(Roll {
                 terms,
@@ -457,15 +482,14 @@ impl App {
                 }
                 self.dice = dice;
                 self.spawned = false;
-                self.needs_spawn = true;
                 self.recorded = false;
                 self.particles.clear();
-                // A plain Enter roll rains from the top; only throw() re-arms these.
-                self.pending_throw = None;
                 self.last_throw = None;
+                true
             }
             Err(e) => {
                 self.error = Some(e);
+                false
             }
         }
     }
@@ -541,14 +565,17 @@ impl App {
         color_idx: usize,
         explode: Option<parse::Compare>,
     ) -> Die {
+        let final_value = self.rng.gen_range(1..=sides);
         Die {
             sides,
-            final_value: self.rng.gen_range(1..=sides),
-            shown: self.rng.gen_range(1..=sides),
-            x: 0.0,
-            y: 0.0,
-            vx: 0.0,
-            vy: 0.0,
+            final_value,
+            // The decoy face for the frames before the first physics step runs
+            // `tumbling_face` — anything but `final_value`, which would flash the
+            // real outcome on the launch frame. Derived, not drawn, so the seed
+            // contract is untouched.
+            shown: 1 + (color_idx as u32 * 7 + 2) % sides,
+            pos: Vec3::ZERO,
+            rot: Quat::IDENTITY,
             settled: false,
             color_idx,
             term_idx,
@@ -556,9 +583,8 @@ impl App {
             kept: true,
             explode,
             exploded: false,
-            tumble_acc: 0.0,
-            still_for: 0.0,
             age: 0.0,
+            body: RigidBodyHandle::invalid(),
         }
     }
 
@@ -616,18 +642,25 @@ impl App {
         centre + (self.shake_t() * CUP_SWAY_RATE).sin() * amp
     }
 
+    /// THE cell→normalised map for the cup's sway: its position as −1..1 across
+    /// the arena. The renderer places the 3D cup with this and the throw aims
+    /// away from it, so where the dice fly from can never drift off where the
+    /// cup is drawn.
+    pub fn cup_offset(&self) -> f32 {
+        (self.cup_x() / self.arena_w.max(1.0)) * 2.0 - 1.0
+    }
+
     /// Release the shake: roll the expression locked at pickup and launch the
     /// dice out of the cup with the power caught at this instant.
     pub fn throw(&mut self) {
         let power = self.power();
-        let cup_x = self.cup_x();
+        let cup = self.cup_offset();
         let Some(shake) = self.shake.take() else {
             return;
         };
         self.input = shake.expr;
-        self.roll();
-        if self.error.is_none() {
-            self.pending_throw = Some((power, cup_x));
+        if self.build_pool() {
+            self.launch_pool(Some((power, cup)));
             self.last_throw = Some(Throw { power, age: 0.0 });
             self.emit(SoundEvent::Throw { power });
         }
@@ -705,65 +738,154 @@ impl App {
             .filter(|d| d.kept && d.settled && fumble_face(d.sides, d.final_value))
     }
 
-    fn max_xy(&self) -> (f32, f32) {
-        (
-            (self.arena_w - DIE_W).max(0.0),
-            (self.arena_h - DIE_H).max(0.0),
-        )
-    }
+    /// Spawn every die's rigid body into the physics world and launch it. A
+    /// plain roll rains them from the top (`power` = None); a released throw
+    /// fires them with the caught power (`Some((0..1, cup_offset))`, the cup's
+    /// normalised −1..1 position from [`Self::cup_offset`]). Only the launch is
+    /// power's to shape — the faces were rolled in [`Self::roll`].
+    /// The RNG draws here are identical for insta and animated rolls, and the
+    /// physics is fixed-step deterministic, so the two settle bit-identically.
+    fn launch_pool(&mut self, power: Option<(f32, f32)>) {
+        self.physics.clear();
+        self.phys_accum = 0.0;
+        let count = self.dice.len();
+        let cols = count.clamp(1, 6);
+        for i in 0..count {
+            let sides = self.dice[i].sides;
+            let pts = mesh_points(sides);
 
-    /// Place and launch the pool. A plain roll rains the dice from random spots
-    /// near the top; a released throw fires them out of the cup instead.
-    fn spawn(&mut self) {
-        let (maxx, maxy) = self.max_xy();
-        if let Some((power, cup_x)) = self.pending_throw.take() {
-            self.spawn_throw(power, cup_x, maxx, maxy);
-        } else {
-            // Borrow the rng separately from the dice to satisfy the borrow checker.
-            let rng = &mut self.rng;
-            for die in &mut self.dice {
-                die.launch_at(
-                    rng.gen_range(0.0..=maxx.max(0.01)),
-                    rng.gen_range(0.0..=(maxy * 0.35).max(0.01)),
-                    rng.gen_range(-42.0..=42.0),
-                    rng.gen_range(-22.0..=18.0),
-                );
-            }
+            // Stagger spawn spots on a 3D lattice — columns across the width,
+            // then depth slots, then layers stacked DOWNWARD from near the top
+            // (going up would push dice through the ceiling and eject them).
+            // Every spot sits a die-diameter (2·DIE_R = 0.72) from its
+            // neighbours, so even the 60-die cap never spawns two dice deeply
+            // interpenetrating — Rapier's penetration recovery would hurl such
+            // a pair apart hard enough to eject dice from the tray. The lattice
+            // is 6 × 3 × 4 = 72 spots, comfortably over the cap.
+            let col = i % cols;
+            let zi = (i / cols) % 3;
+            let layer = i / (cols * 3);
+            let fx = if cols > 1 {
+                col as f32 / (cols - 1) as f32
+            } else {
+                0.5
+            };
+            let x = (fx * 2.0 - 1.0) * physics::HX * 0.7 + self.rng.gen_range(-0.05..=0.05);
+            // Depth slots spread across the tray: centre plus one slot near each
+            // z wall (die radius + the ±0.02 jitter margin inside it), so the
+            // lattice uses the whole depth. Slot spacing must stay ≥ a die
+            // diameter (2·DIE_R = 0.72) to keep spawns non-interpenetrating —
+            // `zs ≥ 0.72` holds for any HZ ≥ 1.1, and at HZ = 1.1 this derives
+            // exactly the old hand-tuned 0.72 slots.
+            let zs = physics::HZ - physics::DIE_R - 0.02;
+            let z = [0.0, -zs, zs][zi] + self.rng.gen_range(-0.02..=0.02);
+            let y =
+                (physics::HY * 0.6 - layer as f32 * 0.8).max(-physics::HY + physics::DIE_R + 0.25); // backstop: never below the floor
+            let pos = Vec3::new(x, y, z);
+            let body = self.physics.spawn(&pts, pos);
+            self.dice[i].body = body;
+            self.dice[i].pos = pos;
+
+            let (linvel, angvel) = match power {
+                Some((p, cx)) => {
+                    // Force and direction are separate dials. The caught power
+                    // sets only the speed; the aim leans away from wherever the
+                    // cup ended up swaying (`cx`, −1..1) plus a real per-die
+                    // spray. Power and sway both ride the same shake clock, so
+                    // a bare sign-of-`cx` aim made every same-power release
+                    // fly the same way — a full-power throw always broke right.
+                    let speed = 4.0 + 9.0 * p;
+                    let aim = (-cx + self.rng.gen_range(-0.6..=0.6)).clamp(-1.0, 1.0);
+                    let lin = Vec3::new(
+                        aim * speed * self.rng.gen_range(0.45..=0.65),
+                        speed * self.rng.gen_range(0.4..=0.7),
+                        self.rng.gen_range(-1.0..=1.0),
+                    );
+                    let ang = Vec3::new(
+                        self.rng.gen_range(-22.0..=22.0),
+                        self.rng.gen_range(-22.0..=22.0),
+                        self.rng.gen_range(-22.0..=22.0),
+                    );
+                    (lin, ang)
+                }
+                None => {
+                    let lin = Vec3::new(
+                        self.rng.gen_range(-2.0..=2.0),
+                        self.rng.gen_range(-7.0..=-3.0),
+                        self.rng.gen_range(-1.5..=1.5),
+                    );
+                    let ang = Vec3::new(
+                        self.rng.gen_range(-18.0..=18.0),
+                        self.rng.gen_range(-18.0..=18.0),
+                        self.rng.gen_range(-18.0..=18.0),
+                    );
+                    (lin, ang)
+                }
+            };
+            self.physics.launch(body, linvel, angvel);
         }
         self.spawned = true;
-        self.needs_spawn = false;
     }
 
-    /// Launch every die out of the cup's mouth. Speed scales with the released
-    /// power and the arc flattens as it grows: a timid lob plops out beside the
-    /// cup, a full-power throw crosses the arena and works the far wall. Only
-    /// the trajectory is power's to shape — the faces were rolled in [`Self::roll`].
-    fn spawn_throw(&mut self, power: f32, cup_x: f32, maxx: f32, maxy: f32) {
-        let rng = &mut self.rng;
-        let speed = THROW_SPEED_MIN + (THROW_SPEED_MAX - THROW_SPEED_MIN) * power;
-        // Throw toward the far side of wherever the cup ended up swaying.
-        let dir = if cup_x < maxx / 2.0 { 1.0 } else { -1.0 };
-        let upward = 0.9 - 0.35 * power; // share of speed that goes up; flattens with power
-        for die in &mut self.dice {
-            let s = speed * rng.gen_range(0.85..=1.15);
-            die.launch_at(
-                (cup_x - DIE_W / 2.0 + rng.gen_range(-2.0..=2.0)).clamp(0.0, maxx),
-                (maxy - rng.gen_range(0.0..=2.0)).max(0.0),
-                dir * s * rng.gen_range(0.25 + 0.4 * power..=0.45 + 0.5 * power),
-                -s * rng.gen_range(upward * 0.8..=upward * 1.1),
-            );
+    /// Cosmetic wall-clock (seconds), driving the arena's idle camera drift.
+    pub fn clock(&self) -> f32 {
+        self.clock
+    }
+
+    /// Crit celebration level (1 → 0): the gold flare + camera punch on a natural
+    /// crit, decaying to nothing. Cosmetic.
+    pub fn flash(&self) -> f32 {
+        self.flash
+    }
+
+    /// Recent die-impact energy (0..~1.5), for the key light's flinch. Cosmetic.
+    pub fn impact_energy(&self) -> f32 {
+        self.impact_energy
+    }
+
+    /// Camera "reading" focus (0 → 1), keyed to the ceremony: eased toward 1 the
+    /// moment a roll is launched — held through the flight and the settle, the
+    /// lean-in over the felt — and back to 0 while the cup is shaking. Cosmetic.
+    pub fn focus(&self) -> f32 {
+        self.focus
+    }
+
+    /// The hard-throw camera shudder, as a world-space eye offset — the 3D heir
+    /// to the 2D screen-shake. Fed into `render3d_view::live_camera` by the
+    /// renderer and the particle projection alike, so the shake can't knock the
+    /// two out of register.
+    pub fn camera_shake(&self) -> Vec3 {
+        let tr = self.tremor();
+        match self.last_throw {
+            Some(t) if tr > 0.0 => {
+                let (amp, phase) = (tr * 0.055, t.age * 38.0);
+                Vec3::new(phase.sin() * amp, phase.cos() * amp, 0.0)
+            }
+            _ => Vec3::ZERO,
         }
     }
 
     /// Advance the simulation by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
         let dt = dt.min(0.05); // clamp so a stalled frame doesn't teleport dice
+        self.clock += dt; // cosmetic wall-clock for the idle camera drift
+        self.flash = (self.flash - dt * 2.2).max(0.0); // crit flare fades over ~0.45 s
+        self.impact_energy = (self.impact_energy - dt * 4.0).max(0.0); // flinch fades fast
+
+        // Ease the reading-focus by ceremony, not by rest: lean IN from the moment a
+        // throw is launched (and hold through the flight and the settle, so you watch
+        // the dice come to a readable stop), and lean back OUT the instant the next
+        // shake begins — the cup coming up is the cue to pull back to the wide view.
+        let want_focus = if self.shaking() || self.dice.is_empty() {
+            0.0
+        } else {
+            1.0
+        };
+        self.focus += (want_focus - self.focus) * (dt * 2.2).min(1.0);
 
         // The shake clock ticks whether or not any dice are in flight — the cup
-        // rattles over whatever the last roll left on the floor. Crossing into
-        // a new half-cycle of the sway is one audible tick of the rattle;
-        // deriving both cycle indices from the clock (rather than remembering
-        // the last one) means a fresh shake can't inherit stale state.
+        // rattles over whatever the last roll left on the floor. Deriving both
+        // cycle indices from the clock means a fresh shake can't inherit stale state.
         if let Some(shake) = &mut self.shake {
             let before = (shake.t * CUP_SWAY_RATE / std::f32::consts::PI) as i32;
             shake.t += dt;
@@ -778,94 +900,145 @@ impl App {
         }
         self.update_particles(dt);
 
-        if self.needs_spawn && self.arena_w > 0.0 {
-            self.spawn();
-        }
         if !self.spawned {
             return;
         }
 
-        let (maxx, maxy) = self.max_xy();
-        let drag = (1.0 - AIR_DRAG * dt).max(0.0);
-        let mut impacts: Vec<SoundEvent> = Vec::new();
-
-        // The one audibility gate for every wall/ceiling/floor strike.
-        fn clack(impacts: &mut Vec<SoundEvent>, sides: u32, speed: f32) {
-            if speed > SOUND_SPEED_MIN {
-                impacts.push(SoundEvent::Impact { sides, speed });
+        // Advance the physics on a FIXED timestep (physics::STEP, the one true
+        // 1/60 s), accumulating real time. An insta roll (one step per call) and
+        // an animated roll (several steps per frame) run the identical simulation
+        // and settle bit-identically — the seeded-roll contract survives real
+        // physics. Once every die is at rest nothing can move again until the
+        // next launch, so skip the stepping entirely rather than churn Rapier
+        // over a world of sleepers for as long as the result sits on screen.
+        if self.all_settled() {
+            self.phys_accum = 0.0;
+        } else {
+            self.phys_accum += dt;
+            let mut budget = 8; // cap steps per frame so a stall can't spiral
+            while self.phys_accum >= physics::STEP && budget > 0 {
+                self.phys_accum -= physics::STEP;
+                budget -= 1;
+                self.physics_step();
             }
         }
-
-        for die in &mut self.dice {
-            if die.settled {
-                continue;
-            }
-
-            // Degenerate arena (too small for a die): just settle in place.
-            if maxy < 0.5 {
-                die.settled = true;
-                die.shown = die.final_value;
-                die.x = die.x.clamp(0.0, maxx);
-                die.y = die.y.clamp(0.0, maxy);
-                continue;
-            }
-
-            // Integrate.
-            die.vy += GRAVITY * dt;
-            die.vx *= drag;
-            die.x += die.vx * dt;
-            die.y += die.vy * dt;
-
-            // Side walls.
-            if die.x < 0.0 {
-                die.x = 0.0;
-                clack(&mut impacts, die.sides, die.vx.abs());
-                die.vx = -die.vx * WALL_RESTITUTION;
-            } else if die.x > maxx {
-                die.x = maxx;
-                clack(&mut impacts, die.sides, die.vx.abs());
-                die.vx = -die.vx * WALL_RESTITUTION;
-            }
-
-            // Ceiling.
-            if die.y < 0.0 {
-                die.y = 0.0;
-                clack(&mut impacts, die.sides, die.vy.abs());
-                die.vy = -die.vy * WALL_RESTITUTION;
-            }
-
-            // Floor: bounce, rub off horizontal speed, and kill tiny hops.
-            if die.y > maxy {
-                die.y = maxy;
-                clack(&mut impacts, die.sides, die.vy.abs());
-                die.vy = -die.vy * FLOOR_RESTITUTION;
-                die.vx *= FLOOR_FRICTION;
-                if die.vy.abs() < MIN_BOUNCE_VY {
-                    die.vy = 0.0;
-                }
-            }
-
-            // Tumble the visible face while airborne.
-            die.tumble_acc += dt;
-            if die.tumble_acc >= TUMBLE_INTERVAL {
-                die.tumble_acc = 0.0;
-                die.shown = self.rng.gen_range(1..=die.sides);
-            }
-        }
-        for ev in impacts {
-            self.emit(ev);
-        }
-
-        // Keep dice from overlapping, then let any that are slow and supported
-        // (by the floor or by an already-settled die) come to rest. Order
-        // matters: settling reads the post-separation resting positions.
-        self.resolve_collisions(maxx, maxy);
-        self.settle_supported(dt, maxx, maxy);
 
         // The frame the roll finishes, record it once for the history pane.
         if !self.recorded && self.all_settled() {
             self.record_roll();
             self.recorded = true;
+        }
+    }
+
+    /// One fixed physics step: advance Rapier, voice any impacts, sync each die's
+    /// pose from its body, settle the sleepers, and spawn explosion dice.
+    fn physics_step(&mut self) {
+        // Every die's speed before the step, so a sharp slowdown (a bounce) can
+        // be reported as an impact for the foley. Settled dice can't produce an
+        // impact (their speed is already 0) but stay in the list so a moving die
+        // striking one is voiced as a die-vs-die knock, not a wall strike.
+        let pre: Vec<(RigidBodyHandle, u32, f32)> = self
+            .dice
+            .iter()
+            .map(|d| (d.body, d.sides, self.physics.speed(d.body)))
+            .collect();
+        let mut voiced = 0;
+        for imp in self.physics.step(&pre) {
+            if imp.speed > 1.5 {
+                // A hard contact kicks the key light (cosmetic; capped and decayed).
+                self.impact_energy = (self.impact_energy + imp.speed * 0.12).min(1.5);
+                // A dense pool landing at once is dozens of near-identical clicks
+                // in one step — more than anyone can hear. Voice a frame's worth.
+                if voiced >= KNOCK_BUDGET {
+                    continue;
+                }
+                voiced += 1;
+                let (sides, speed) = (imp.sides, imp.speed * 12.0);
+                if imp.die_die {
+                    self.emit(SoundEvent::Knock { sides, speed });
+                } else {
+                    self.emit(SoundEvent::Impact { sides, speed });
+                }
+            }
+        }
+        self.sync_and_settle(physics::STEP);
+    }
+
+    /// Sync poses from the bodies, settle any that have gone to sleep (or run out
+    /// the airborne clock), and spawn the dice that exploding faces call for.
+    fn sync_and_settle(&mut self, dt: f32) {
+        let mut to_explode: Vec<(u32, usize, i32, parse::Compare)> = Vec::new();
+        for i in 0..self.dice.len() {
+            if self.dice[i].settled {
+                continue;
+            }
+            let (pos, rot) = self.physics.pose(self.dice[i].body);
+            self.dice[i].pos = pos;
+            self.dice[i].rot = rot;
+            self.dice[i].age += dt;
+
+            // While it's still moving, the up-face number flickers with the spin —
+            // a secret still forming. The settle branch below overwrites it with
+            // the real value (the burn) on the step the die comes to rest.
+            self.dice[i].shown = tumbling_face(rot, self.dice[i].sides);
+
+            // Hard cap: a die tumbling past MAX_AIRBORNE is frozen where it lies,
+            // a backstop so an over-packed pile can't agitate itself forever.
+            let overdue = self.dice[i].age >= MAX_AIRBORNE;
+            if overdue {
+                self.physics.freeze(self.dice[i].body);
+            }
+            if overdue || self.physics.sleeping(self.dice[i].body) {
+                self.dice[i].settled = true;
+                // The burn: the RNG-decided value locks onto the up-face.
+                self.dice[i].shown = self.dice[i].final_value;
+                let sides = self.dice[i].sides;
+                self.emit(SoundEvent::Settle { sides });
+
+                // Exploding: a die that rests on a matching face spawns one more,
+                // once, while its term is under the cap. Read the fields out first
+                // so the `self.dice` borrow doesn't overlap `self.explosions`.
+                let (exploded, explode, final_value, term, mult) = {
+                    let d = &self.dice[i];
+                    (d.exploded, d.explode, d.final_value, d.term_idx, d.mult)
+                };
+                if !exploded {
+                    self.dice[i].exploded = true;
+                    if let Some(cmp) = explode {
+                        if cmp.matches(final_value) && self.explosions[term] < MAX_EXPLOSIONS {
+                            self.explosions[term] += 1;
+                            to_explode.push((sides, term, mult, cmp));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drop the explosion dice from the top, exactly like a fresh throw.
+        for (sides, term_idx, mult, cmp) in to_explode {
+            let color = self.dice.len();
+            let mut die = self.new_die(sides, term_idx, color, Some(cmp));
+            die.mult = mult;
+            let x = self.rng.gen_range(-physics::HX * 0.6..=physics::HX * 0.6);
+            let z = self.rng.gen_range(-physics::HZ * 0.5..=physics::HZ * 0.5);
+            let pos = Vec3::new(x, physics::HY * 0.6, z);
+            let pts = mesh_points(sides);
+            die.body = self.physics.spawn(&pts, pos);
+            die.pos = pos;
+            self.physics.launch(
+                die.body,
+                Vec3::new(
+                    self.rng.gen_range(-2.0..=2.0),
+                    self.rng.gen_range(-6.0..=-3.0),
+                    self.rng.gen_range(-1.0..=1.0),
+                ),
+                Vec3::new(
+                    self.rng.gen_range(-18.0..=18.0),
+                    self.rng.gen_range(-18.0..=18.0),
+                    self.rng.gen_range(-18.0..=18.0),
+                ),
+            );
+            self.dice.push(die);
         }
     }
 
@@ -892,8 +1065,16 @@ impl App {
         // thud play once per roll however many dice earned them — a fistful of
         // sixes is one chord, not a bell choir. Positions are copied out first
         // so the burst can borrow the RNG mutably.
-        let crits: Vec<(f32, f32)> = self.crit_dice().map(|d| (d.x, d.y)).collect();
-        let fumbles: Vec<(f32, f32)> = self.fumble_dice().map(|d| (d.x, d.y)).collect();
+        let crit_pos: Vec<Vec3> = self.crit_dice().map(|d| d.pos).collect();
+        let fumble_pos: Vec<Vec3> = self.fumble_dice().map(|d| d.pos).collect();
+        // Fire the flash *before* projecting the bursts: the next frames render
+        // through the punched-in camera, so the bursts must be placed by it too
+        // or the gold would erupt beside the die instead of from it.
+        if !crit_pos.is_empty() {
+            self.flash = 1.0; // fire the gold flare + camera punch
+        }
+        let crits: Vec<(f32, f32)> = crit_pos.iter().map(|&p| self.world_to_cell(p)).collect();
+        let fumbles: Vec<(f32, f32)> = fumble_pos.iter().map(|&p| self.world_to_cell(p)).collect();
         for &(x, y) in &crits {
             self.burst(x, y, true);
         }
@@ -916,7 +1097,8 @@ impl App {
     /// Spray celebration glyphs from a die's centre: a gold radial burst for a
     /// crit, a small grey slump of dust for a fumble.
     fn burst(&mut self, x: f32, y: f32, bright: bool) {
-        let (cx, cy) = (x + DIE_W / 2.0, y + DIE_H / 2.0);
+        // `x`/`y` are already the die's projected centre in cells.
+        let (cx, cy) = (x, y);
         let n = if bright { CRIT_PARTICLES } else { 6 };
         for i in 0..n {
             let angle =
@@ -966,195 +1148,33 @@ impl App {
         self.particles.retain(|p| p.age < p.life);
     }
 
-    /// Push apart any overlapping pairs of dice (axis-aligned boxes). Settled
-    /// dice act as immovable obstacles so piles build from the bottom up.
-    fn resolve_collisions(&mut self, maxx: f32, maxy: f32) {
-        let n = self.dice.len();
-        let mut knocks: Vec<SoundEvent> = Vec::new();
-        for iter in 0..COLLISION_ITERS {
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    let (left, right) = self.dice.split_at_mut(j);
-                    let (a, b) = (&mut left[i], &mut right[0]);
-                    let closing = resolve_pair(a, b);
-                    // Only the first pass is an audible strike; later passes
-                    // re-separate the same contact and would double-report.
-                    // A dense pool striking itself is O(n²) contacts a frame,
-                    // so stop collecting once a frame's worth of near-identical
-                    // clicks is already more than anyone can hear.
-                    if iter == 0 && knocks.len() < KNOCK_BUDGET {
-                        if let Some(speed) = closing {
-                            if speed > SOUND_SPEED_MIN {
-                                knocks.push(SoundEvent::Knock {
-                                    sides: a.sides.max(b.sides),
-                                    speed,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // Separation can shove a die through a wall; clamp everything back in.
-        for die in &mut self.dice {
-            if !die.settled {
-                die.x = die.x.clamp(0.0, maxx);
-                die.y = die.y.clamp(0.0, maxy);
-            }
-        }
-        for ev in knocks {
-            self.emit(ev);
-        }
-    }
-
-    /// Settle each slow die that rests on the floor or on a settled die below it.
-    /// A settling die is snapped flush onto whatever supports it; if that resting
-    /// spot would still overlap a die that came to rest this same frame, settling
-    /// is deferred so the collision pass can pry them apart first. This is what
-    /// stops two co-settling dice from freezing on top of each other.
-    ///
-    /// As a last resort, a die that has sat still for [`STUCK_TIMEOUT`] without
-    /// finding a clean rest (wedged in an over-tall stack the arena can't hold)
-    /// settles wherever it is — accepting a little overlap beats bouncing forever.
-    fn settle_supported(&mut self, dt: f32, maxx: f32, maxy: f32) {
-        // Boxes already at rest. Grows as we accept more dice this frame, so each
-        // candidate is checked against the ones settled just before it.
-        let mut resting: Vec<(f32, f32)> = self
-            .dice
-            .iter()
-            .filter(|d| d.settled)
-            .map(|d| (d.x, d.y))
-            .collect();
-
-        // Explosions discovered this frame: a die that settles on a matching face
-        // spawns one more. Collected here and tossed in after the loop so we don't
-        // grow `self.dice` (and shift `resting`) mid-iteration.
-        let mut to_explode: Vec<(u32, usize, i32, parse::Compare)> = Vec::new();
-
-        for i in 0..self.dice.len() {
-            if self.dice[i].settled {
-                continue;
-            }
-            self.dice[i].age += dt;
-            // Hard cap: anything still tumbling after MAX_AIRBORNE settles in
-            // place, even if it's fast — a backstop so a chaotically over-packed
-            // pile can't agitate itself forever. Real rolls settle long before.
-            let overdue = self.dice[i].age >= MAX_AIRBORNE;
-
-            let slow = {
-                let d = &self.dice[i];
-                d.vx * d.vx + d.vy * d.vy < SETTLE_SPEED_SQ
-            };
-            if slow {
-                self.dice[i].still_for += dt;
-            } else {
-                self.dice[i].still_for = 0.0;
-                if !overdue {
-                    continue; // moving and not overdue: keep simulating
-                }
-            }
-            let stuck = overdue || self.dice[i].still_for >= STUCK_TIMEOUT;
-            let die = &self.dice[i];
-
-            // Where would this die come to rest? On the floor, or flush on the
-            // highest settled die directly beneath it (it may straddle two).
-            let on_floor = die.y >= maxy - 0.5;
-            let bottom = die.y + DIE_H;
-            let support_top = resting
-                .iter()
-                .filter(|&&(rx, ry)| {
-                    let x_overlap = die.x < rx + DIE_W && die.x + DIE_W > rx;
-                    x_overlap && ry > die.y && (bottom - ry).abs() < CONTACT_EPS
-                })
-                .map(|&(_, ry)| ry)
-                .fold(f32::INFINITY, f32::min);
-
-            let (rest_x, rest_y) = if on_floor {
-                (die.x, maxy)
-            } else if support_top.is_finite() {
-                (die.x, support_top - DIE_H)
-            } else if stuck {
-                (die.x, die.y) // wedged with nowhere to go: rest in place
-            } else {
-                continue; // unsupported: keep falling
-            };
-            // A stack taller than the arena would push the top die past the
-            // ceiling; keep every resting spot inside the bounds.
-            let rest_x = rest_x.clamp(0.0, maxx);
-            let rest_y = rest_y.clamp(0.0, maxy);
-
-            // Defer if this resting spot still clashes with one already taken —
-            // unless we're stuck, in which case a clash is unavoidable.
-            let clashes = !stuck
-                && resting.iter().any(|&(rx, ry)| {
-                    let (px, py) = penetration(rest_x, rest_y, rx, ry);
-                    px.min(py) > 0.5
-                });
-            if clashes {
-                continue;
-            }
-
-            let die = &mut self.dice[i];
-            die.settled = true;
-            die.shown = die.final_value;
-            die.x = rest_x;
-            die.y = rest_y;
-            die.vx = 0.0;
-            die.vy = 0.0;
-            resting.push((rest_x, rest_y));
-            let sides = die.sides;
-
-            // Exploding: a die that comes to rest on a face meeting its condition
-            // spawns one more die — but only once, and only while its term is
-            // under the cap. The new die is built and tossed after the loop.
-            if !die.exploded {
-                die.exploded = true;
-                if let Some(cmp) = die.explode {
-                    let term = die.term_idx;
-                    if cmp.matches(die.final_value) && self.explosions[term] < MAX_EXPLOSIONS {
-                        self.explosions[term] += 1;
-                        to_explode.push((die.sides, term, die.mult, cmp));
-                    }
-                }
-            }
-            self.emit(SoundEvent::Settle { sides });
-        }
-
-        // Toss any dice the just-settled dice exploded into. They drop from the
-        // top with a random velocity, exactly like the opening throw, and carry
-        // their term's multiplier and explode condition so chains keep going.
-        for (sides, term_idx, mult, cmp) in to_explode {
-            let color = self.dice.len();
-            let mut die = self.new_die(sides, term_idx, color, Some(cmp));
-            die.mult = mult;
-            self.launch(&mut die, maxx, maxy);
-            self.dice.push(die);
-        }
-    }
-
-    /// Toss a single die from a random spot near the top, like the opening
-    /// throw. Used for explosion spawns that appear mid-animation.
-    fn launch(&mut self, die: &mut Die, maxx: f32, maxy: f32) {
-        die.launch_at(
-            self.rng.gen_range(0.0..=maxx.max(0.01)),
-            self.rng.gen_range(0.0..=(maxy * 0.35).max(0.01)),
-            self.rng.gen_range(-42.0..=42.0),
-            self.rng.gen_range(-22.0..=18.0),
-        );
-    }
-
     pub fn all_settled(&self) -> bool {
         self.spawned && !self.dice.is_empty() && self.dice.iter().all(|d| d.settled)
+    }
+
+    /// World→arena-cell mapping for the 2D particle overlays (crit gold, fumble
+    /// dust). It projects through the *same* [`live_camera`](crate::render3d_view::live_camera)
+    /// the dice are drawn with — drift, punch-in, shudder and all — so a burst
+    /// erupts exactly from the die that earned it.
+    fn world_to_cell(&self, pos: Vec3) -> (f32, f32) {
+        if self.arena_w < 1.0 || self.arena_h < 1.0 {
+            return (self.arena_w / 2.0, self.arena_h / 2.0);
+        }
+        let aspect = crate::render3d_view::arena_aspect(self.arena_w, self.arena_h);
+        let cam = crate::render3d_view::live_camera(
+            self.camera_shake(),
+            aspect,
+            self.focus,
+            self.clock,
+            self.flash,
+        );
+        crate::render3d_view::project_to_cell(&cam, pos, self.arena_w, self.arena_h)
+            .unwrap_or((self.arena_w / 2.0, self.arena_h / 2.0))
     }
 
     /// Final total (only meaningful once settled, but always well-defined).
     pub fn total(&self) -> i32 {
         self.summed(|d| d.final_value as i32)
-    }
-
-    /// Running total of whatever faces are currently showing.
-    pub fn live_total(&self) -> i32 {
-        self.summed(|d| d.shown as i32)
     }
 
     /// Sum each term's kept dice (via `value`), scale by the term's multiplier,
@@ -1649,127 +1669,6 @@ fn keep_n(dice: &mut [Die], n: usize, high: bool) {
     }
 }
 
-/// Per-axis overlap depth of two die-sized boxes whose top-left corners are at
-/// the given coordinates. A component is positive only when the boxes intrude on
-/// that axis; both positive means a real overlap, and `min` of the two is the
-/// penetration that matters for separation.
-fn penetration(ax: f32, ay: f32, bx: f32, by: f32) -> (f32, f32) {
-    (
-        (DIE_W - (ax - bx).abs()).max(0.0),
-        (DIE_H - (ay - by).abs()).max(0.0),
-    )
-}
-
-/// Separate two overlapping dice and damp their velocities along the contact
-/// normal. Dice are equal-size axis-aligned boxes, so this is plain AABB:
-/// resolve along the axis of least penetration. A settled die is immovable, so
-/// moving dice get pushed off it and piles build from the bottom up.
-///
-/// Returns the closing speed along the contact normal when the pair actually
-/// struck (approaching, not just overlapping) — the foley's cue for a knock.
-fn resolve_pair(a: &mut Die, b: &mut Die) -> Option<f32> {
-    if a.settled && b.settled {
-        return None; // two resting dice: never nudge them
-    }
-
-    // Equal extents, so the centre offset equals the top-left offset.
-    let dx = a.x - b.x;
-    let dy = a.y - b.y;
-    let (px, py) = penetration(a.x, a.y, b.x, b.y);
-    if px <= 0.0 || py <= 0.0 {
-        return None; // not touching
-    }
-
-    // A settled die yields nothing; otherwise split the correction evenly.
-    let (a_share, b_share) = if a.settled {
-        (0.0, 1.0)
-    } else if b.settled {
-        (1.0, 0.0)
-    } else {
-        (0.5, 0.5)
-    };
-
-    if px < py {
-        // Horizontal contact: n is the unit normal from b toward a.
-        let n = if dx >= 0.0 { 1.0 } else { -1.0 };
-        a.x += n * px * a_share;
-        b.x -= n * px * b_share;
-        let closing = -(a.vx - b.vx) * n;
-        resolve_velocity(&mut a.vx, &mut b.vx, n, a.settled, b.settled);
-        (closing > 0.0).then_some(closing)
-    } else {
-        // Vertical contact: bounce and kill tiny hops so stacks can come to rest.
-        let n = if dy >= 0.0 { 1.0 } else { -1.0 };
-        a.y += n * py * a_share;
-        b.y -= n * py * b_share;
-
-        // How hard they meet, captured before the bounce damps it.
-        let closing = -(a.vy - b.vy) * n;
-        resolve_velocity(&mut a.vy, &mut b.vy, n, a.settled, b.settled);
-
-        // Topple: real dice don't balance on each other. The upper die (smaller
-        // y) converts part of the impact into sideways motion, proportional to
-        // how far its centre overhangs the die below, so it rolls off the edge.
-        // (overhang/DIE_W is the signed overhang fraction.) The kick is capped so
-        // a hard, far-overhanging slam can't fling a die across the arena.
-        let (upper, lower) = if dy < 0.0 {
-            (&mut *a, &*b)
-        } else {
-            (&mut *b, &*a)
-        };
-        if closing > 0.0 && !upper.settled {
-            let kick = (upper.x - lower.x) / DIE_W * closing * TOPPLE_FACTOR;
-            upper.vx += kick.clamp(-TOPPLE_MAX, TOPPLE_MAX);
-        }
-
-        // Quiet a die that's effectively at rest on another: kill tiny vertical
-        // hops and tiny sideways drift. A real topple kick is far larger than
-        // MIN_SLIDE_VX so it still rolls; this only stops the micro-jitter that
-        // would otherwise keep a crowded pile from ever settling.
-        for d in [&mut *a, &mut *b] {
-            if d.settled {
-                continue;
-            }
-            if d.vy.abs() < MIN_BOUNCE_VY {
-                d.vy = 0.0;
-            }
-            if d.vx.abs() < MIN_SLIDE_VX {
-                d.vx = 0.0;
-            }
-        }
-        (closing > 0.0).then_some(closing)
-    }
-}
-
-/// One-dimensional collision response along a contact normal `n` (±1). For two
-/// equal-mass movable dice this reverses their relative velocity (scaled by
-/// restitution); against an immovable settled die the mover simply reflects.
-/// Only fires when the pair is actually approaching, so resting contacts don't
-/// gain energy.
-fn resolve_velocity(va: &mut f32, vb: &mut f32, n: f32, a_static: bool, b_static: bool) {
-    let e = DIE_RESTITUTION;
-    match (a_static, b_static) {
-        (false, false) => {
-            if (*va - *vb) * n < 0.0 {
-                let (a0, b0) = (*va, *vb);
-                *va = 0.5 * ((1.0 - e) * a0 + (1.0 + e) * b0);
-                *vb = 0.5 * ((1.0 + e) * a0 + (1.0 - e) * b0);
-            }
-        }
-        (true, false) => {
-            if *vb * n > 0.0 {
-                *vb *= -e;
-            }
-        }
-        (false, true) => {
-            if *va * n < 0.0 {
-                *va *= -e;
-            }
-        }
-        (true, true) => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1786,6 +1685,13 @@ mod tests {
         None
     }
 
+    /// A die's centre is inside the physics tray (a small margin for its radius).
+    fn in_box(p: Vec3) -> bool {
+        p.x.abs() <= physics::HX + 0.25
+            && p.y.abs() <= physics::HY + 0.25
+            && p.z.abs() <= physics::HZ + 0.25
+    }
+
     /// A deterministic App for testing roll semantics: same input, same RNG,
     /// same dice every time. The arena is sized so dice can settle.
     fn seeded(input: &str, seed: u64) -> App {
@@ -1800,9 +1706,7 @@ mod tests {
             arena_w: 60.0,
             arena_h: 20.0,
             spawned: false,
-            needs_spawn: false,
             shake: None,
-            pending_throw: None,
             last_throw: None,
             particles: Vec::new(),
             sounds: Vec::new(),
@@ -1814,6 +1718,12 @@ mod tests {
             mode: RollMode::Shake,
             recorded: false,
             rng: StdRng::seed_from_u64(seed),
+            physics: Physics::new(),
+            phys_accum: 0.0,
+            clock: 0.0,
+            flash: 0.0,
+            impact_energy: 0.0,
+            focus: 0.0,
         };
         app.roll();
         app
@@ -1902,39 +1812,18 @@ mod tests {
             app.input = "4d6".into();
             app.start_shake();
             tick(&mut app, 0.4); // release on the rise
-            let cup = app.cup_x();
             app.throw();
             assert!(!app.shaking());
             assert_eq!(app.dice.len(), 4);
 
-            // The dice spawn out of the cup's mouth near the arena floor. The
-            // same update also runs a separation pass, which can shove
-            // co-spawned dice apart, so the bounds are generous.
-            app.update(1.0 / 60.0); // first update performs the spawn
-            let (maxx, maxy) = app.max_xy();
-            let avg_vy: f32 = app.dice.iter().map(|d| d.vy).sum::<f32>() / app.dice.len() as f32;
-            assert!(
-                avg_vy < 0.0,
-                "seed {seed}: the pool must launch upward on balance"
-            );
-            for d in &app.dice {
-                assert!(
-                    (d.x - (cup - DIE_W / 2.0)).abs() <= 3.0 * DIE_W,
-                    "seed {seed}: die spawned at x={} far from the cup at {cup}",
-                    d.x
-                );
-                assert!(
-                    d.y >= maxy - 3.0 - 2.0 * DIE_H,
-                    "seed {seed}: die spawned at y={} nowhere near the floor",
-                    d.y
-                );
-            }
-
-            // ...and the roll still converges inside the arena like any other.
+            // The thrown pool converges inside the tray like any other roll.
             settle(&mut app, 20000).expect("thrown dice never settled");
             for d in &app.dice {
-                assert!(d.x >= -0.01 && d.x <= maxx + 0.01);
-                assert!(d.y >= -0.01 && d.y <= maxy + 0.01);
+                assert!(
+                    in_box(d.pos),
+                    "seed {seed}: die escaped the tray at {:?}",
+                    d.pos
+                );
             }
             assert_eq!(
                 app.history.len(),
@@ -1978,26 +1867,55 @@ mod tests {
 
     #[test]
     fn a_full_power_throw_leaves_the_cup_faster_than_a_lob() {
+        // The other half of the power contract: the caught power must actually
+        // shape the launch, or the whole release-timing game is a no-op. Read
+        // each die's body speed straight after the throw, before any step.
         let launch_speed = |shake_secs: f32, seed: u64| -> f32 {
             let mut app = seeded("", seed);
             app.input = "3d6".into();
             app.start_shake();
             tick(&mut app, shake_secs);
             app.throw();
-            app.update(1.0 / 60.0); // spawn
             app.dice
                 .iter()
-                .map(|d| (d.vx * d.vx + d.vy * d.vy).sqrt())
+                .map(|d| app.physics.speed(d.body))
                 .fold(0.0, f32::max)
         };
         for seed in 0..10 {
-            let rocket = launch_speed(0.8, seed);
-            let lob = launch_speed(1.55, seed);
+            let rocket = launch_speed(0.8, seed); // near the power peak
+            let lob = launch_speed(1.55, seed); // near the trough
             assert!(
                 rocket > lob * 1.5,
                 "seed {seed}: rocket {rocket:.1} not clearly faster than lob {lob:.1}"
             );
         }
+    }
+
+    #[test]
+    fn same_power_throws_spray_both_directions() {
+        // Force and direction are separate dials: power rides the shake clock,
+        // so the cup's sway phase is pinned at any given release time — but the
+        // aim must still vary die to die and seed to seed. If direction ever
+        // collapses back to sign-of-cup-side, every full-power throw breaks the
+        // same way and this catches it.
+        let (mut left, mut right) = (0, 0);
+        for seed in 0..30 {
+            let mut app = seeded("", seed);
+            app.input = "3d6".into();
+            app.start_shake();
+            tick(&mut app, 0.8); // near the power peak — the same phase every time
+            app.throw();
+            for d in &app.dice {
+                match app.physics.velocity_x(d.body) {
+                    vx if vx < 0.0 => left += 1,
+                    _ => right += 1,
+                }
+            }
+        }
+        assert!(
+            left > 0 && right > 0,
+            "full-power throws all broke one way ({left} left / {right} right)"
+        );
     }
 
     #[test]
@@ -2049,6 +1967,14 @@ mod tests {
                 assert!(
                     app.particles.iter().any(|p| p.bright),
                     "seed {seed}: no gold burst for a natural 20"
+                );
+                // The burst is placed by projecting the die through the real
+                // arena camera (same map the renderer draws it with), so it
+                // erupts from the die — never NaN, never an orthographic guess.
+                let (cx, cy) = app.world_to_cell(app.dice[0].pos);
+                assert!(
+                    cx.is_finite() && cy.is_finite(),
+                    "burst position not finite"
                 );
                 assert!(app.sounds.contains(&SoundEvent::Crit), "no crit ring");
                 found.0 = true;
@@ -2421,12 +2347,10 @@ mod tests {
         // to the per-term cap. It must still terminate and stay in the arena.
         for seed in 0..20 {
             let mut app = seeded("4d3!>1", seed);
-            let (maxx, maxy) = app.max_xy();
             settle(&mut app, 40000).expect("capped explosion chain never settled");
             assert!(app.dice.len() <= 4 + MAX_EXPLOSIONS, "blew past the cap");
             for d in &app.dice {
-                assert!(d.x >= -0.01 && d.x <= maxx + 0.01);
-                assert!(d.y >= -0.01 && d.y <= maxy + 0.01);
+                assert!(in_box(d.pos), "die escaped the tray at {:?}", d.pos);
             }
         }
     }
@@ -2468,31 +2392,13 @@ mod tests {
     }
 
     #[test]
-    fn live_total_excludes_dropped_dice_mid_roll() {
-        // Before settling, the running total already ignores the dropped die.
-        let app = seeded("2d20kh1", 7);
-        let kept = app.dice.iter().find(|d| d.kept).unwrap();
-        // live_total uses `shown`, but dropped dice never contribute regardless.
-        let by_hand: i32 = app
-            .dice
-            .iter()
-            .filter(|d| d.kept)
-            .map(|d| d.shown as i32)
-            .sum();
-        assert_eq!(app.live_total(), by_hand);
-        let _ = kept; // (named for clarity)
-    }
-
-    #[test]
     fn exploding_pool_still_converges_and_stays_in_arena() {
         let mut app = seeded("6d6!", 3);
-        let (maxx, maxy) = app.max_xy();
         let mut settled = false;
-        for _ in 0..12000 {
+        for _ in 0..20000 {
             app.update(1.0 / 60.0);
             for d in &app.dice {
-                assert!(d.x >= -0.001 && d.x <= maxx + 0.001);
-                assert!(d.y >= -0.001 && d.y <= maxy + 0.001);
+                assert!(in_box(d.pos), "die escaped the tray at {:?}", d.pos);
             }
             if app.all_settled() {
                 settled = true;
@@ -2512,13 +2418,12 @@ mod tests {
         // A few seconds of sim time at most.
         assert!(frame < 6000);
 
-        // Once settled, every die shows its rolled value...
+        // Once settled, every die's shown face is the burned-in rolled value...
         for d in &app.dice {
             assert_eq!(d.shown, d.final_value);
             assert!((1..=d.sides).contains(&d.final_value));
         }
-        // ...and live/final totals agree.
-        assert_eq!(app.total(), app.live_total());
+        // ...and the total is in range.
         let t = app.total();
         assert!((4 + 2..=24 + 2).contains(&t), "total {t} out of range");
     }
@@ -2526,14 +2431,10 @@ mod tests {
     #[test]
     fn dice_stay_inside_the_arena() {
         let mut app = App::new("6d8".to_string());
-        app.arena_w = 40.0;
-        app.arena_h = 15.0;
-        let (maxx, maxy) = app.max_xy();
-        for _ in 0..6000 {
+        for _ in 0..20000 {
             app.update(1.0 / 60.0);
             for d in &app.dice {
-                assert!(d.x >= -0.001 && d.x <= maxx + 0.001, "x={} escaped", d.x);
-                assert!(d.y >= -0.001 && d.y <= maxy + 0.001, "y={} escaped", d.y);
+                assert!(in_box(d.pos), "die escaped the tray at {:?}", d.pos);
             }
             if app.all_settled() {
                 break;
@@ -2546,54 +2447,40 @@ mod tests {
     #[ignore]
     fn debug_converge() {
         let mut app = App::new("6d8".to_string());
-        app.arena_w = 40.0;
-        app.arena_h = 15.0;
-        for f in 0..6000 {
+        for f in 0..20000 {
             app.update(1.0 / 60.0);
             if f % 500 == 0 || app.all_settled() {
                 let settled = app.dice.iter().filter(|d| d.settled).count();
-                let max_sp = app
-                    .dice
-                    .iter()
-                    .map(|d| (d.vx * d.vx + d.vy * d.vy).sqrt())
-                    .fold(0.0f32, f32::max);
-                eprintln!("f={f:5} settled={settled}/6 max_speed={max_sp:6.2}");
+                eprintln!("f={f:5} settled={settled}/{}", app.dice.len());
                 if app.all_settled() {
                     break;
                 }
             }
         }
         for (i, d) in app.dice.iter().enumerate() {
-            eprintln!(
-                "  die {i}: x={:6.2} y={:6.2} settled={}",
-                d.x, d.y, d.settled
-            );
+            eprintln!("  die {i}: pos={:?} settled={}", d.pos, d.settled);
         }
     }
 
     #[test]
     fn settled_dice_do_not_overlap() {
-        // Narrow but tall: forces real stacking (~3 per row) while leaving enough
-        // height that no die ever gets crushed, so zero overlap is achievable.
+        // A crowded pool must pile up without two dice occupying the same spot —
+        // Rapier's contacts enforce it, and the centres stay meaningfully apart.
         let mut app = App::new("8d6".to_string());
-        app.arena_w = 22.0;
-        app.arena_h = 40.0;
+        settle(&mut app, 20000).expect("crowded pool never settled");
 
-        settle(&mut app, 12000).expect("crowded pool never settled");
-
+        // Non-overlap bound: each die contains a ball of its inradius, so two
+        // non-overlapping dice keep their centres at least two d6-inradii apart
+        // (2·DIE_R/√3 ≈ 0.416; the tightest rest is two cubes face-to-face). A
+        // hair under that allows Rapier's contact slop without hiding a real
+        // interpenetration, which would land well below it.
+        let min_gap = 2.0 * physics::DIE_R / 3.0_f32.sqrt() * 0.96;
         for i in 0..app.dice.len() {
             for j in (i + 1)..app.dice.len() {
-                let (a, b) = (&app.dice[i], &app.dice[j]);
-                // Allow a hair of penetration from the position-correction slop.
-                let (px, py) = penetration(a.x, a.y, b.x, b.y);
-                let pen = px.min(py);
+                let gap = (app.dice[i].pos - app.dice[j].pos).length();
                 assert!(
-                    pen < 0.5,
-                    "dice {i} and {j} overlap by {pen:.2} at ({},{}) / ({},{})",
-                    a.x,
-                    a.y,
-                    b.x,
-                    b.y
+                    gap > min_gap,
+                    "dice {i} and {j} overlap: centres {gap:.2} apart (< {min_gap:.2})"
                 );
             }
         }
@@ -2601,27 +2488,20 @@ mod tests {
 
     #[test]
     fn settled_dice_stay_in_bounds_when_cramped() {
-        // Arenas a bit too small to hold every die cleanly (~1.5× capacity):
-        // stacks reach the ceiling and the stuck/over-tall paths kick in, but the
-        // pool still converges. No settled die may end up outside the arena
-        // (a regression guard for the once-unclamped rest position).
-        for (spec, w, h) in [
-            ("12d6", 20.0, 14.0),
-            ("12d6", 18.0, 14.0),
-            ("16d6", 22.0, 16.0),
-        ] {
-            for _ in 0..40 {
+        // A big pool crowds the tray and stacks up, but must still converge with
+        // no die ending up outside the box. 60d6 is the parser's cap — the worst
+        // case the spawn lattice must place without interpenetration (co-spawned
+        // overlapping dice get hurled apart by Rapier's penetration recovery,
+        // hard enough to eject one through a wall).
+        for spec in ["12d6", "16d6", "20d6", "60d6"] {
+            for _ in 0..15 {
                 let mut app = App::new(spec.to_string());
-                app.arena_w = w;
-                app.arena_h = h;
-                let (maxx, maxy) = app.max_xy();
-                settle(&mut app, 15000).expect("cramped pool never settled");
+                settle(&mut app, 20000).expect("cramped pool never settled");
                 for (i, d) in app.dice.iter().enumerate() {
                     assert!(
-                        d.x >= -0.01 && d.x <= maxx + 0.01 && d.y >= -0.01 && d.y <= maxy + 0.01,
-                        "{spec} die {i} settled out of bounds at ({}, {})",
-                        d.x,
-                        d.y
+                        in_box(d.pos),
+                        "{spec} die {i} settled out of bounds at {:?}",
+                        d.pos
                     );
                 }
             }
@@ -2629,11 +2509,12 @@ mod tests {
     }
 
     #[test]
-    fn tiny_arena_still_settles() {
+    fn a_plain_roll_comes_to_rest() {
         let mut app = App::new("3d6".to_string());
-        app.arena_w = 3.0; // smaller than a die box
-        app.arena_h = 2.0;
-        assert!(settle(&mut app, 100).is_some());
+        assert!(
+            settle(&mut app, 20000).is_some(),
+            "a plain roll must come to rest"
+        );
     }
 
     #[test]

@@ -30,24 +30,26 @@ README in the same PR.
 
 ## Design
 
-Five small modules behind a 60 fps event loop:
+A handful of modules behind a 60 fps event loop — `parse`, `app`, `physics`,
+`ui`, `cli`, `foley`, plus the vendored `render3d` rasterizer and its
+`render3d_view` bridge:
 
 - **`parse`** — a hand-written parser that turns notation into a `Roll`: a list
   of **dice terms** (each a count, a side count, and its modifiers — keep/drop,
   explode, multiply) plus an integer flat modifier and the optional `Stake` (a
   target with a `Goal`: meet-or-beat `> N` / `vs N`, or roll-under `< N`). Pure
   and unit-tested.
-- **`app`** — the state plus a tiny physics simulation. Each die is an
-  axis-aligned box with position/velocity; the engine applies gravity, bounces
-  off the four walls with restitution, rubs off speed with floor friction and air
-  drag, and tumbles its visible face every 50 ms while airborne. Dice also
-  collide with **each other** — a per-frame AABB separation pass pushes
-  overlapping pairs apart, and a die that lands off-centre on another *rolls
-  off the edge*, so dice spread out instead of balancing in neat columns.
-  A die comes to rest when it's slow and *supported*, snapping flush onto its
-  support and locking to its pre-rolled value; the simulation always
-  converges. Each die's value is decided up front by the RNG — the animation
-  just shows it off — so the displayed total always matches the real total.
+- **`app`** — the state, the roll evaluator, and the glue that drives the dice
+  through the rigid-body sim. Each die is a real 3D body in the `physics`
+  world (Rapier): `app` decides its value up front with the seeded RNG, spawns
+  and launches its body, syncs its pose (`pos`/`rot`) back every step, and
+  settles it when the body sleeps — or freezes it in place at the hard
+  airborne cap, so the simulation always converges. The physics advances on a
+  **fixed 1/60 s timestep** (`physics::STEP`, fed by an accumulator), which is
+  what makes insta and animated rolls settle bit-identically. While a die
+  tumbles its number is a spin-derived decoy (no RNG draw); the real value
+  burns in the instant it settles — the animation just shows off a total that
+  was already decided, so the displayed total always matches the real one.
   **Exploding** is the one thing that happens *during* the animation.
   The Throw lives here too (the shake clock, the cup, the launch), along with
   the Tab-cycled roll modes — insta fast-forwards this same simulation
@@ -57,11 +59,32 @@ Five small modules behind a 60 fps event loop:
   the same semantics** as the animation, and single-source helpers (`check`,
   `verdict_text`, `crit_face`/`fumble_face`) keep the verdict and crit rules
   identical across the TUI, the CLI, and the stats sampler.
-- **`ui`** — ratatui rendering: the arena (each die painted cell-by-cell at
-  its float position as the 2D silhouette of its polyhedron), the swaying cup
-  and its power meter, the release echo, crit and fumble particles, a result
-  panel with per-die colour-coded chips and the staked verdict, an editable
-  input line, and a help bar.
+- **`physics`** — the 3D rigid-body world on **Rapier**: a fixed box tray
+  (floor, walls, ceiling) and one dynamic body per die with a convex-hull
+  collider from its polyhedron. A small API (`spawn`/`launch`/`step`/`pose`/
+  `sleeping`/`freeze`/`clear`) keeps Rapier out of every other module. It
+  decides only where dice land — never their values.
+- **`ui`** — ratatui rendering: the 3D arena — a rendered dice tray (a textured
+  felt floor inside a solid mahogany lip — a back wall and two side walls with a
+  top rail, under a warm overhead point light with a cool rim behind) sitting on a
+  small wood table over a dark-red casino rug in a dark
+  casino room, heavy oxblood stage curtains — free-hanging drapes with
+  scallop-edged real corrugated folds, velvet-textured — flanking the
+  background, the whole
+  scene fading into
+  **depth fog** so the far floor recedes,
+  with tumbling polyhedra straight
+  from the physics and a number riding each die's frontmost face (`dice::face_geometry`
+  finds it from the die's orientation) — a dim decoy that ducks out as the die
+  rolls edge-on, burning to the real value on settle, and scaling uniformly across
+  the roll from a single cell to a dark-outlined half-block glyph — centred on and
+  contained within the die — as a wide terminal renders the dice large — an open tin cup that sways
+  while shaking with its power meter above, the release echo, crit and fumble
+  particles, a result panel with per-die colour-coded chips and the staked
+  verdict, an editable input line, and a help bar. The result panel **holds the
+  outcome back until the dice stop** — each chip a dim decoy until its die
+  settles, the total a dim `…` until every die has landed — so the animation
+  never spoils the number it's building toward.
 - **`cli`** — clap argument parsing and the one-shot output paths (bare
   total, verbose breakdown, JSON), plus the staked exit-code contract.
 - **`foley`** — procedural sound synthesis: `SoundEvent`s in, sample buffers
@@ -71,9 +94,10 @@ Five small modules behind a 60 fps event loop:
   audio device.
 
 The main loop draws a frame, polls for a key for up to one frame budget,
-advances the simulation by the real elapsed `dt`, then plays whatever the
-physics wanted heard. Decoupling the roll result from the animation keeps the
-physics free to be as chaotic as it likes.
+advances the simulation by the real elapsed `dt` (which `app` consumes in
+fixed 1/60 s physics steps), then plays whatever the physics wanted heard.
+Decoupling the roll result from the animation keeps the physics free to be as
+chaotic as it likes.
 
 ## House rules (the invariants)
 
