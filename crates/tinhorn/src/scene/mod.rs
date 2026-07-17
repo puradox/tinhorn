@@ -37,6 +37,7 @@ use tinhorn_core::app::{App as DiceApp, Die, SoundEvent};
 use tinhorn_core::{dice_geom, physics, view_math};
 
 use crate::foley::Foley;
+use crate::graphics::{self, GraphicsArg, GraphicsMode};
 use crate::{Action, handle_key, ui};
 
 mod arena;
@@ -50,12 +51,14 @@ const SNAP_COLS: u16 = 100;
 const SNAP_ROWS: u16 = 38;
 
 /// Entry point (interactive or headless snapshot). Only called off the
-/// interactive CLI path, never one-shot.
-pub fn run(expr: String, seed: Option<u64>, muted: bool) {
+/// interactive CLI path, never one-shot. `arg` is the `--graphics` flag; the
+/// snapshot path forces half-blocks (it composes to a `TestBackend`/PNG and has no
+/// TTY to resolve against), the interactive path resolves it against the terminal.
+pub fn run(expr: String, seed: Option<u64>, muted: bool, arg: GraphicsArg) {
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
         run_snapshot(&expr, seed, muted, PathBuf::from(path));
     } else {
-        run_interactive(&expr, seed, muted);
+        run_interactive(&expr, seed, muted, graphics::resolve(arg));
     }
 }
 
@@ -64,7 +67,7 @@ pub fn run(expr: String, seed: Option<u64>, muted: bool) {
 /// transitively, so DefaultPlugins carries a WindowPlugin and no loop driver —
 /// render headless (no primary window, don't exit when there are none) and drive
 /// the loop ourselves at ~60 fps.
-fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
+fn base_app(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) -> App {
     let mut sim = match seed {
         Some(s) => DiceApp::with_seed(expr.to_string(), s),
         None => DiceApp::new(expr.to_string()),
@@ -88,6 +91,7 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
     ))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
     .insert_resource(Sim(sim))
+    .insert_resource(Graphics(mode))
     .insert_resource(ArenaView { w: 0, h: 0 })
     .init_resource::<ArenaImage>()
     .add_systems(Startup, setup)
@@ -105,13 +109,17 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
     app
 }
 
-/// The interactive path: terminal context, input, per-frame compose, sound.
-fn run_interactive(expr: &str, seed: Option<u64>, muted: bool) {
-    let mut app = base_app(expr, seed, muted);
+/// The interactive path: terminal context, input, per-frame compose, sound. In
+/// kitty mode `draw_ui` also emits the image after the draw, `KittyState` gates the
+/// pane-open placement delete, and `kitty_cleanup` removes the image on quit.
+fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) {
+    let mut app = base_app(expr, seed, muted, mode);
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
+        .insert_resource(KittyState::default())
         .add_systems(PreUpdate, input_system)
         .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
+        .add_systems(PostUpdate, kitty_cleanup)
         .run();
 }
 
@@ -125,7 +133,8 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
-    let mut app = base_app(expr, seed, muted);
+    // The snapshot path always composes to a TestBackend/PNG: force half-blocks.
+    let mut app = base_app(expr, seed, muted, GraphicsMode::Blocks);
     app.insert_resource(Snapshot {
         path,
         frames: 0,
@@ -144,6 +153,18 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
 /// The core sim — the single source of truth. Only the input system writes it.
 #[derive(Resource)]
 struct Sim(DiceApp);
+
+/// The resolved arena renderer for this session, fixed at startup.
+#[derive(Resource, Clone, Copy)]
+struct Graphics(GraphicsMode);
+
+/// Whether the kitty image is currently placed on screen. Gates the delete /
+/// re-place when a pane opens over the arena — the pane renders with `Clear` +
+/// default-bg text, so a placed image would show through it at any z.
+#[derive(Resource, Default)]
+struct KittyState {
+    placed: bool,
+}
 
 /// Tags a Bevy entity as the view of `sim.0.dice[index]`.
 #[derive(Component)]
@@ -467,17 +488,81 @@ fn draw_ui(
     mut sim: ResMut<Sim>,
     arena: Res<ArenaImage>,
     mut view: ResMut<ArenaView>,
+    gfx: Res<Graphics>,
+    mut kitty: ResMut<KittyState>,
 ) -> Result {
+    let mode = gfx.0;
     let mut reported = (view.w, view.h);
+    let mut panel = None;
     context.draw(|frame| {
-        let (w, h) = ui::render_bevy(frame, &mut sim.0, &arena.pixels, arena.w, arena.h);
-        if w > 0 {
-            reported = (w as u32, h as u32);
+        let report = ui::render_bevy_mode(frame, &mut sim.0, &arena.pixels, arena.w, arena.h, mode);
+        if report.view.0 > 0 {
+            reported = (report.view.0 as u32, report.view.1 as u32);
         }
+        panel = report.kitty;
     })?;
     view.w = reported.0;
     view.h = reported.1;
+
+    // Kitty emission runs strictly AFTER the draw (ratatui owns stdout during it):
+    // write the image APC over the arena origin, or delete it while a pane covers it.
+    if let (GraphicsMode::Kitty { .. }, Some(panel)) = (mode, panel) {
+        let pane_open = sim.0.pane != tinhorn_core::app::Pane::None;
+        emit_kitty(&panel, &arena, pane_open, &mut kitty);
+    }
     Ok(())
+}
+
+/// Place — or, while a pane covers the arena, remove — the kitty image for this
+/// frame. A pane renders with `Clear` + default-bg text, so a placed image would
+/// show through it at any z; delete the placement once and re-place on close. An
+/// empty/stale readback (startup, or just after `resize_arena` clears `pixels`) is
+/// skipped, leaving the previous placement up, since the readback lags the size
+/// request by a frame or two.
+fn emit_kitty(panel: &ui::KittyPanel, arena: &ArenaImage, pane_open: bool, state: &mut KittyState) {
+    if pane_open {
+        if state.placed {
+            let _ = graphics::emit_raw(&graphics::delete_placement_apc());
+            state.placed = false;
+        }
+        return;
+    }
+    let Some(mut rgb) = graphics::pack_rgb(&arena.pixels, arena.w, arena.h) else {
+        return;
+    };
+    ui::burn_numbers(
+        &mut rgb,
+        arena.w,
+        arena.h,
+        panel.inner.width,
+        panel.inner.height,
+        &panel.burns,
+    );
+    let apc = graphics::encode_frame(
+        &rgb,
+        arena.w,
+        arena.h,
+        panel.inner.width,
+        panel.inner.height,
+    );
+    if graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok() {
+        state.placed = true;
+    }
+}
+
+/// On quit, delete our kitty image so nothing is left behind in the scrollback.
+/// Runs in PostUpdate — after `input_system` writes `AppExit` in PreUpdate, but
+/// before `CleanupPlugin` drops `RatatuiContext` in `Last` and leaves the alt
+/// screen — so the escape lands while the session is still live. A no-op outside
+/// kitty mode, and targeted to `i=1` so it can't disturb anything else on screen.
+fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>) {
+    if exits.is_empty() {
+        return;
+    }
+    exits.clear();
+    if let GraphicsMode::Kitty { .. } = gfx.0 {
+        let _ = graphics::emit_raw(&graphics::delete_all_apc());
+    }
 }
 
 /// Drain the sim's queued sounds into the lazily-spawned player (capping the
