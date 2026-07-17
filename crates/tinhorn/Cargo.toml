@@ -47,6 +47,12 @@ bevy_ratatui = { path = "../bevy_ratatui", version = "0.11.1", optional = true, 
   "keyboard",
   "mouse",
 ] }
+# PNG encoder for the headless snapshot path (`TINHORN_BEVY_SNAPSHOT`), so the
+# render can be validated in CI / a non-interactive shell without a terminal.
+# Unifies with Bevy's own `image` 0.25.
+image = { version = "0.25", optional = true, default-features = false, features = [
+  "png",
+] }
 # NOTE: bevy_ratatui_camera is intentionally NOT a dependency yet. The Stage-2
 # spike reads the render target back with Bevy 0.19's built-in
 # `bevy_render::gpu_readback` (Readback + ReadbackComplete) and a hand-rolled
@@ -55,4 +61,4 @@ bevy_ratatui = { path = "../bevy_ratatui", version = "0.11.1", optional = true, 
 
 [features]
 # Compile the Bevy dice arena and its `--bevy` entry point. Heavy; opt-in.
-bevy = ["dep:bevy", "dep:bevy_ratatui"]
+bevy = ["dep:bevy", "dep:bevy_ratatui", "dep:image"]

@@ -57,6 +57,17 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let expr = cli.expression();
 
+    // Headless Bevy snapshot: an explicit request to render the arena to a PNG
+    // (`TINHORN_BEVY_SNAPSHOT=<path>`), used to validate the renderer in CI or a
+    // non-interactive shell. Checked *before* the one-shot short-circuit precisely
+    // because it has no TTY — but it is opt-in and feature-gated, so ordinary
+    // scripting (no env var, default build) still never touches a GPU.
+    #[cfg(feature = "bevy")]
+    if std::env::var_os("TINHORN_BEVY_SNAPSHOT").is_some() {
+        scene::run(expr, cli.seed);
+        return Ok(());
+    }
+
     // One-shot mode: print a result and exit instead of animating. Triggered by
     // an explicit output flag, or automatically when stdout isn't a terminal
     // (so `roll 3d6 | cat` and `roll 3d6 > f` just work).

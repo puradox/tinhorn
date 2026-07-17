@@ -11,6 +11,7 @@
 //! real arena's dice, not stand-ins. Everything here is compiled only under the
 //! `bevy` feature; nothing on the one-shot CLI path can reach it.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
@@ -50,26 +51,53 @@ pub fn run(expr: String, seed: Option<u64>) {
     // isn't consumed yet; kept in the signature for when the sim drives the scene.
     let _ = seed;
 
-    App::new()
-        .add_plugins((
-            // `bevy_window` is pulled in transitively by the render features, so
-            // DefaultPlugins carries a WindowPlugin (and, without winit, no loop
-            // driver). Render headless — no primary window, and don't exit just
-            // because there are none — and drive the update loop ourselves at
-            // ~60 fps via a separately-added ScheduleRunnerPlugin.
-            DefaultPlugins.set(WindowPlugin {
-                primary_window: None,
-                exit_condition: ExitCondition::DontExit,
-                ..default()
-            }),
-            ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
-            RatatuiPlugins::default(),
-        ))
-        .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
-        .insert_resource(DiceList(dice_from_expr(&expr)))
-        .init_resource::<ArenaImage>()
-        .add_systems(Startup, setup)
+    // Headless self-validation: `TINHORN_BEVY_SNAPSHOT=<path>` renders the same
+    // scene to a PNG instead of the terminal, then exits. No RatatuiContext, so
+    // no TTY is required — this is how the render is checked in CI or from a
+    // non-interactive shell (open the PNG to eyeball the dice, felt, and shadows).
+    if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
+        run_snapshot(&expr, PathBuf::from(path));
+    } else {
+        run_interactive(&expr);
+    }
+}
+
+/// The scene, minus the presentation layer: the headless render plugins plus the
+/// `setup` system, shared by the interactive and snapshot paths. `bevy_window`
+/// is pulled in transitively by the render features, so DefaultPlugins carries a
+/// WindowPlugin (and, without winit, no loop driver). Render headless — no
+/// primary window, and don't exit just because there are none — and drive the
+/// update loop ourselves at ~60 fps.
+fn base_app(expr: &str) -> App {
+    let mut app = App::new();
+    app.add_plugins((
+        DefaultPlugins.set(WindowPlugin {
+            primary_window: None,
+            exit_condition: ExitCondition::DontExit,
+            ..default()
+        }),
+        ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
+    ))
+    .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
+    .insert_resource(DiceList(dice_from_expr(expr)))
+    .init_resource::<ArenaImage>()
+    .add_systems(Startup, setup);
+    app
+}
+
+/// The real path: terminal context + input + per-frame blit.
+fn run_interactive(expr: &str) {
+    let mut app = base_app(expr);
+    app.add_plugins(RatatuiPlugins::default())
         .add_systems(Update, (handle_input, draw_arena))
+        .run();
+}
+
+/// The validation path: render a few frames, dump the arena image to `path`, exit.
+fn run_snapshot(expr: &str, path: PathBuf) {
+    let mut app = base_app(expr);
+    app.insert_resource(Snapshot { path, frames: 0 })
+        .add_systems(Update, save_snapshot)
         .run();
 }
 
@@ -279,4 +307,50 @@ fn blit_half_blocks(pixels: &[u8], iw: u32, ih: u32, buf: &mut Buffer, area: Rec
 fn aligned_row_bytes(width: u32) -> usize {
     let bytes = width as usize * 4;
     bytes.div_ceil(ROW_ALIGN) * ROW_ALIGN
+}
+
+/// Where to write the headless snapshot, and how many frames have elapsed.
+#[derive(Resource)]
+struct Snapshot {
+    path: PathBuf,
+    frames: u32,
+}
+
+/// Wait for the render and the async GPU readback to settle, write the arena
+/// image to a PNG, and exit. The validation counterpart of [`draw_arena`].
+fn save_snapshot(
+    mut snapshot: ResMut<Snapshot>,
+    arena: Res<ArenaImage>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    snapshot.frames += 1;
+
+    // The first readback is a few frames out (render → copy → map_async → the
+    // next extract triggers ReadbackComplete); wait for pixels AND a short warmup.
+    let ready = !arena.pixels.is_empty();
+    if snapshot.frames < 16 || !ready {
+        if snapshot.frames > 300 {
+            eprintln!("tinhorn: no frame read back after 300 frames; giving up");
+            exit.write_default();
+        }
+        return;
+    }
+
+    match save_png(&arena.pixels, RENDER_W, RENDER_H, &snapshot.path) {
+        Ok(()) => eprintln!("tinhorn: wrote snapshot {}", snapshot.path.display()),
+        Err(err) => eprintln!("tinhorn: failed to write snapshot: {err}"),
+    }
+    exit.write_default();
+}
+
+/// Strip the readback's per-row padding into tight RGBA8 and encode a PNG.
+fn save_png(padded: &[u8], w: u32, h: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let stride = aligned_row_bytes(w);
+    let row = w as usize * 4;
+    let mut rgba = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        rgba.extend_from_slice(&padded[y * stride..y * stride + row]);
+    }
+    image::save_buffer(path, &rgba, w, h, image::ExtendedColorType::Rgba8)?;
+    Ok(())
 }
