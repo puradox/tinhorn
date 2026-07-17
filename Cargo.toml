@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/tinhorn-core", "crates/tinhorn"]
 
 # Shared dependency pins, referenced by each crate with `{ workspace = true }`.
@@ -21,3 +21,15 @@ rodio = { version = "0.22.2", default-features = false, features = ["playback"] 
 [profile.release]
 opt-level = 3
 lto = true
+
+# Bevy is miserable to debug-build unoptimized; give dependencies (incl. Bevy)
+# real optimization even in dev, but keep our own code quick to compile. Only
+# affects builds that pull Bevy in (the `bevy` feature); the default build is
+# unchanged.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Workaround for an objc2-foundation crash on macOS 26 (Tahoe) under Bevy.
+# See: https://github.com/bevyengine/bevy/issues/19625
+[profile.dev.package.objc2]
+debug-assertions = false

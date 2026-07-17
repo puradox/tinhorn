@@ -690,11 +690,7 @@ impl App {
     /// remembering its own gate.
     pub fn take_sounds(&mut self) -> Vec<SoundEvent> {
         let events = std::mem::take(&mut self.sounds);
-        if self.muted {
-            Vec::new()
-        } else {
-            events
-        }
+        if self.muted { Vec::new() } else { events }
     }
 
     /// The release echo: the most recent throw while it's still fresh enough
@@ -1004,11 +1000,12 @@ impl App {
                 };
                 if !exploded {
                     self.dice[i].exploded = true;
-                    if let Some(cmp) = explode {
-                        if cmp.matches(final_value) && self.explosions[term] < MAX_EXPLOSIONS {
-                            self.explosions[term] += 1;
-                            to_explode.push((sides, term, mult, cmp));
-                        }
+                    if let Some(cmp) = explode
+                        && cmp.matches(final_value)
+                        && self.explosions[term] < MAX_EXPLOSIONS
+                    {
+                        self.explosions[term] += 1;
+                        to_explode.push((sides, term, mult, cmp));
                     }
                 }
             }
@@ -1210,10 +1207,11 @@ impl App {
     /// seeded from exactly the values in the key.
     pub fn stats(&mut self) -> Result<Stats, String> {
         let expr = self.input.trim().to_string();
-        if let Some((k_expr, k_rolls, stats)) = &self.stats_cache {
-            if *k_expr == expr && *k_rolls == self.history.len() {
-                return Ok(stats.clone());
-            }
+        if let Some((k_expr, k_rolls, stats)) = &self.stats_cache
+            && *k_expr == expr
+            && *k_rolls == self.history.len()
+        {
+            return Ok(stats.clone());
         }
 
         let roll = parse::parse(&expr)?;
@@ -2532,7 +2530,7 @@ mod tests {
         let e = &app.history[0];
         assert_eq!(e.expr, "3d6+1");
         assert_eq!(e.values.len(), 3); // three kept dice
-                                       // total = sum of faces + 1, and matches what the entry stored.
+        // total = sum of faces + 1, and matches what the entry stored.
         let face_sum: i32 = e.values.iter().map(|&v| v as i32).sum();
         assert_eq!(e.total, face_sum + 1);
         assert_eq!(e.total, app.total());

@@ -1,7 +1,7 @@
 [package]
 name = "tinhorn"
 version = "0.1.4"
-edition = "2021"
+edition = "2024"
 description = "A dice cup for your terminal: shake the cup, watch dice fly, hear them land."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/puradox/tinhorn"
@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "games"]
 
 [dependencies]
 tinhorn-core = { workspace = true }
-ratatui = { workspace = true }
+ratatui = { workspace = true, features = ["unstable-widget-ref"] }
 crossterm = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }
@@ -19,3 +19,32 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rodio = { workspace = true }
 glam = { workspace = true }
+
+# --- Bevy renderer (the default interactive arena) ---
+# Always linked; the one-shot CLI just never constructs a Bevy `App` (see main.rs).
+# The engine is exact-pinned and trimmed to headless PBR.
+bevy = { version = "=0.19.0", default-features = false, features = [
+  "multi_threaded",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_pbr",
+  "bevy_asset",
+  "tonemapping_luts",
+  "zstd_rust",
+  "std",
+  "async_executor",
+] }
+# Terminal integration is now vendored in-tree as `src/term/` (a trimmed
+# snapshot of the `bevy_ratatui` fork — see `src/term/mod.rs`), not a path
+# dependency, so `cargo publish` works. These are the two external crates that
+# vendored crossterm path still pulls in (beyond bevy/ratatui/crossterm above).
+bitflags = "2.8"
+color-eyre = "0.6"
+# PNG encoder for the headless snapshot path (`TINHORN_BEVY_SNAPSHOT`), so the
+# render can be validated in CI / a non-interactive shell. Unifies with Bevy's
+# own `image` 0.25.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# NOTE: bevy_ratatui_camera is intentionally NOT a dependency. The arena reads the
+# render target back with Bevy 0.19's built-in `bevy_render::gpu_readback`
+# (Readback + ReadbackComplete) and a hand-rolled half-block blit. Vendoring that
+# crate's richer widget strategies is a later follow-up.

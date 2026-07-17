@@ -93,7 +93,7 @@ pub fn arena_camera(shake: Vec3, aspect: f32, focus: f32) -> Camera {
     // more distance, so the cup, the throw's arc, and the tray are never clipped.
     // As the dice settle (`focus`→1) there's no launch arc left to frame, so the
     // vertical framing tightens a touch and the camera leans in over the felt.
-    let want_half_w = crate::physics::HX + crate::physics::DIE_R + 0.25;
+    let want_half_w = crate::physics::HX + crate::physics::DIE_R + 0.02;
     // The vertical framing follows the tray's depth (`physics::HZ`) rather than a
     // magic number, so a deeper tray automatically frames correctly at both ends
     // of the ceremony. Settled (`focus`→1) the camera looks near-straight down
@@ -102,10 +102,11 @@ pub fn arena_camera(shake: Vec3, aspect: f32, focus: f32) -> Camera {
     // Rolling (`focus`→0) the tilt is shallow (~31°, sin ≈ 0.52): depth
     // foreshortens to half, and the launch arc's *height* is what needs the
     // frame — a fixed headroom term, since HY and the throw are depth-agnostic.
-    // (At the old HZ = 1.1 these derive the previous hand-tuned 2.4 → 1.45.)
+    // Margins are kept thin so the felt fills the frame — a dice tray you lean
+    // over, not a small table across the room.
     let hz = crate::physics::HZ;
-    let overhead = 0.93 * hz + 0.42; // felt depth at ~68° + rail margin
-    let establishing = 0.52 * hz + 1.83; // tray front at ~31° + launch-arc headroom
+    let overhead = 0.93 * hz + 0.15; // felt depth at ~68° + a thin rail margin
+    let establishing = 0.52 * hz + 1.45; // tray front at ~31° + launch-arc headroom
     let want_half_h = establishing + (overhead - establishing) * focus;
     let dist_w = want_half_w / (aspect.max(0.25) * tan);
     let dist_h = want_half_h / tan;
