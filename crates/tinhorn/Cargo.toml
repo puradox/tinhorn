@@ -34,17 +34,12 @@ bevy = { version = "=0.19.0", default-features = false, features = [
   "std",
   "async_executor",
 ] }
-# Vendored fork (see its PROVENANCE.md). `version` is required for
-# `cargo package` even though local builds use the `path`; the fork isn't on
-# crates.io, so publishing `tinhorn` is out until it's vendored as an in-tree
-# module — tracked, but there are no crates.io users to serve yet.
-bevy_ratatui = { path = "../bevy_ratatui", version = "0.11.1", default-features = false, features = [
-  "std",
-  "async_executor",
-  "crossterm",
-  "keyboard",
-  "mouse",
-] }
+# Terminal integration is now vendored in-tree as `src/term/` (a trimmed
+# snapshot of the `bevy_ratatui` fork — see `src/term/mod.rs`), not a path
+# dependency, so `cargo publish` works. These are the two external crates that
+# vendored crossterm path still pulls in (beyond bevy/ratatui/crossterm above).
+bitflags = "2.8"
+color-eyre = "0.6"
 # PNG encoder for the headless snapshot path (`TINHORN_BEVY_SNAPSHOT`), so the
 # render can be validated in CI / a non-interactive shell. Unifies with Bevy's
 # own `image` 0.25.

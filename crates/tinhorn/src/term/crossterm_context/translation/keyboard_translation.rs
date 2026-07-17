@@ -2,7 +2,7 @@
 
 use std::{collections::HashSet, hash::Hash, time::Duration};
 
-use crate::crossterm_context::event::{InputSet, KeyMessage};
+use crate::term::crossterm_context::event::{InputSet, KeyMessage};
 use bevy::{
     input::{ButtonState, keyboard::KeyboardInput},
     prelude::*,

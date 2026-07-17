@@ -1,10 +1,9 @@
 use bevy::prelude::*;
 
-use crate::RatatuiContext;
+use crate::term::RatatuiContext;
 
 use super::kitty::KittyEnabled;
 
-#[cfg(feature = "mouse")]
 use super::mouse::MouseEnabled;
 
 /// Plugin responsible for cleaning up resources in the correct order when exiting.
@@ -22,7 +21,6 @@ impl Plugin for CleanupPlugin {
 fn cleanup(mut exit: MessageReader<AppExit>, mut commands: Commands) {
     for _ in exit.read() {
         commands.remove_resource::<KittyEnabled>();
-        #[cfg(feature = "mouse")]
         commands.remove_resource::<MouseEnabled>();
         commands.remove_resource::<RatatuiContext>();
     }

@@ -28,6 +28,10 @@ mod ui;
 // one-shot CLI path simply never constructs a Bevy `App`.
 mod scene;
 
+// Vendored, in-tree terminal integration (a trimmed snapshot of the
+// `bevy_ratatui` fork — see `term/mod.rs`). In-tree so `cargo publish` works.
+mod term;
+
 use std::io::{self, IsTerminal};
 
 use clap::Parser;

@@ -989,17 +989,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b511e89f7078fd21fdea77061a0ca3e737297c7011bb10c073e0aecb17c9fea6"
 
 [[package]]
-name = "bevy_ratatui"
-version = "0.11.1"
-dependencies = [
- "bevy",
- "bitflags 2.13.0",
- "color-eyre",
- "ratatui",
- "tracing",
-]
-
-[[package]]
 name = "bevy_reflect"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4371,8 +4360,9 @@ name = "tinhorn"
 version = "0.1.4"
 dependencies = [
  "bevy",
- "bevy_ratatui",
+ "bitflags 2.13.0",
  "clap",
+ "color-eyre",
  "crossterm",
  "glam 0.33.2",
  "image",

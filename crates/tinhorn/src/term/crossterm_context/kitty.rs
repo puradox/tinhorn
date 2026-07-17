@@ -8,7 +8,7 @@ use ratatui::crossterm::{
     terminal::supports_keyboard_enhancement,
 };
 
-use crate::ratatui_plugin::context_setup;
+use crate::term::ratatui_plugin::context_setup;
 
 /// Plugin responsible for enabling the Kitty keyboard protocol in the current buffer.
 ///

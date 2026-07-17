@@ -55,10 +55,9 @@ ratatui, rodio, or clap:
   and *nothing else* — no ratatui, no Bevy, no rodio, no clap — so its ~64
   sim/ceremony tests run GPU- and terminal-free.
 - **`crates/tinhorn`** — the binary: the Bevy `scene`, the ratatui `ui` chrome
-  and arena overlays, `cli`, `foley`, and `paint`. Re-exports
-  `tinhorn_core::{app, parse, physics}` so its modules refer to `crate::app` etc.
-- **`crates/bevy_ratatui`** — a vendored fork, **excluded from the workspace**
-  and pulled in as a `path` dependency (see the last bullet).
+  and arena overlays, `cli`, `foley`, `paint`, and the vendored `term` terminal
+  integration. Re-exports `tinhorn_core::{app, parse, physics}` so its modules
+  refer to `crate::app` etc.
 
 The interactive arena is a Bevy `App` driven by a `ScheduleRunnerPlugin` at
 ~60 fps (no window — headless render target). The core `App` (the sim) is the
@@ -158,7 +157,7 @@ and `drain_sounds` plays whatever the physics queued.
 - **`scene`** (bin) — the Bevy dice arena, the default interactive renderer. The
   `Sim(App)` resource is the single source of truth; the entities are a pure view.
   - Systems (all reading `Sim`): `input_system` (PreUpdate) feeds each
-    `bevy_ratatui` `KeyMessage` to the shared, pure `handle_key`, exiting on its
+    `term::event::KeyMessage` to the shared, pure `handle_key`, exiting on its
     `Quit` verdict; `advance_sim` steps `app.update(time.delta_secs())` (core's
     fixed-step accumulator keeps the physics deterministic regardless of Bevy's
     frame pacing); `sync_dice_scene` diffs `app.dice` → `DieView` entities
@@ -232,16 +231,18 @@ and `drain_sounds` plays whatever the physics queued.
   APIs at all (macOS raises a one-time microphone prompt for playback on duplex
   output devices; that's the OS, even `afplay` draws it — don't chase it).
 
-- **the vendored `bevy_ratatui` fork** — `crates/bevy_ratatui/` is a **vendored
-  snapshot** of `puradox/bevy_ratatui` (a fork of `ratatui/bevy_ratatui` plus
-  apekros's PR #98, the Bevy-0.19 port; see its `PROVENANCE.md`). It's
-  **excluded from the workspace** and pulled in as a `path` dependency; it
-  provides the terminal context and the `KeyMessage` input the scene reads.
-  tinhorn uses **Bevy 0.19's built-in `gpu_readback`** rather than the
-  `bevy_ratatui_camera` crate. Caveat worth knowing: because the fork isn't on
-  crates.io, **publishing `tinhorn` is blocked** until it's re-vendored as an
-  in-tree `src/` module — a known follow-up, but there are no crates.io users to
-  serve yet.
+- **`term`** (bin) — the terminal integration, a **vendored in-tree snapshot** of
+  `puradox/bevy_ratatui` (a fork of `ratatui/bevy_ratatui` plus apekros's PR #98,
+  the Bevy-0.19 port; see `src/term/PROVENANCE.md`). It lives as a plain module
+  (`src/term/`), **not** a path dependency, so `cargo publish` works. It's trimmed
+  to the **crossterm** path the scene drives — the winit/`soft_ratatui`
+  `windowed` backend is dropped and the crate's `crossterm`/`keyboard`/`mouse`
+  cargo features are resolved to always-on — and provides the `RatatuiContext`,
+  `RatatuiPlugins`, and the `KeyMessage` input the scene reads. `#![allow(dead_code,
+  unused_imports)]` keeps the upstream surface verbatim under the binary's
+  `-D warnings`. tinhorn uses **Bevy 0.19's built-in `gpu_readback`** for readback
+  rather than the `bevy_ratatui_camera` crate. To sync: recopy the fork's
+  crossterm `src/`, re-apply the trims, update the SHA in `PROVENANCE.md`.
 
 ## Conventions worth knowing
 

@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::term::event::KeyMessage;
+use crate::term::{RatatuiContext, RatatuiPlugins};
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::{Hdr, RenderTarget};
@@ -26,8 +28,6 @@ use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::view::Msaa;
 use bevy::window::{ExitCondition, WindowPlugin};
-use bevy_ratatui::event::KeyMessage;
-use bevy_ratatui::{RatatuiContext, RatatuiPlugins};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyEventKind, KeyModifiers};

@@ -47,12 +47,12 @@ kept out of it:
   `rapier3d` — **no ratatui, no Bevy, no rodio, no clap** — so the crate stays GPU-
   and terminal-free and its ~64 sim/ceremony tests run without a display.
 - **`crates/tinhorn`** — the binary: the Bevy `scene`, the ratatui `ui` chrome and
-  arena overlays, `cli`, `foley`, and the small `paint` colour/texture types. It
-  re-exports `tinhorn_core::{app, parse, physics}` so its modules keep saying
-  `crate::app`.
-- **`crates/bevy_ratatui`** — a **vendored fork**, deliberately *excluded* from the
-  workspace and consumed as a `path` dependency (see Releasing → the publishing
-  caveat).
+  arena overlays, `cli`, `foley`, the small `paint` colour/texture types, and the
+  vendored `term` terminal integration. It re-exports
+  `tinhorn_core::{app, parse, physics}` so its modules keep saying `crate::app`.
+- **`src/term/`** — the terminal integration, a **vendored in-tree snapshot** of the
+  `bevy_ratatui` fork (see `src/term/PROVENANCE.md`), trimmed to the crossterm path.
+  A plain module, not a path dependency, so the crate publishes.
 
 ## Design
 
@@ -265,11 +265,11 @@ Two repository secrets are required:
 
 Three things worth knowing:
 
-- **Publishing is blocked until the vendored fork is re-vendored in-tree.**
-  `crates/bevy_ratatui` is a git-fork snapshot pulled in as a `path` dependency,
-  and crates.io forbids that. Until it's re-vendored as an in-tree `src/` module,
-  `cargo publish` of the `tinhorn` binary won't go through — a known follow-up.
-  (`tinhorn-core` has no such blocker.)
+- **Publish `tinhorn-core` before `tinhorn`.** The binary depends on the library
+  by version, so release-plz (or a manual publish) must push `tinhorn-core` to
+  crates.io first, then `tinhorn` — the normal two-crate workspace order. There is
+  no longer a git-fork blocker: the old `bevy_ratatui` path dependency is vendored
+  in-tree as `src/term/`, so both crates publish with only crates.io dependencies.
 - release-plz reads **conventional-commit** prefixes (`feat:`, `fix:`) to choose
   the version bump and group the changelog. Commits without them still release,
   but as a patch bump under a flat changelog.

@@ -10,13 +10,11 @@ use ratatui::crossterm::{
 
 use ratatui::backend::CrosstermBackend;
 
-use crate::{RatatuiPlugins, context::TerminalContext};
+use crate::term::{RatatuiPlugins, context::TerminalContext};
 
 use super::{cleanup::CleanupPlugin, error::ErrorPlugin, event::EventPlugin, kitty::KittyPlugin};
 
-#[cfg(feature = "mouse")]
 use super::mouse::MousePlugin;
-#[cfg(feature = "keyboard")]
 use super::translation::TranslationPlugin;
 
 /// Ratatui context that will draw to the terminal buffer using crossterm.
@@ -52,9 +50,7 @@ impl TerminalContext<CrosstermBackend<Stdout>> for CrosstermContext {
             .add(EventPlugin::default())
             .add(KittyPlugin);
 
-        #[cfg(feature = "mouse")]
         let builder = builder.add(MousePlugin);
-        #[cfg(feature = "keyboard")]
         let builder = builder.add(TranslationPlugin);
 
         let mut builder = builder;
@@ -62,12 +58,10 @@ impl TerminalContext<CrosstermBackend<Stdout>> for CrosstermContext {
             builder = builder.disable::<KittyPlugin>();
         }
 
-        #[cfg(feature = "mouse")]
         if !group.enable_mouse_capture {
             builder = builder.disable::<MousePlugin>();
         }
 
-        #[cfg(feature = "keyboard")]
         if !group.enable_input_forwarding {
             builder = builder.disable::<TranslationPlugin>();
         }

@@ -12,7 +12,7 @@
 //!
 //! # Usage
 //!
-//! To enable it, add the [RatatuiPlugins][crate::RatatuiPlugins] with
+//! To enable it, add the [RatatuiPlugins][crate::term::RatatuiPlugins] with
 //! `enable_input_forwarding` set to true.
 //!
 //! ```no_run

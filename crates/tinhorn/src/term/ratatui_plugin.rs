@@ -3,9 +3,9 @@ use bevy::{
     prelude::{Commands, Result},
 };
 
-use crate::{RatatuiContext, context::DefaultContext};
+use crate::term::{RatatuiContext, context::DefaultContext};
 
-use crate::context::TerminalContext;
+use crate::term::context::TerminalContext;
 
 /// A plugin group that includes all the plugins in the Ratatui crate.
 ///

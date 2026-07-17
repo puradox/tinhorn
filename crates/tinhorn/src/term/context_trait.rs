@@ -3,7 +3,7 @@ use std::ops::Deref;
 use bevy::{app::PluginGroupBuilder, prelude::Result};
 use ratatui::{Terminal, prelude::Backend};
 
-use crate::RatatuiPlugins;
+use crate::term::RatatuiPlugins;
 
 /// Trait for types that implement lifecycle functions for initializing a terminal context and
 /// restoring the terminal state after exiting. Implementors must also use their implementation of

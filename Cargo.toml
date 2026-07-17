@@ -1,11 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/tinhorn-core", "crates/tinhorn"]
-# The vendored Bevy glue crates are NOT workspace members: they're pulled in only
-# via the `tinhorn/bevy` feature (Stage-2 spike), so a default `cargo build` /
-# `cargo test --workspace` / `cargo install` never compiles Bevy. They live under
-# `crates/` for provenance but build purely as optional path dependencies.
-exclude = ["crates/bevy_ratatui"]
 
 # Shared dependency pins, referenced by each crate with `{ workspace = true }`.
 # One place to bump a version, and the two crates can never drift apart.

@@ -2,11 +2,7 @@ use bevy::prelude::*;
 
 use super::context_trait::TerminalContext;
 
-#[cfg(all(feature = "crossterm", not(feature = "windowed")))]
-pub type DefaultContext = crate::context::CrosstermContext;
-
-#[cfg(feature = "windowed")]
-pub type DefaultContext = crate::context::WindowedContext;
+pub type DefaultContext = crate::term::context::CrosstermContext;
 
 /// A bevy Resource that wraps [ratatui::Terminal], setting up the terminal context when
 /// initialized (i.e. entering raw mode), restores the prior terminal state when dropped (i.e.
