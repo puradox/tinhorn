@@ -1,0 +1,15 @@
+[package]
+name = "tinhorn-core"
+version = "0.1.4"
+edition = "2021"
+description = "Core dice-roll semantics and 3D physics for tinhorn, a terminal dice roller."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/puradox/tinhorn"
+keywords = ["dice", "roll", "rpg", "ttrpg"]
+categories = ["game-development", "simulation"]
+
+[dependencies]
+rand = { workspace = true }
+serde = { workspace = true }
+glam = { workspace = true }
+rapier3d = { workspace = true }

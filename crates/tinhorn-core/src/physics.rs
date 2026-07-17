@@ -23,7 +23,7 @@ pub const HY: f32 = 1.9;
 /// Deeper still reads even more tray-like, but the overhead camera must back out
 /// to fit the felt's depth and the dice shrink with it; 2.0 is the tradeoff.
 /// The launch lattice, camera framing, and furniture all derive from this —
-/// see `app::launch_pool`, `render3d_view::arena_camera`, and `ui::render_arena`.
+/// see `app::launch_pool`, `view_math::arena_camera`, and `ui::render_arena`.
 pub const HZ: f32 = 2.0;
 /// World radius a die occupies (its mesh is circumradius 1, scaled to this).
 pub const DIE_R: f32 = 0.36;

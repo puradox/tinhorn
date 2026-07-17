@@ -18,10 +18,10 @@ const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so
 // The Throw: shake-the-cup tuning. Power rises from 0 the moment the cup is
 // picked up and oscillates forever, so the release timing is the whole game.
 const SHAKE_POWER_RATE: f32 = 3.9; // rad/s: a full 0→1→0 power cycle ≈ 1.6 s
-/// rad/s: how fast the cup rattles side to side. `pub(crate)` because the
-/// renderer syncs the cup's bob and lean to the same clock — one rate, so the
-/// drawn shake can't drift off the audible one.
-pub(crate) const CUP_SWAY_RATE: f32 = 7.0;
+/// rad/s: how fast the cup rattles side to side. `pub` because the renderer (in
+/// the binary crate) syncs the cup's bob and lean to the same clock — one rate,
+/// so the drawn shake can't drift off the audible one.
+pub const CUP_SWAY_RATE: f32 = 7.0;
 const MAX_HISTORY: usize = 200; // most recent rolls kept in memory for the history pane
 const STAT_SAMPLES: usize = 20_000; // Monte-Carlo trials for the statistics pane's odds
 const MAX_SOUNDS: usize = 64; // pending sound events; when nothing drains them, stop queuing
@@ -121,7 +121,7 @@ fn tumbling_face(rot: Quat, sides: u32) -> u32 {
 /// The convex-hull points for a die of `sides` — its polyhedron's vertices
 /// (circumradius 1; the physics scales them to the collider size).
 fn mesh_points(sides: u32) -> Vec<Vec3> {
-    crate::render3d::dice::mesh_for(sides)
+    crate::dice_geom::mesh_for(sides)
         .vertices
         .iter()
         .map(|v| v.position)
@@ -851,9 +851,9 @@ impl App {
     }
 
     /// The hard-throw camera shudder, as a world-space eye offset — the 3D heir
-    /// to the 2D screen-shake. Fed into `render3d_view::live_camera` by the
-    /// renderer and the particle projection alike, so the shake can't knock the
-    /// two out of register.
+    /// to the 2D screen-shake. Fed into [`view_math::live_camera`](crate::view_math::live_camera)
+    /// by the renderer and the particle projection alike, so the shake can't
+    /// knock the two out of register.
     pub fn camera_shake(&self) -> Vec3 {
         let tr = self.tremor();
         match self.last_throw {
@@ -1153,22 +1153,22 @@ impl App {
     }
 
     /// World→arena-cell mapping for the 2D particle overlays (crit gold, fumble
-    /// dust). It projects through the *same* [`live_camera`](crate::render3d_view::live_camera)
+    /// dust). It projects through the *same* [`live_camera`](crate::view_math::live_camera)
     /// the dice are drawn with — drift, punch-in, shudder and all — so a burst
     /// erupts exactly from the die that earned it.
     fn world_to_cell(&self, pos: Vec3) -> (f32, f32) {
         if self.arena_w < 1.0 || self.arena_h < 1.0 {
             return (self.arena_w / 2.0, self.arena_h / 2.0);
         }
-        let aspect = crate::render3d_view::arena_aspect(self.arena_w, self.arena_h);
-        let cam = crate::render3d_view::live_camera(
+        let aspect = crate::view_math::arena_aspect(self.arena_w, self.arena_h);
+        let cam = crate::view_math::live_camera(
             self.camera_shake(),
             aspect,
             self.focus,
             self.clock,
             self.flash,
         );
-        crate::render3d_view::project_to_cell(&cam, pos, self.arena_w, self.arena_h)
+        crate::view_math::project_to_cell(&cam, pos, self.arena_w, self.arena_h)
             .unwrap_or((self.arena_w / 2.0, self.arena_h / 2.0))
     }
 
