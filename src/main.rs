@@ -17,6 +17,9 @@ mod app;
 mod cli;
 mod foley;
 mod parse;
+mod physics;
+mod render3d;
+mod render3d_view;
 mod ui;
 
 use std::io::{self, IsTerminal};
@@ -358,18 +361,73 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
 
+        // The tray is always drawn, so to catch the *cup* we compare two frames of
+        // the same scene: roll first (dice on the felt, no idle hint) for a stable
+        // baseline, then start shaking. The cup (a solid block) and the meter paint
+        // over felt cells, so a healthy count of *changed* arena cells proves the
+        // cup rendered — a culled-to-nothing cup would change almost nothing.
+        let snapshot = |t: &Terminal<TestBackend>| -> Vec<(String, ratatui::style::Color)> {
+            let buf = t.backend().buffer();
+            (0..buf.area().width)
+                .flat_map(|x| (1..16u16).map(move |y| (x, y)))
+                .map(|(x, y)| {
+                    let c = &buf[(x, y)];
+                    (c.symbol().to_string(), c.fg)
+                })
+                .collect()
+        };
+
         type_str(&mut app, "3d6");
-        handle_key(&mut app, KeyCode::Enter, false);
+        handle_key(&mut app, KeyCode::Tab, false); // Roll
+        handle_key(&mut app, KeyCode::Tab, false); // Insta
+        handle_key(&mut app, KeyCode::Enter, false); // settle a roll on the felt
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let baseline = snapshot(&terminal); // tray + settled dice
+
+        handle_key(&mut app, KeyCode::Tab, false); // Insta → Shake
+        handle_key(&mut app, KeyCode::Enter, false); // start shaking
         app.update(0.3);
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let shaking = snapshot(&terminal); // + the cup (and the meter)
+        let changed = baseline
+            .iter()
+            .zip(&shaking)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            changed > 50,
+            "the 3D cup didn't render (only {changed} arena cells changed)"
+        );
 
+        // The previous roll's dice — and their number overlays — are withheld while
+        // shaking (they're gathered in the cup), so the settled digits the baseline
+        // shows must be gone now, not painting over the cup and its meter.
+        let digit_cells = |snap: &[(String, ratatui::style::Color)]| {
+            snap.iter()
+                .filter(|(s, _)| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .count()
+        };
+        assert!(
+            digit_cells(&baseline) > 0,
+            "the settled roll should show its numbers on the felt"
+        );
+        assert_eq!(
+            digit_cells(&shaking),
+            0,
+            "die numbers must not render over the cup while shaking"
+        );
+
+        // The rest of the shake ceremony: the title, the power meter, the hint.
         let screen = flatten(&terminal);
         assert!(screen.contains("shaking"), "title should say shaking");
-        assert!(screen.contains("╲____╱"), "the cup is missing");
+        assert!(
+            screen.contains('▀'),
+            "the 3D arena should render while shaking"
+        );
         assert!(screen.contains("power"), "the power meter is missing");
         assert!(screen.contains("throw"), "the release hint is missing");
 
-        // Throw and let it land: the cup vanishes and the roll completes.
+        // Throw and let it land: the meter vanishes and the roll completes.
         handle_key(&mut app, KeyCode::Enter, false);
         for _ in 0..6000 {
             app.update(1.0 / 60.0);
@@ -381,8 +439,8 @@ mod tests {
         assert!(app.all_settled(), "thrown dice never settled on screen");
         let screen = flatten(&terminal);
         assert!(
-            !screen.contains("╲____╱"),
-            "the cup should be gone after the throw"
+            !screen.contains("power"),
+            "the power meter should be gone after the throw"
         );
         assert!(
             screen.contains("settled"),
@@ -445,9 +503,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tiny_terminal_skips_the_cup_rather_than_breaking_the_border() {
-        // Regression: on an arena narrower than the cup, drawing it would
-        // paint over the border chrome. It is skipped instead.
+    fn a_tiny_terminal_skips_the_meter_rather_than_breaking_the_border() {
+        // Regression: on an arena too narrow for the power meter, drawing it
+        // would paint over the border chrome. It is skipped instead. (The cup is
+        // now a 3D object, rasterised into the arena interior, so it can't spill
+        // over the border at all — but the meter is still a text overlay.)
         let mut app = App::new(String::new());
         let mut terminal = Terminal::new(TestBackend::new(9, 12)).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
@@ -458,11 +518,7 @@ mod tests {
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
 
         let screen = flatten(&terminal);
-        assert!(
-            !screen.contains("╲____╱"),
-            "the cup must not squeeze into 7 cells"
-        );
-        assert!(!screen.contains("power"), "nor the meter");
+        assert!(!screen.contains("power"), "the meter must not squeeze in");
         // The arena frame survives intact (rows 1..=4 are its left border;
         // rows 0 and 5 are corners, and the results block starts below).
         let buf = terminal.backend().buffer();
@@ -769,8 +825,175 @@ mod tests {
         let screen = flatten(&terminal);
         assert!(screen.contains("tinhorn"), "missing title");
         assert!(screen.contains("total"), "missing total label");
-        // The settled d6 squares should be on screen.
-        assert!(screen.contains("┌────┐"), "no die boxes rendered");
+        // The dice render in 3D, filling the arena with half-blocks.
+        assert!(screen.contains('▀'), "no 3D dice rendered");
+    }
+
+    #[test]
+    fn renders_the_roll_in_3d_with_burned_values() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+
+        // Insta-roll a d6 so a settled die exists to render.
+        type_str(&mut app, "1d6");
+        handle_key(&mut app, KeyCode::Tab, false); // Roll
+        handle_key(&mut app, KeyCode::Tab, false); // Insta
+        handle_key(&mut app, KeyCode::Enter, false);
+        assert!(app.all_settled());
+
+        // The 3D die renders as half-blocks in the arena, and its value is burned
+        // in — proving the whole render3d → blit → overlay path reaches the buffer.
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let arena: Vec<(u16, u16)> = (0..buf.area().width)
+            .flat_map(|x| (0..14u16).map(move |y| (x, y)))
+            .collect();
+        let has_block = arena.iter().any(|&(x, y)| buf[(x, y)].symbol() == "▀");
+        assert!(has_block, "the 3D die should fill arena cells with '▀'");
+        let value = app.dice[0].final_value.to_string();
+        let has_value = arena.iter().any(|&(x, y)| buf[(x, y)].symbol() == value);
+        assert!(has_value, "the die's value should be burned onto the face");
+    }
+
+    // The number rides the frontmost face and ducks out when the die turns
+    // edge-on: a cube squared to the eye reads one face clearly (high clarity, the
+    // digit shows), but rotated 45° two faces tie for frontmost (clarity ~0, the
+    // airborne digit blinks off) — so it reads as ink on the tumbling solid, not a
+    // fixed label. One threshold works because clarity is the leader's lead, not
+    // an absolute facing.
+    #[test]
+    fn the_number_ducks_out_when_the_die_rolls_edge_on() {
+        use crate::render3d::dice;
+        use crate::render3d::math::{Quat, Vec3};
+
+        let faces = dice::face_geometry(6); // a cube
+                                            // Face-on: the +Z face points straight at the eye and clearly leads.
+        let (_c, face_on) = ui::read_face(faces, Quat::IDENTITY, Vec3::Z);
+        assert!(
+            face_on > 0.5,
+            "a squarely-presented face should read clearly, got clarity {face_on}"
+        );
+        // Edge-on: a 45° spin about Y ties two faces for frontmost, so clarity
+        // collapses and the airborne number ducks out there.
+        let edge = Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let (_c, edge_on) = ui::read_face(faces, edge, Vec3::Z);
+        assert!(
+            edge_on < 0.1,
+            "an edge-on cube ties two faces, so clarity should be ~0, got {edge_on}"
+        );
+    }
+
+    // The number scales to the die's on-screen size: a small die keeps the crisp
+    // single cell (scale 0), and the digits grow as the die does — so a wide
+    // terminal, which renders the dice large, doesn't leave a speck of a number on
+    // a big die. A wider (two-digit) number needs a wider die for the same scale.
+    #[test]
+    fn the_number_scales_with_the_die() {
+        // A tiny die can't fit even a scale-1 half-block glyph (3×3 cells) → 0.
+        assert_eq!(ui::number_scale(3.0, 2.0, 1), 0, "small die → single cell");
+        // Room for the 3×3 glyph but not the 6×5 one → scale 1.
+        assert_eq!(ui::number_scale(6.0, 3.0, 1), 1);
+        // A big die fits the larger glyph → scale 2.
+        assert_eq!(ui::number_scale(12.0, 6.0, 1), 2);
+        // Bigger dice keep scaling up.
+        assert!(ui::number_scale(40.0, 20.0, 1) > ui::number_scale(12.0, 6.0, 1));
+        // Two digits are wider, so the same die yields a smaller (or equal) scale.
+        assert!(ui::number_scale(9.0, 6.0, 2) <= ui::number_scale(9.0, 6.0, 1));
+    }
+
+    /// Eyeball the 3D shaking cup:
+    ///   cargo test preview_cup_3d -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn preview_cup_3d() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(66, 22)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+        type_str(&mut app, "3d6");
+        handle_key(&mut app, KeyCode::Enter, false); // start shaking
+        app.update(0.45); // let the cup sway off-centre and wobble
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let area = buf.area();
+        eprintln!("\n=== shaking (3D cup) ===");
+        for y in 0..area.height {
+            let mut line = String::new();
+            for x in 0..area.width {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            eprintln!("{line}");
+        }
+    }
+
+    /// Eyeball the 3D dice arena after a roll settles. Override the expression
+    /// with SNAP=... :
+    ///   SNAP="d20+d12+d6" cargo test preview_dice_3d -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn preview_dice_3d() {
+        let expr = std::env::var("SNAP").unwrap_or_else(|_| "d20+d12+d10+d8+d6+d4".to_string());
+        let parse_env = |k: &str, d: u16| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (parse_env("W", 66), parse_env("H", 22));
+        let mut app = App::new(expr);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        // A coverage map so die size is actually visible: every arena cell is
+        // '▀', so raw symbols show nothing — instead print ' ' for felt-coloured
+        // cells and '#'/the digit for cells the dice cover, and report how much
+        // of the arena the dice fill (a proxy for how big they read on screen).
+        let felt = ratatui::style::Color::Rgb(28, 46, 40);
+        let dump = |terminal: &Terminal<TestBackend>, tag: &str| {
+            let buf = terminal.backend().buffer();
+            let area = buf.area();
+            let (mut die_cells, mut arena_cells) = (0u32, 0u32);
+            eprintln!("\n=== {tag} ===");
+            for y in 0..area.height {
+                let mut line = String::new();
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    let sym = cell.symbol();
+                    // Inside the arena border, translate to a coverage glyph.
+                    if sym == "▀" || sym.chars().all(|c| c.is_ascii_digit()) {
+                        arena_cells += 1;
+                        let is_die = cell.fg != felt || cell.bg != felt;
+                        if is_die {
+                            die_cells += 1;
+                        }
+                        if sym.chars().all(|c| c.is_ascii_digit()) {
+                            line.push_str(sym);
+                        } else if is_die {
+                            line.push('#');
+                        } else {
+                            line.push(' ');
+                        }
+                        continue;
+                    }
+                    line.push_str(sym);
+                }
+                eprintln!("{line}");
+            }
+            eprintln!(
+                "dice cover {die_cells}/{arena_cells} arena cells ({:.0}%)",
+                100.0 * die_cells as f32 / arena_cells.max(1) as f32
+            );
+        };
+        for i in 0..40000 {
+            app.update(1.0 / 60.0);
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            if i == 14 {
+                dump(&terminal, "mid-flight (physics: dice scattered)");
+            }
+            if app.all_settled() {
+                break;
+            }
+        }
+        dump(&terminal, "settled (values burned in)");
     }
 
     /// Not a real assertion — prints a rendered frame so you can eyeball the
@@ -778,10 +1001,17 @@ mod tests {
     #[test]
     #[ignore]
     fn snapshot() {
-        // Override the expression with SNAP=... to eyeball other rolls.
+        // Override the expression with SNAP=... and the terminal size with W=/H=
+        // (e.g. to eyeball the number scaling up on a wide terminal).
         let expr = std::env::var("SNAP").unwrap_or_else(|_| "d4+d6+d8+d10+d12+d20".to_string());
+        let dim = |k: &str, d: u16| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         let mut app = App::new(expr);
-        let mut terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(dim("W", 72), dim("H", 18))).unwrap();
         terminal.draw(|f| ui::render(f, &mut app)).unwrap();
         // Generous budget: an exploding chain settles dice one at a time.
         for _ in 0..40000 {
@@ -801,6 +1031,204 @@ mod tests {
             }
             eprintln!("{line}");
         }
+    }
+
+    /// Reconstruct the rendered frame as a PPM image at `path`. The terminal
+    /// packs two pixels per cell into '▀' (fg = upper, bg = lower), so a text
+    /// dump shows none of the colour; this rebuilds the true image. Convert with
+    /// `magick <path> out.png`.
+    fn write_ppm(terminal: &Terminal<TestBackend>, path: &str) {
+        use ratatui::style::Color;
+        fn rgb(c: Color) -> [u8; 3] {
+            match c {
+                Color::Rgb(r, g, b) => [r, g, b],
+                Color::Black => [0, 0, 0],
+                Color::White => [230, 230, 230],
+                Color::Red => [200, 70, 70],
+                Color::Green => [70, 190, 90],
+                Color::Yellow => [220, 200, 60],
+                Color::Blue => [80, 120, 230],
+                Color::Magenta => [200, 90, 200],
+                Color::Cyan => [70, 190, 200],
+                Color::Gray => [160, 160, 160],
+                Color::DarkGray => [90, 90, 90],
+                Color::LightGreen => [130, 230, 130],
+                Color::LightMagenta => [230, 130, 230],
+                _ => [13, 17, 23], // Reset / unknown → terminal background
+            }
+        }
+        let buf = terminal.backend().buffer();
+        let area = *buf.area();
+        let (pw, ph) = (area.width as usize, area.height as usize * 2);
+        let mut px = vec![0u8; pw * ph * 3];
+        for cy in 0..area.height {
+            for cx in 0..area.width {
+                let cell = &buf[(cx, cy)];
+                let (top, bot) = if cell.symbol() == "▀" {
+                    (rgb(cell.fg), rgb(cell.bg))
+                } else {
+                    (rgb(cell.fg), rgb(cell.fg))
+                };
+                for (row, color) in [(cy as usize * 2, top), (cy as usize * 2 + 1, bot)] {
+                    let i = (row * pw + cx as usize) * 3;
+                    px[i..i + 3].copy_from_slice(&color);
+                }
+            }
+        }
+        let mut out = format!("P6\n{pw} {ph}\n255\n").into_bytes();
+        out.extend_from_slice(&px);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Not a real assertion — reconstructs the rendered frame as a real image so
+    /// the 3D arena can be eyeballed in colour. Writes a PPM; convert and view:
+    ///   SNAP="3d6" SHAKE=1 cargo test preview_png -- --ignored --nocapture \
+    ///     && magick /tmp/tinhorn.ppm /tmp/tinhorn.png
+    /// Env: SNAP=expr, W/H=frame size, SHAKE=show the cup, THROW=N stop mid-air,
+    /// SEED=N pin the roll (and the whole frame) for a stable side-by-side.
+    #[test]
+    #[ignore]
+    fn preview_png() {
+        let expr = std::env::var("SNAP").unwrap_or_else(|_| "d20+d12+d8+d6".to_string());
+        let parse_env = |k: &str, d: u16| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = (parse_env("W", 96), parse_env("H", 30));
+        let shake = std::env::var("SHAKE").is_ok();
+
+        // SEED=N pins the roll (and so the whole frame) for a stable eyeball;
+        // without it each run rolls fresh, as the app does.
+        let mut app = match std::env::var("SEED").ok().and_then(|v| v.parse().ok()) {
+            Some(seed) => App::with_seed(String::new(), seed),
+            None => App::new(String::new()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+        type_str(&mut app, &expr);
+        // Settle a roll first (so a shake has dice on the felt, as in the report).
+        handle_key(&mut app, KeyCode::Tab, false); // Roll
+        handle_key(&mut app, KeyCode::Tab, false); // Insta
+        handle_key(&mut app, KeyCode::Enter, false);
+        // Let the reading-focus ease in so the settled eyeball shows the lean-in
+        // camera (the app reaches this ~1 s after a roll comes to rest).
+        if !shake && std::env::var("THROW").is_err() {
+            for _ in 0..90 {
+                app.update(1.0 / 60.0);
+            }
+        }
+        if shake {
+            handle_key(&mut app, KeyCode::Tab, false); // Insta → Shake mode
+            handle_key(&mut app, KeyCode::Enter, false); // start shaking
+            app.update(0.45); // sway the cup off-centre
+        }
+        // THROW=<frames>: roll fresh and stop mid-air to check the launch is in view.
+        if let Ok(n) = std::env::var("THROW").map(|v| v.parse::<u32>().unwrap_or(6)) {
+            let mut fresh = App::with_seed(String::new(), 7);
+            fresh.arena_w = app.arena_w;
+            fresh.arena_h = app.arena_h;
+            type_str(&mut fresh, &expr);
+            handle_key(&mut fresh, KeyCode::Tab, false); // Shake → Roll
+            handle_key(&mut fresh, KeyCode::Enter, false); // rain the dice in
+            for _ in 0..n {
+                fresh.update(1.0 / 60.0);
+            }
+            app = fresh;
+        }
+        terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+        write_ppm(&terminal, "/tmp/tinhorn.ppm");
+        eprintln!("wrote /tmp/tinhorn.ppm");
+    }
+
+    /// Not a real assertion — renders the arena under several candidate palettes
+    /// (the same seeded roll each time) to PPMs for a side-by-side design pick:
+    ///   cargo test preview_designs -- --ignored --nocapture
+    ///   for f in /tmp/design-*.ppm; do magick "$f" "${f%.ppm}.png"; done
+    #[test]
+    #[ignore]
+    fn preview_designs() {
+        use crate::render3d::color::Rgb;
+        use ui::ArenaStyle;
+
+        // Each variant changes only the palette (background/felt/lip + light
+        // warmth); the shape, texture, and lighting model are the shared new tray,
+        // and the roll is identical. `..d` inherits the tuned ambient/lip.
+        let d = ArenaStyle::DEFAULT;
+        let variants: [(&str, ArenaStyle); 6] = [
+            ("0-slate", d), // the current default
+            (
+                "1-casino",
+                ArenaStyle {
+                    background: Rgb(12, 22, 16),
+                    floor: Rgb(26, 74, 46),
+                    wall: Rgb(58, 44, 32),
+                    key: Rgb(255, 244, 222),
+                    fill: Rgb(80, 96, 88),
+                    ..d
+                },
+            ),
+            (
+                "2-noir",
+                ArenaStyle {
+                    background: Rgb(9, 9, 11),
+                    floor: Rgb(28, 30, 34),
+                    wall: Rgb(66, 56, 50),
+                    key: Rgb(255, 230, 198),
+                    fill: Rgb(64, 68, 78),
+                    ..d
+                },
+            ),
+            (
+                "3-leather",
+                ArenaStyle {
+                    background: Rgb(20, 15, 11),
+                    floor: Rgb(104, 80, 52),
+                    wall: Rgb(66, 44, 28),
+                    key: Rgb(255, 242, 220),
+                    fill: Rgb(96, 84, 70),
+                    ..d
+                },
+            ),
+            (
+                "4-twilight",
+                ArenaStyle {
+                    background: Rgb(13, 11, 22),
+                    floor: Rgb(42, 32, 62),
+                    wall: Rgb(70, 46, 84),
+                    key: Rgb(232, 224, 255),
+                    fill: Rgb(110, 104, 140),
+                    ..d
+                },
+            ),
+            (
+                "5-ocean",
+                ArenaStyle {
+                    background: Rgb(10, 18, 24),
+                    floor: Rgb(30, 58, 72),
+                    wall: Rgb(44, 64, 74),
+                    key: Rgb(240, 248, 255),
+                    fill: Rgb(88, 110, 120),
+                    ..d
+                },
+            ),
+        ];
+
+        for (name, style) in variants {
+            ui::set_arena_style(Some(style));
+            let mut app = App::with_seed(String::new(), 12);
+            let mut terminal = Terminal::new(TestBackend::new(110, 34)).unwrap();
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap(); // size the arena
+            type_str(&mut app, "d20+d12+d8+d6");
+            handle_key(&mut app, KeyCode::Tab, false); // Roll
+            handle_key(&mut app, KeyCode::Tab, false); // Insta
+            handle_key(&mut app, KeyCode::Enter, false); // settle
+            terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+            write_ppm(&terminal, &format!("/tmp/design-{name}.ppm"));
+            eprintln!("wrote /tmp/design-{name}.ppm");
+        }
+        ui::set_arena_style(None);
     }
 
     /// Not a real assertion — records scripted TUI sessions as JSON frame dumps
@@ -1034,8 +1462,12 @@ mod tests {
             app.pane = pane;
             terminal.draw(|f| ui::render(f, &mut app)).unwrap();
             let s = flatten(&terminal);
-            let titles = ["dice notation", "🎲   history", "🎲   statistics"];
-            let showing = titles.iter().filter(|t| s.contains(**t)).count();
+            // Match distinctive pane *content* rather than the emoji titles: the
+            // dense 3D arena behind can bleed a half-block into a title's wide
+            // emoji cell. Help = its notation reference, History = the empty-list
+            // line, Stats = the odds header — each unique to one pane.
+            let markers = ["dice notation", "no rolls yet", "Odds for"];
+            let showing = markers.iter().filter(|t| s.contains(**t)).count();
             assert_eq!(
                 showing, 1,
                 "exactly one pane should be visible for {pane:?}"
