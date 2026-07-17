@@ -241,15 +241,13 @@ fn setup(
             brightness: 70.0,
             ..default()
         },
-        // Recede far geometry into the room; a warm colour so the floor's far
-        // reaches and the drapes ease into the room rather than into black. Start
-        // pushed past the mid-ground so the felt, dice, and near room stay crisp.
+        // A warm, smoky haze that thickens with distance so the room dissolves
+        // into an amber murk beyond the lit tray — the cigar-smoke air of a
+        // saloon back room. Exponential falloff reads softer and smokier than a
+        // hard linear band; the near tray and dice stay crisp.
         DistanceFog {
-            color: Color::srgb_u8(40, 28, 22),
-            falloff: FogFalloff::Linear {
-                start: 22.0,
-                end: 55.0,
-            },
+            color: Color::srgb_u8(50, 33, 20),
+            falloff: FogFalloff::Exponential { density: 0.06 },
             ..default()
         },
     ));
@@ -259,17 +257,19 @@ fn setup(
         .spawn(Readback::texture(handle))
         .observe(on_readback);
 
-    // Warm key light with shadow maps, a cool rim.
+    // Warm key light living inside the overhead pendant shade (see `arena`), hung
+    // low and centred over the tray so it pools a bright circle of lamplight on
+    // the felt and falls off into the smoky room, a cool rim for separation.
     commands.spawn((
         ArenaKeyLight,
         PointLight {
-            color: Color::srgb(1.0, 0.86, 0.66),
-            intensity: 9_000_000.0,
-            range: 60.0,
+            color: Color::srgb(1.0, 0.84, 0.6),
+            intensity: KEY_LIGHT_INTENSITY,
+            range: 40.0,
             shadow_maps_enabled: true,
             ..default()
         },
-        Transform::from_xyz(0.8, physics::HY + 3.0, physics::HZ * 0.5),
+        Transform::from_xyz(0.0, -physics::HY + 2.7, 0.1),
     ));
     commands.spawn((
         DirectionalLight {
@@ -306,6 +306,11 @@ fn setup(
 /// Marks the warm key light so its intensity can flinch on hard impacts.
 #[derive(Component)]
 struct ArenaKeyLight;
+
+/// The pendant key light's resting intensity — hung low over the tray, so it's
+/// dimmer than a high fill would be. `choreograph` scales this on impact and
+/// crit, so the spawn and the flinch must read the same baseline.
+const KEY_LIGHT_INTENSITY: f32 = 4_500_000.0;
 
 /// Feed keys to the shared, pure `handle_key`; quit on its `Quit` verdict.
 fn input_system(
@@ -448,7 +453,7 @@ fn choreograph(
     if let Ok(mut light) = key_light.single_mut() {
         // Brighten with hard-impact energy and a crit flare.
         let boost = 1.0 + app.impact_energy() * 0.6 + app.flash() * 1.5;
-        light.intensity = 9_000_000.0 * boost;
+        light.intensity = KEY_LIGHT_INTENSITY * boost;
     }
 }
 

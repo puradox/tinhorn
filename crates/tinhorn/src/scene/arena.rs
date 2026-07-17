@@ -282,6 +282,36 @@ pub fn spawn(
         ));
     }
 
+    // --- Overhead saloon pendant: a warm tin shade hung over the tray on a
+    //     chain, with the key light living just inside its mouth (see `scene`), so
+    //     the felt sits in a pool of lamplight and the room falls to shadow. Hung
+    //     high and a touch back so the shade rides the top of the frame instead of
+    //     covering the felt at the overhead read. ---
+    let lamp_y = FELT_TOP + 4.4;
+    let lamp_z = -0.6;
+    let shade = materials.add(StandardMaterial {
+        base_color: col(Rgb(38, 26, 16)),
+        emissive: LinearRgba::rgb(1.2, 0.72, 0.32), // warm underglow off the tin shade
+        perceptual_roughness: 0.5,
+        metallic: 0.3,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Cone {
+            radius: 0.5,
+            height: 0.5,
+        })),
+        MeshMaterial3d(shade),
+        Transform::from_xyz(0.0, lamp_y, lamp_z),
+    ));
+    // A thin chain climbing into the dark above the shade.
+    let chain = matte(materials, Rgb(20, 16, 12), 0.6);
+    commands.spawn((
+        Mesh3d(meshes.add(Cylinder::new(0.025, 2.4))),
+        MeshMaterial3d(chain),
+        Transform::from_xyz(0.0, lamp_y + 1.5, lamp_z),
+    ));
+
     // --- Poker-chip stacks clustered at the open-front corners. ---
     for (i, side) in [-1.0f32, 1.0].into_iter().enumerate() {
         let stacks = 2 + i; // a little variety left vs right
