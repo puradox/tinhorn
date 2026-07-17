@@ -19,6 +19,7 @@ use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::window::{ExitCondition, WindowPlugin};
 use bevy_ratatui::event::KeyMessage;
 use bevy_ratatui::{RatatuiContext, RatatuiPlugins};
 use ratatui::buffer::Buffer;
@@ -51,10 +52,17 @@ pub fn run(expr: String, seed: Option<u64>) {
 
     App::new()
         .add_plugins((
-            // With window/winit/log features off, DefaultPlugins is already a
-            // headless PBR stack and supplies a ScheduleRunnerPlugin; we only
-            // retime it to ~60 fps and add the terminal context.
-            DefaultPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0))),
+            // `bevy_window` is pulled in transitively by the render features, so
+            // DefaultPlugins carries a WindowPlugin (and, without winit, no loop
+            // driver). Render headless — no primary window, and don't exit just
+            // because there are none — and drive the update loop ourselves at
+            // ~60 fps via a separately-added ScheduleRunnerPlugin.
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: None,
+                exit_condition: ExitCondition::DontExit,
+                ..default()
+            }),
+            ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
             RatatuiPlugins::default(),
         ))
         .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
@@ -145,7 +153,9 @@ fn setup(
     ));
 
     // 3. Read the render target back to the CPU every frame (Bevy 0.19 built-in).
-    commands.spawn(Readback::texture(handle)).observe(on_readback);
+    commands
+        .spawn(Readback::texture(handle))
+        .observe(on_readback);
 
     // 4. Warm key light with shadow maps (the payoff over the old baked contact
     //    shadows), a cool rim, and a little fill (ambient sits on the camera).
@@ -201,9 +211,7 @@ fn setup(
             MeshMaterial3d(material),
             Transform::from_xyz(x, -physics::HY + physics::DIE_R, z)
                 .with_scale(Vec3::splat(physics::DIE_R))
-                .with_rotation(
-                    Quat::from_rotation_y(i as f32 * 0.7) * Quat::from_rotation_x(0.4),
-                ),
+                .with_rotation(Quat::from_rotation_y(i as f32 * 0.7) * Quat::from_rotation_x(0.4)),
         ));
     }
 }
@@ -250,8 +258,10 @@ fn blit_half_blocks(pixels: &[u8], iw: u32, ih: u32, buf: &mut Buffer, area: Rec
     for row in 0..area.height {
         for col in 0..area.width {
             let ix = ((col as f32 + 0.5) / area.width as f32 * iw as f32) as u32;
-            let iy_upper = ((row as f32 * 2.0 + 0.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
-            let iy_lower = ((row as f32 * 2.0 + 1.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
+            let iy_upper =
+                ((row as f32 * 2.0 + 0.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
+            let iy_lower =
+                ((row as f32 * 2.0 + 1.5) / (area.height as f32 * 2.0) * ih as f32) as u32;
             let up = sample(ix, iy_upper);
             let lo = sample(ix, iy_lower);
             let cell = &mut buf[(area.x + col, area.y + row)];
