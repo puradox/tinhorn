@@ -55,6 +55,12 @@ pub struct Cli {
     /// Start the interactive mode muted (Ctrl-Q toggles sound at runtime).
     #[arg(long)]
     pub mute: bool,
+
+    /// Render the interactive arena with the experimental Bevy backend (Stage-2
+    /// spike). Needs a build with `--features bevy`; ignored in one-shot mode.
+    /// `TINHORN_BEVY=1` does the same. Hidden while the old renderer is default.
+    #[arg(long, hide = true)]
+    pub bevy: bool,
 }
 
 impl Cli {

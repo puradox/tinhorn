@@ -25,6 +25,12 @@ mod render3d;
 mod render3d_view;
 mod ui;
 
+// The experimental Bevy arena (Stage-2 spike). Compiled only under `--features
+// bevy`, so a default build/`cargo install` never links Bevy and this module —
+// and the whole engine — is absent from the shipped binary.
+#[cfg(feature = "bevy")]
+mod scene;
+
 use std::io::{self, IsTerminal};
 use std::time::{Duration, Instant};
 
@@ -63,6 +69,22 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
         return cli::run_one_shot(&cli, &expr);
+    }
+
+    // Experimental Bevy arena, opt-in via `--bevy` or `TINHORN_BEVY=1`. Reached
+    // only in interactive mode — placed *after* the one-shot short-circuit above,
+    // so scripting and pipes never construct a Bevy `App` or touch a GPU.
+    if cli.bevy || std::env::var_os("TINHORN_BEVY").is_some() {
+        #[cfg(feature = "bevy")]
+        {
+            scene::run(expr, cli.seed);
+            return Ok(());
+        }
+        #[cfg(not(feature = "bevy"))]
+        {
+            eprintln!("tinhorn: --bevy needs a build with `--features bevy`");
+            std::process::exit(2);
+        }
     }
 
     // Interactive: launch the animated TUI. The dice are audible unless muted
