@@ -516,13 +516,111 @@ pub(crate) fn number_scale(die_w: f32, die_h: f32, n_digits: i32) -> i32 {
     scale
 }
 
-/// Draw one die's number into the arena at the frame's shared `scale` — computed
-/// once for the whole roll so every die reads the same, never a mix of a big
-/// number on the nearest die and single cells on the rest. Scale 0 is the crisp
-/// single-cell overlay (small dice, or the whole roll on a narrow terminal); ≥1
-/// renders the digits as an outlined [`DIGIT_FONT`] glyph sitting on the
-/// read-face. Both ride the read-face and share [`face_ink`], so colour, the
-/// airborne duck-out, and the settle burn behave identically at every size.
+/// One die's number, resolved to everything the two render paths need to place a
+/// digit — computed once by [`plan_die_number`] so the cell overlay and the kitty
+/// pixel burn can never disagree. `center` is in arena *cell* coordinates (`0..cols`
+/// wide, `0..rows` tall — the arena's inner origin is NOT folded in, so both the
+/// cell painter and the pixel rasteriser can place from it); `scale` is the shared
+/// [`number_scale`] size (0 = the crisp single-cell overlay, ≥1 = the block glyph);
+/// `ink`/`mods` come from [`face_ink`] (the airborne dim decoy, the settled burn);
+/// `outline` is the die-tinted glyph surround; `plate` the dark inset the scale-0
+/// overlay sits on.
+pub(crate) struct NumberBurn {
+    pub(crate) label: String,
+    pub(crate) center: (f32, f32),
+    pub(crate) scale: i32,
+    pub(crate) ink: Color,
+    pub(crate) mods: Modifier,
+    pub(crate) outline: Color,
+    pub(crate) plate: Color,
+}
+
+/// Resolve one die's number for the frame's shared `scale` (computed once for the
+/// whole roll so every die reads the same size). Carries the front half of the
+/// overlay — [`read_face`] → [`face_ink`] (the decoy/settle/duck-out rules) → the
+/// anchor projected through [`project_to_cell`] — so both render paths share it
+/// verbatim. `None` when the number ducks out (edge-on) or projects behind the eye.
+/// Scale 0 anchors on the read-face centroid (a small label rides the top face);
+/// ≥1 anchors on the die centre (from the near-overhead read the silhouette *is*
+/// the top face, so centring keeps the digits contained rather than sliding off a
+/// small top facet on a d20).
+pub(crate) fn plan_die_number(
+    camera: &tinhorn_core::view_math::Camera,
+    die: &Die,
+    cols: f32,
+    rows: f32,
+    scale: i32,
+) -> Option<NumberBurn> {
+    use tinhorn_core::view_math::project_to_cell;
+    let to_cam = (camera.position - die.pos).normalize_or_zero();
+    let (read_centroid, clarity) = read_face(
+        tinhorn_core::dice_geom::face_geometry(die.sides),
+        die.rot,
+        to_cam,
+    );
+    let (ink, mods) = face_ink(die, clarity)?;
+    let label = die.shown.to_string();
+
+    let center = if scale < 1 {
+        let anchor = die.pos + die.rot * (read_centroid * crate::physics::DIE_R);
+        project_to_cell(camera, anchor, cols, rows)?
+    } else {
+        project_to_cell(camera, die.pos, cols, rows)?
+    };
+
+    // Outline the number in a dark tint of *this die's* colour rather than a
+    // generic black, so on a small die (where the digits cover most of it) the
+    // number's surround still carries the die's hue — that's how you read which
+    // number belongs to which die when the die itself is mostly hidden.
+    let base = if die.kept {
+        die_rgb(die.color_idx)
+    } else {
+        Rgb(120, 120, 120)
+    };
+    let outline = Color::Rgb(
+        (base.0 as f32 * 0.42) as u8,
+        (base.1 as f32 * 0.42) as u8,
+        (base.2 as f32 * 0.42) as u8,
+    );
+
+    Some(NumberBurn {
+        label,
+        center,
+        scale,
+        ink,
+        mods,
+        outline,
+        plate: NUMBER_PLATE,
+    })
+}
+
+/// Paint a resolved [`NumberBurn`] into the ratatui buffer (the half-block cell
+/// path). Scale 0 is the crisp single centred cell per digit on a dark plate; ≥1
+/// composites the outlined [`DIGIT_FONT`] glyph as `▀` half-blocks. `center` is
+/// arena-local, so the inner origin is added here.
+fn paint_die_number(frame: &mut Frame, inner: Rect, burn: &NumberBurn) {
+    let (cx, cy) = burn.center;
+    if burn.scale < 1 {
+        let label = &burn.label;
+        let style = Style::default()
+            .bg(burn.plate)
+            .fg(burn.ink)
+            .add_modifier(burn.mods);
+        let x = (inner.x as f32 + cx - label.len() as f32 / 2.0).round() as i32;
+        let y = (inner.y as f32 + cy).round() as i32;
+        let max_x = (inner.right() as i32 - label.len() as i32).max(inner.x as i32);
+        let x = x.clamp(inner.x as i32, max_x) as u16;
+        let y = y.clamp(inner.y as i32, inner.bottom() as i32 - 1) as u16;
+        frame.buffer_mut().set_string(x, y, label, style);
+    } else {
+        let center = (inner.x as f32 + cx, inner.y as f32 + cy);
+        draw_big_number(frame, inner, center, &burn.label, burn.scale, burn.ink, burn.outline);
+    }
+}
+
+/// Plan and paint one die's number into the arena (the cell path). Splitting plan
+/// from paint lets the kitty path collect the plans and burn them into pixels
+/// instead ([`plan_die_number`] + `burn_numbers`), sharing every placement rule.
 fn draw_die_number(
     frame: &mut Frame,
     inner: Rect,
@@ -532,57 +630,86 @@ fn draw_die_number(
     rows: f32,
     scale: i32,
 ) {
-    let to_cam = (camera.position - die.pos).normalize_or_zero();
-    let (read_centroid, clarity) = read_face(
-        tinhorn_core::dice_geom::face_geometry(die.sides),
-        die.rot,
-        to_cam,
-    );
-    let Some((ink, mods)) = face_ink(die, clarity) else {
-        return;
-    };
-    let label = die.shown.to_string();
+    if let Some(burn) = plan_die_number(camera, die, cols, rows, scale) {
+        paint_die_number(frame, inner, &burn);
+    }
+}
 
-    if scale < 1 {
-        // The crisp overlay: one centred cell per digit on a dark plate, sitting on
-        // the read-face (a small label rides the top face nicely).
-        let anchor = die.pos + die.rot * (read_centroid * crate::physics::DIE_R);
-        let Some((cx, cy)) = tinhorn_core::view_math::project_to_cell(camera, anchor, cols, rows)
-        else {
-            return;
-        };
-        let style = Style::default().bg(NUMBER_PLATE).fg(ink).add_modifier(mods);
-        let x = (inner.x as f32 + cx - label.len() as f32 / 2.0).round() as i32;
-        let y = (inner.y as f32 + cy).round() as i32;
-        let max_x = (inner.right() as i32 - label.len() as i32).max(inner.x as i32);
-        let x = x.clamp(inner.x as i32, max_x) as u16;
-        let y = y.clamp(inner.y as i32, inner.bottom() as i32 - 1) as u16;
-        frame.buffer_mut().set_string(x, y, &label, style);
-    } else {
-        // The block number centres on the die itself (not the read-face centroid):
-        // from the near-overhead read the die's silhouette *is* its top face, and
-        // centring keeps the digits contained on it rather than sliding off toward
-        // a small top facet on a d20.
-        let Some((cx, cy)) = tinhorn_core::view_math::project_to_cell(camera, die.pos, cols, rows)
-        else {
-            return;
-        };
-        let center = (inner.x as f32 + cx, inner.y as f32 + cy);
-        // Outline the number in a dark tint of *this die's* colour rather than a
-        // generic black, so on a small die (where the digits cover most of it) the
-        // number's surround still carries the die's hue — that's how you read which
-        // number belongs to which die when the die itself is mostly hidden.
-        let base = if die.kept {
-            die_rgb(die.color_idx)
+/// One glyph sub-pixel's role in a number raster: a lit font stroke, its dark
+/// outline dilation, or clear (the die shows through). Shared by the two render
+/// paths — the cell path composites it into `▀` half-blocks ([`draw_big_number`]),
+/// the kitty path fills image rects from it (`burn_numbers`).
+#[derive(PartialEq)]
+pub(crate) enum GlyphPx {
+    Ink,
+    Outline,
+    Clear,
+}
+
+/// The rasteriser for a number `label` at `scale`, resolving each sub-pixel of the
+/// [`DIGIT_FONT`] to a [`GlyphPx`]. THE single source of the digit shapes: both
+/// render paths ask it the same question ([`GlyphRaster::px`]) so a cell glyph and
+/// a burned-in pixel glyph can never differ. The glyph box is
+/// [`width_sub`](Self::width_sub)×[`height_sub`](Self::height_sub) sub-pixels; a
+/// half-block cell packs two sub-rows.
+pub(crate) struct GlyphRaster {
+    digits: Vec<u8>,
+    scale: i32,
+    gw: i32,    // glyph-box width in sub-pixels: n digits × 3 + (n−1) gaps, scaled
+    h_sub: i32, // glyph-box height in sub-pixels
+}
+
+impl GlyphRaster {
+    pub(crate) fn new(label: &str, scale: i32) -> Self {
+        let digits: Vec<u8> = label.bytes().filter(u8::is_ascii_digit).collect();
+        let n = digits.len() as i32;
+        Self {
+            digits,
+            scale,
+            gw: (4 * n - 1) * scale,
+            h_sub: 5 * scale,
+        }
+    }
+
+    /// Glyph-box width in sub-pixels (negative when the label had no digits).
+    pub(crate) fn width_sub(&self) -> i32 {
+        self.gw
+    }
+
+    /// Glyph-box height in sub-pixels.
+    pub(crate) fn height_sub(&self) -> i32 {
+        self.h_sub
+    }
+
+    /// Is sub-pixel `(x cell column, sub row)` a lit font stroke? Off outside the
+    /// grid and in the one-column gap between digits.
+    fn lit(&self, x: i32, sub: i32) -> bool {
+        if x < 0 || sub < 0 || x >= self.gw || sub >= self.h_sub {
+            return false;
+        }
+        let n = self.digits.len() as i32;
+        let span = 4 * self.scale; // 3 glyph columns + 1 gap, scaled
+        let di = x / span;
+        let local_x = x - di * span;
+        if di >= n || local_x >= 3 * self.scale {
+            return false;
+        }
+        let (fx, fy) = ((local_x / self.scale) as usize, (sub / self.scale) as usize);
+        (DIGIT_FONT[(self.digits[di as usize] - b'0') as usize][fy] >> (2 - fx)) & 1 == 1
+    }
+
+    /// Classify sub-pixel `(x, sub)`. The outline is a *tight* one-sub-pixel
+    /// dilation of the strokes on every side — enough to separate the number from
+    /// any die colour, but thin so the die still shows around and between the digits
+    /// (that colour is how you tell dice apart), not a solid tile blotting it out.
+    pub(crate) fn px(&self, x: i32, sub: i32) -> GlyphPx {
+        if self.lit(x, sub) {
+            GlyphPx::Ink
+        } else if (-1..=1).any(|dx| (-1..=1).any(|ds| self.lit(x + dx, sub + ds))) {
+            GlyphPx::Outline
         } else {
-            Rgb(120, 120, 120)
-        };
-        let outline = Color::Rgb(
-            (base.0 as f32 * 0.42) as u8,
-            (base.1 as f32 * 0.42) as u8,
-            (base.2 as f32 * 0.42) as u8,
-        );
-        draw_big_number(frame, inner, center, &label, scale, ink, outline);
+            GlyphPx::Clear
+        }
     }
 }
 
@@ -592,9 +719,9 @@ fn draw_die_number(
 /// stroke gets the `outline` colour (a dark tint of the die, so the number stays
 /// tied to its die), and everything else is left transparent — so the die shows
 /// through and the number reads as ink *on the face* rather than a plate covering
-/// it. Compositing is per sub-pixel: a cell becomes `▀` with its upper and lower
-/// halves coloured independently (ink, outline, or the die pixel already in the
-/// buffer). Cells outside `area` clip cleanly.
+/// it. Compositing is per sub-pixel via [`GlyphRaster`]: a cell becomes `▀` with
+/// its upper and lower halves coloured independently (ink, outline, or the die
+/// pixel already in the buffer). Cells outside `area` clip cleanly.
 fn draw_big_number(
     frame: &mut Frame,
     area: Rect,
@@ -605,49 +732,12 @@ fn draw_big_number(
     outline: Color,
 ) {
     let (cx, cy) = center;
-    let digits: Vec<u8> = label.bytes().filter(u8::is_ascii_digit).collect();
-    let n = digits.len() as i32;
-    if n == 0 {
-        return;
+    let raster = GlyphRaster::new(label, scale);
+    let (gw, h_sub) = (raster.width_sub(), raster.height_sub());
+    if gw <= 0 {
+        return; // no digits in the label
     }
-    let gw = (4 * n - 1) * scale; // cells wide: n digits × 3 + (n−1) gaps, scaled
-    let h_sub = 5 * scale; // half-block sub-rows tall
     let gh = (h_sub + 1) / 2; // cells tall (two sub-rows per cell, last may be half)
-    // Is glyph sub-pixel `(x cell, sub row)` a lit font pixel? Off outside the grid
-    // and in the one-column gap between digits.
-    let lit = |x: i32, sub: i32| -> bool {
-        if x < 0 || sub < 0 || x >= gw || sub >= h_sub {
-            return false;
-        }
-        let span = 4 * scale; // 3 glyph columns + 1 gap, scaled
-        let di = x / span;
-        let local_x = x - di * span;
-        if di >= n || local_x >= 3 * scale {
-            return false;
-        }
-        let (fx, fy) = ((local_x / scale) as usize, (sub / scale) as usize);
-        (DIGIT_FONT[(digits[di as usize] - b'0') as usize][fy] >> (2 - fx)) & 1 == 1
-    };
-    // Each sub-pixel: a lit stroke, its dark outline, or clear. The outline is a
-    // *tight* one-sub-pixel dilation of the strokes on every side — enough to
-    // separate the number from any die colour, but thin so the die still shows
-    // around and between the digits (that colour is how you tell dice apart), not
-    // a solid tile blotting the die out.
-    #[derive(PartialEq)]
-    enum Px {
-        Ink,
-        Outline,
-        Clear,
-    }
-    let sub = |x: i32, s: i32| -> Px {
-        if lit(x, s) {
-            Px::Ink
-        } else if (-1..=1).any(|dx| (-1..=1).any(|ds| lit(x + dx, s + ds))) {
-            Px::Outline
-        } else {
-            Px::Clear
-        }
-    };
 
     let x0 = (cx - gw as f32 / 2.0).round() as i32;
     let y0 = (cy - gh as f32 / 2.0).round() as i32;
@@ -666,18 +756,18 @@ fn draw_big_number(
             {
                 continue;
             }
-            let (up, lo) = (sub(col, 2 * row), sub(col, 2 * row + 1));
-            if up == Px::Clear && lo == Px::Clear {
+            let (up, lo) = (raster.px(col, 2 * row), raster.px(col, 2 * row + 1));
+            if up == GlyphPx::Clear && lo == GlyphPx::Clear {
                 continue; // leave the die pixel untouched — the number isn't here
             }
             let cell = &mut buf[(x as u16, y as u16)];
             // The die's own sub-pixels are already in the buffer: a HalfBlock `▀`
             // cell holds fg = upper pixel, bg = lower pixel. Clear keeps them.
             let (die_up, die_lo) = (cell.fg, cell.bg);
-            let paint = |p: &Px, die: Color| match p {
-                Px::Ink => ink,
-                Px::Outline => outline,
-                Px::Clear => die,
+            let paint = |p: &GlyphPx, die: Color| match p {
+                GlyphPx::Ink => ink,
+                GlyphPx::Outline => outline,
+                GlyphPx::Clear => die,
             };
             cell.set_char('▀');
             cell.set_style(
@@ -847,6 +937,17 @@ pub fn render_bevy(
 /// half-block grid and box-downsampled in the blit, for cheap anti-aliasing.
 const ARENA_SS: u32 = 2;
 
+/// The warm radial vignette applied to the arena: darkens toward the corners and
+/// warms the tint a touch (a whisper more red, a whisper less blue). Returns the
+/// per-channel multipliers `(fr, fg, fb)` for a normalised offset-from-centre
+/// `(nx, ny)` in `[-0.5, 0.5]`. Shared by the half-block blit and the kitty pixel
+/// pack (`graphics::pack_rgb`) so both paths grade the picture identically.
+pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
+    let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
+    let f = 1.0 - 0.34 * d2 * d2;
+    (f * 1.04, f, f * 0.95)
+}
+
 /// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg =
 /// upper pixel, bg = lower). The render is supersampled — `img_w`/`img_h` are
 /// `ARENA_SS×` the `inner.width`/`inner.height*2` grid — so each output subpixel
@@ -884,9 +985,7 @@ fn blit_bevy_arena(
     };
     let (fw, fh) = (inner.width as f32, inner.height as f32 * 2.0);
     let graded = |c: (u8, u8, u8), nx: f32, ny: f32| -> Color {
-        let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
-        let f = 1.0 - 0.34 * d2 * d2;
-        let (fr, fg, fb) = (f * 1.04, f, f * 0.95);
+        let (fr, fg, fb) = vignette(nx, ny);
         Color::Rgb(
             (c.0 as f32 * fr).min(255.0) as u8,
             (c.1 as f32 * fg).min(255.0) as u8,
