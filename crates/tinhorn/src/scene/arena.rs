@@ -242,14 +242,22 @@ pub fn spawn(
         Transform::from_xyz(0.0, rug_y - 0.12, -8.0),
     ));
 
-    // --- Emissive gradient backdrop: warm at the floor seam → dim ceiling. Big
-    // enough to fill the flight framing so a rolling die isn't tumbling in a
-    // black void; unlit so it glows regardless of the key light's reach. ---
-    let seam = OAK; // warm lit-floor tone at the horizon seam
-    let ceiling = Rgb(46, 32, 26); // dim warm ceiling (not black, so the room reads)
-    let grad = images.add(vertical_gradient(seam, ceiling, 96));
+    // --- Textured room back wall: the software renderer's baked backdrop (a warm
+    // vertical gradient — bright at the floor seam → dim ceiling — with a
+    // wainscot/chair-rail band and a panelled tone below it). Big enough to fill
+    // the flight framing so a rolling die isn't tumbling in a black void; unlit so
+    // it glows regardless of the key light's reach. Tiled a couple of times across
+    // so the wainscot panels read at a sensible width on the wide wall. ---
+    let mut wall_img = repeat(tex_image(&crate::ui::backdrop_texture()));
+    wall_img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::ClampToEdge, // keep the gradient/wainscot vertical layout
+        ..default()
+    });
     let backdrop = materials.add(StandardMaterial {
-        base_color_texture: Some(grad),
+        base_color: Color::WHITE,
+        base_color_texture: Some(images.add(wall_img)),
+        uv_transform: Affine2::from_scale(Vec2::new(4.0, 1.0)),
         unlit: true,
         ..default()
     });
@@ -265,12 +273,13 @@ pub fn spawn(
     let velvet = images.add(tex_image(&crate::ui::velvet_texture(CURTAIN)));
     let curtain = textured(materials, velvet, 0.92);
     // Close in and tall/wide, so the drapes fill the sides of the frame from the
-    // floor to above the top — a proscenium framing the tray, not thin far strips.
+    // floor to above the top — a proscenium framing the tray. Extended well past
+    // the frame edge in x so the outer end never shows.
     for side in [-1.0f32, 1.0] {
         commands.spawn((
-            Mesh3d(meshes.add(curtain_mesh(7.0, 30.0, 7))),
+            Mesh3d(meshes.add(curtain_mesh(16.0, 30.0, 14))),
             MeshMaterial3d(curtain.clone()),
-            Transform::from_xyz(side * 6.2, rug_y + 13.0, -6.0),
+            Transform::from_xyz(side * 10.5, rug_y + 13.0, -6.0),
         ));
     }
 
@@ -369,29 +378,4 @@ fn curtain_mesh(w: f32, h: f32, folds: u32) -> Mesh {
 fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     Rgb(l(a.0, b.0), l(a.1, b.1), l(a.2, b.2))
-}
-
-/// A `2×h` sRGB image running `bottom` (row h-1) → `top` (row 0), for the
-/// backdrop's warm-seam-to-dark-ceiling gradient.
-fn vertical_gradient(bottom: Rgb, top: Rgb, h: u32) -> Image {
-    let w = 2u32;
-    let mut data = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        let t = y as f32 / (h - 1) as f32; // 0 at the top row → 1 at the bottom
-        let c = lerp_rgb(top, bottom, t);
-        for _ in 0..w {
-            data.extend_from_slice(&[c.0, c.1, c.2, 255]);
-        }
-    }
-    Image::new(
-        Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    )
 }

@@ -296,7 +296,7 @@ pub(crate) fn floor_texture(base: Rgb) -> std::sync::Arc<crate::render3d::textur
 /// floor of signage and lights, impressionistic rather than a hard row of
 /// machines. Emissive; the 3D bokeh add nearer, crisper glows in front. Cached
 /// once; it never changes.
-fn backdrop_texture() -> std::sync::Arc<crate::render3d::texture::Texture> {
+pub(crate) fn backdrop_texture() -> std::sync::Arc<crate::render3d::texture::Texture> {
     use crate::render3d::texture::Texture;
     use std::sync::{Arc, OnceLock};
     static CACHE: OnceLock<Arc<Texture>> = OnceLock::new();
