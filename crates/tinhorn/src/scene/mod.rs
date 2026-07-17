@@ -392,9 +392,12 @@ fn sync_dice_scene(
             continue;
         }
         let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(die.sides)));
+        // Glossy resin: a low roughness + lifted reflectance so each die catches a
+        // crisp specular highlight from the warm key, reading as moulded plastic.
         let material = materials.add(StandardMaterial {
             base_color: die_color(die),
-            perceptual_roughness: 0.28,
+            perceptual_roughness: 0.22,
+            reflectance: 0.6,
             ..default()
         });
         commands.spawn((

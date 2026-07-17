@@ -321,7 +321,8 @@ fn chip_color(materials: &mut Assets<StandardMaterial>, idx: usize) -> Handle<St
     ][idx % 4];
     materials.add(StandardMaterial {
         base_color: col(c),
-        perceptual_roughness: 0.5,
+        perceptual_roughness: 0.42,
+        reflectance: 0.55,
         ..default()
     })
 }
