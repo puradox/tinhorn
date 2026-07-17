@@ -6,9 +6,11 @@
 //! shadow maps replace the old baked contact shadows.
 
 use bevy::asset::RenderAssetUsages;
-use bevy::image::Image;
+use bevy::image::{Image, ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::math::Affine2;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::mesh::Indices;
+use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
 
 use crate::render3d::color::Rgb;
 use crate::ui::ArenaStyle;
@@ -91,55 +93,80 @@ pub fn spawn(
         Transform::from_xyz(0.0, FELT_TOP - 0.125, 0.0),
     ));
 
-    // --- Mahogany tray walls (back + two sides; front open) with wood rails. ---
-    let wall = matte(materials, style.wall, 0.8);
-    let rail = matte(materials, RAIL, 0.6);
+    // --- Mahogany tray walls (back + two sides; front open). Real wood grain
+    //     (not a flat single tone) on the body, plus a distinctly lighter, fatter
+    //     top rail proud of the wall and a lit inner face flaring up from the felt
+    //     edge — so a wall reads as a solid framed lip, not a coloured slab. ---
+    let wall = textured(
+        materials,
+        images.add(tex_image(&crate::ui::grain_texture(style.wall))),
+        0.75,
+    );
+    let rail = textured(
+        materials,
+        images.add(tex_image(&crate::ui::grain_texture(RAIL))),
+        0.5,
+    );
+    let inner = matte(materials, lerp_rgb(style.wall, RAIL, 0.4), 0.7);
     let wall_y = FELT_TOP + lip * 0.5;
-    let rail_y = FELT_TOP + lip + 0.04;
-    let spans: [(Vec3, Vec3); 3] = [
-        // back wall (spans the full width incl. the corners)
+    let rail_y = FELT_TOP + lip + 0.05;
+    let spans: [(Vec3, Vec3, Vec3); 3] = [
+        // (centre, size, inward-face offset toward the felt)
         (
             Vec3::new(0.0, wall_y, -HZ - WALL_T * 0.5),
             Vec3::new(HX * 2.0 + WALL_T * 2.0, lip, WALL_T),
+            Vec3::new(0.0, 0.0, WALL_T * 0.5),
         ),
-        // left wall
         (
             Vec3::new(-HX - WALL_T * 0.5, wall_y, 0.0),
             Vec3::new(WALL_T, lip, HZ * 2.0),
+            Vec3::new(WALL_T * 0.5, 0.0, 0.0),
         ),
-        // right wall
         (
             Vec3::new(HX + WALL_T * 0.5, wall_y, 0.0),
             Vec3::new(WALL_T, lip, HZ * 2.0),
+            Vec3::new(-WALL_T * 0.5, 0.0, 0.0),
         ),
     ];
-    for (pos, size) in spans {
+    for (pos, size, inface) in spans {
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(wall.clone()),
             Transform::from_translation(pos),
         ));
-        // A lighter rail sitting proud on the wall's top.
+        // A lit inner face flaring up from the felt edge (catches the key light).
+        let inner_size = if size.x > size.z {
+            Vec3::new(size.x - WALL_T, lip * 0.9, 0.06)
+        } else {
+            Vec3::new(0.06, lip * 0.9, size.z - WALL_T)
+        };
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(size.x + 0.06, 0.12, size.z + 0.06))),
+            Mesh3d(meshes.add(Cuboid::new(inner_size.x, inner_size.y, inner_size.z))),
+            MeshMaterial3d(inner.clone()),
+            Transform::from_translation(pos + inface),
+        ));
+        // A fat, lighter rail sitting proud on the wall's top.
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size.x + 0.12, 0.2, size.z + 0.12))),
             MeshMaterial3d(rail.clone()),
             Transform::from_xyz(pos.x, rail_y, pos.z),
         ));
     }
 
-    // --- Wood table the tray rests on: a slab with a visible apron. ---
-    let table_top = FELT_TOP - 0.25;
-    let table = matte(materials, TABLE, 0.7);
+    // --- Wood table the tray rests on: a slab with a visible apron, extended
+    //     forward and down so its front reads below the tray's open front. ---
+    let table_top = FELT_TOP - 0.2;
+    let table = matte(materials, TABLE, 0.65);
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(HX * 2.0 + 1.6, 0.35, HZ * 2.0 + 1.6))),
+        Mesh3d(meshes.add(Cuboid::new(HX * 2.0 + 2.6, 0.4, HZ * 2.0 + 2.6))),
         MeshMaterial3d(table),
-        Transform::from_xyz(0.0, table_top - 0.175, 0.2),
+        Transform::from_xyz(0.0, table_top - 0.2, 0.7),
     ));
-    let apron = matte(materials, APRON, 0.75);
+    let apron = matte(materials, APRON, 0.7);
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(HX * 2.0 + 1.6, 0.7, HZ * 2.0 + 1.6))),
+        Mesh3d(meshes.add(Cuboid::new(HX * 2.0 + 2.6, 1.0, HZ * 2.0 + 2.6))),
         MeshMaterial3d(apron),
-        Transform::from_xyz(0.0, table_top - 0.35 - 0.35, 0.2),
+        Transform::from_xyz(0.0, table_top - 0.9, 0.7),
     ));
 
     // --- Dark-red casino rug: an oxblood border band under a crimson field. ---
@@ -157,18 +184,28 @@ pub fn spawn(
 
     // --- Broad room floor of oak floorboards, well below the rug. Unlit (like
     //     the software floor's pure-ambient treatment) so it stays a genuinely
-    //     bright oak at every angle instead of falling dark when ambient is low. ---
-    let floor_tex = images.add(tex_image(&crate::ui::floor_texture(OAK)));
+    //     bright oak at every angle. The plank texture is *tiled* (narrow planks
+    //     running front-to-back) with a repeat sampler + a UV scale — not
+    //     stretched once across the whole floor, which made each plank huge. ---
+    let mut floor_img = tex_image(&crate::ui::floor_texture(OAK));
+    floor_img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    let floor_tex = images.add(floor_img);
     let floor = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(floor_tex),
+        // More repeats across (narrow planks) than along (long boards front-to-back).
+        uv_transform: Affine2::from_scale(Vec2::new(16.0, 5.0)),
         unlit: true,
         ..default()
     });
     commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(46.0, 0.1, 46.0))),
+        Mesh3d(meshes.add(Cuboid::new(64.0, 0.1, 64.0))),
         MeshMaterial3d(floor),
-        Transform::from_xyz(0.0, rug_y - 0.12, -4.0),
+        Transform::from_xyz(0.0, rug_y - 0.12, -8.0),
     ));
 
     // --- Emissive gradient backdrop: warm at the floor seam → dim ceiling. Big
@@ -183,19 +220,21 @@ pub fn spawn(
         ..default()
     });
     commands.spawn((
-        Mesh3d(meshes.add(Rectangle::new(70.0, 34.0))),
+        Mesh3d(meshes.add(Rectangle::new(100.0, 42.0))),
         MeshMaterial3d(backdrop),
-        Transform::from_xyz(0.0, rug_y + 13.0, -13.0),
+        Transform::from_xyz(0.0, rug_y + 16.0, -18.0),
     ));
 
-    // --- Heavy oxblood stage curtains flanking the backdrop (velvet streak). ---
+    // --- Heavy oxblood stage curtains flanking the backdrop: real corrugated
+    //     fold geometry (the key/rim light shades the folds), hanging free from
+    //     the floor to well above the frame with a velvet streak texture. ---
     let velvet = images.add(tex_image(&crate::ui::velvet_texture(CURTAIN)));
-    let curtain = textured(materials, velvet, 0.9);
+    let curtain = textured(materials, velvet, 0.92);
     for side in [-1.0f32, 1.0] {
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(3.2, 12.0, 0.4))),
+            Mesh3d(meshes.add(curtain_mesh(5.5, 20.0, 6))),
             MeshMaterial3d(curtain.clone()),
-            Transform::from_xyz(side * 7.5, rug_y + 6.0, -9.5),
+            Transform::from_xyz(side * 7.0, rug_y + 9.0, -11.0),
         ));
     }
 
@@ -240,6 +279,54 @@ fn chip_color(materials: &mut Assets<StandardMaterial>, idx: usize) -> Handle<St
         perceptual_roughness: 0.5,
         ..default()
     })
+}
+
+/// A free-hanging stage-curtain panel: a `folds`-wave corrugated vertical sheet,
+/// `w` wide × `h` tall, facing +Z. Real fold geometry with flat-ish facet normals
+/// so the key/rim light genuinely shades the crests and valleys, rather than a
+/// flat slab. A whisker of outward relaxation toward the floor so it hangs free.
+fn curtain_mesh(w: f32, h: f32, folds: u32) -> Mesh {
+    let cols = folds * 6; // facets across the width
+    let rows = 10u32; // segments down the drop
+    let amp = 0.32; // fold depth (z)
+    let tau = std::f32::consts::TAU;
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for r in 0..=rows {
+        let v = r as f32 / rows as f32; // 0 top → 1 bottom
+        let y = (0.5 - v) * h;
+        let relax = 1.0 + v * 0.12; // fold amplitude relaxes a touch at the floor
+        for c in 0..=cols {
+            let u = c as f32 / cols as f32;
+            let x = (u - 0.5) * w;
+            let phase = u * folds as f32 * tau;
+            let z = phase.cos() * amp * relax;
+            positions.push([x, y, z]);
+            uvs.push([u, v]);
+            // Normal from the wave slope dz/dx, pointing toward +Z (the room).
+            let dz_dx = -phase.sin() * amp * relax * folds as f32 * tau / w;
+            let n = Vec3::new(-dz_dx, 0.0, 1.0).normalize();
+            normals.push([n.x, n.y, n.z]);
+        }
+    }
+    let stride = cols + 1;
+    for r in 0..rows {
+        for c in 0..cols {
+            let i = r * stride + c;
+            indices.extend_from_slice(&[i, i + stride, i + 1, i + 1, i + stride, i + stride + 1]);
+        }
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 /// Lerp two `render3d` colours in sRGB byte space.

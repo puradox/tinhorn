@@ -140,7 +140,7 @@ fn dquad(
 /// A procedural grain texture: `base` colour with a soft fibrous grain baked in
 /// (coarse blotches plus fine speckle), so a surface reads as fabric/painted
 /// rather than a flat plastic plane.
-fn grain_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
+pub(crate) fn grain_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture> {
     use crate::render3d::texture::Texture;
 
     static CACHE: TexCache = TexCache::new();
@@ -403,7 +403,7 @@ const PALETTE: [Rgb; 8] = [
 ];
 
 /// The render3d colour for die palette slot `idx`.
-fn die_rgb(idx: usize) -> Rgb {
+pub(crate) fn die_rgb(idx: usize) -> Rgb {
     PALETTE[idx % PALETTE.len()]
 }
 

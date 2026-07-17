@@ -33,7 +33,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyEventKind, KeyModifiers};
 use ratatui::style::Color as TColor;
 
-use tinhorn_core::app::{App as DiceApp, Die, SoundEvent, crit_face, fumble_face};
+use tinhorn_core::app::{App as DiceApp, Die, SoundEvent};
 use tinhorn_core::{dice_geom, physics, view_math};
 
 use crate::foley::Foley;
@@ -497,24 +497,17 @@ fn die_transform(die: &Die) -> Transform {
         .with_scale(Vec3::splat(physics::DIE_R))
 }
 
-/// Die colour: dropped dice grey out, a settled crit burns gold and a fumble red,
-/// otherwise a bone ivory faintly tinted per term so multiple terms read apart.
+/// Die colour: the SAME per-die palette (`ui::die_rgb`) the number overlay tints
+/// its outline with, so a die and its burned value read as the same colour and
+/// you can tell which number belongs to which die when several land at once.
+/// Dropped dice grey out; crit/fumble are signalled by the number's ink (gold /
+/// red), not the die, exactly as the software renderer does.
 fn die_color(die: &Die) -> Color {
     if !die.kept {
-        return Color::srgb(0.34, 0.34, 0.31);
+        return Color::srgb_u8(90, 90, 90);
     }
-    if die.settled && crit_face(die.sides, die.final_value) {
-        return Color::srgb(1.0, 0.84, 0.28);
-    }
-    if die.settled && fumble_face(die.sides, die.final_value) {
-        return Color::srgb(0.82, 0.22, 0.2);
-    }
-    let tints = [
-        Color::srgb(0.92, 0.90, 0.84),
-        Color::srgb(0.85, 0.89, 0.92),
-        Color::srgb(0.92, 0.87, 0.85),
-    ];
-    tints[die.color_idx % tints.len()]
+    let c = ui::die_rgb(die.color_idx);
+    Color::srgb_u8(c.0, c.1, c.2)
 }
 
 /// Render the full composed frame (arena + chrome) into a `TestBackend`, and once
