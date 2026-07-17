@@ -21,6 +21,9 @@ pub use tinhorn_core::{app, parse, physics};
 
 mod cli;
 mod foley;
+// The kitty graphics protocol arena (real pixels in kitty/Ghostty); the
+// half-block blit in `ui` stays the fallback everywhere else.
+mod graphics;
 mod paint;
 mod ui;
 
