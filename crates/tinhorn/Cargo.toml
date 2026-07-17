@@ -1,7 +1,7 @@
 [package]
 name = "tinhorn"
 version = "0.1.4"
-edition = "2021"
+edition = "2024"
 description = "A dice cup for your terminal: shake the cup, watch dice fly, hear them land."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/puradox/tinhorn"

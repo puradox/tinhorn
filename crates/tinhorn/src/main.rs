@@ -220,15 +220,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
         terminal.draw(|f| ui::render(f, app))?;
 
         // Wait for input, but never longer than our frame budget.
-        if event::poll(FRAME)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if handle_key(app, key.code, ctrl) == Action::Quit {
-                    break;
-                }
+        if event::poll(FRAME)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if handle_key(app, key.code, ctrl) == Action::Quit {
+                break;
             }
         }
 
@@ -267,8 +267,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()>
 mod tests {
     use super::*;
     use app::Pane;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// Feed a string of plain (non-ctrl) characters through the key handler.
     fn type_str(app: &mut App, s: &str) {
@@ -893,7 +893,7 @@ mod tests {
         use crate::render3d::math::{Quat, Vec3};
 
         let faces = dice::face_geometry(6); // a cube
-                                            // Face-on: the +Z face points straight at the eye and clearly leads.
+        // Face-on: the +Z face points straight at the eye and clearly leads.
         let (_c, face_on) = ui::read_face(faces, Quat::IDENTITY, Vec3::Z);
         assert!(
             face_on > 0.5,

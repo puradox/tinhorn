@@ -16,10 +16,10 @@
 use std::io::{self, Write};
 
 use clap::Parser;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-use crate::app::{evaluate, Outcome};
+use crate::app::{Outcome, evaluate};
 use crate::parse;
 
 /// A terminal dice roller you actually throw.
@@ -219,11 +219,13 @@ mod tests {
             let o = outcome("6d6!", seed);
             if o.terms[0].dice.iter().any(|d| d.exploded) {
                 // Every exploded die is kept (explosions always count).
-                assert!(o.terms[0]
-                    .dice
-                    .iter()
-                    .filter(|d| d.exploded)
-                    .all(|d| d.kept));
+                assert!(
+                    o.terms[0]
+                        .dice
+                        .iter()
+                        .filter(|d| d.exploded)
+                        .all(|d| d.kept)
+                );
                 return;
             }
         }

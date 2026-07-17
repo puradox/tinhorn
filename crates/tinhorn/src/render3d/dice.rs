@@ -14,7 +14,7 @@ use tinhorn_core::dice_geom;
 
 // The read-face geometry is pure glam data with no `render3d` types, so the
 // renderer and the number overlay use it straight from core.
-pub use tinhorn_core::dice_geom::{face_geometry, FaceGeom};
+pub use tinhorn_core::dice_geom::{FaceGeom, face_geometry};
 
 /// Copy a core geometry mesh into `render3d`'s `Mesh` (identical fields, distinct
 /// types — the crate boundary is the only reason for the copy).

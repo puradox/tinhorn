@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/tinhorn-core", "crates/tinhorn"]
 # The vendored Bevy glue crates are NOT workspace members: they're pulled in only
 # via the `tinhorn/bevy` feature (Stage-2 spike), so a default `cargo build` /

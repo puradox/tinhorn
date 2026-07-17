@@ -1,10 +1,10 @@
 //! All ratatui rendering lives here.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{App, Die, Pane, Particle, Stats};
 use crate::render3d::color::Rgb;
@@ -268,9 +268,9 @@ fn floor_texture(base: Rgb) -> std::sync::Arc<crate::render3d::texture::Texture>
             let fp = u * PLANKS;
             let idx = fp.floor();
             let frac = fp - idx; // position across this plank, 0..1
-                                 // Dark groove where planks butt: 0 at each seam, 1 across the board
-                                 // face. A wide-ish groove so the seam survives minification into the
-                                 // grazing distance instead of averaging away to a flat "blank" tone.
+            // Dark groove where planks butt: 0 at each seam, 1 across the board
+            // face. A wide-ish groove so the seam survives minification into the
+            // grazing distance instead of averaging away to a flat "blank" tone.
             let groove = smoothstep(0.0, 0.09, frac) * smoothstep(0.0, 0.09, 1.0 - frac);
             // Each plank a slightly different wood shade.
             let shade = 0.82
@@ -695,8 +695,8 @@ fn draw_big_number(
     let gw = (4 * n - 1) * scale; // cells wide: n digits × 3 + (n−1) gaps, scaled
     let h_sub = 5 * scale; // half-block sub-rows tall
     let gh = (h_sub + 1) / 2; // cells tall (two sub-rows per cell, last may be half)
-                              // Is glyph sub-pixel `(x cell, sub row)` a lit font pixel? Off outside the grid
-                              // and in the one-column gap between digits.
+    // Is glyph sub-pixel `(x cell, sub row)` a lit font pixel? Off outside the grid
+    // and in the one-column gap between digits.
     let lit = |x: i32, sub: i32| -> bool {
         if x < 0 || sub < 0 || x >= gw || sub >= h_sub {
             return false;
@@ -895,9 +895,9 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         const AMP: f32 = 0.28; // fold depth — and the edge scallop's amplitude
         let (y_top, y_bot, cz) = (2.6f32, -3.15f32, -5.0f32);
         let x_out = 13.8f32; // outer edge, well past the frame
-                             // The free-hanging inner edge: essentially straight down the drop, with
-                             // a whisker of spread at the floor and a gentle scallop at the fold
-                             // amplitude (no more — a deeper wobble stops reading as the same cloth).
+        // The free-hanging inner edge: essentially straight down the drop, with
+        // a whisker of spread at the floor and a gentle scallop at the fold
+        // amplitude (no more — a deeper wobble stops reading as the same cloth).
         let inner_x = |v: f32, edge_phase: f32| 6.15 - 0.2 * v + AMP * (v * 4.4 + edge_phase).sin();
         let mat = Material::default()
             .with_color(Rgb(104, 32, 33)) // the rug field's crimson, as cloth
@@ -961,9 +961,9 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         use crate::render3d::mesh::{Mesh, Vertex};
         let wall_h = style.lip_top; // the wall rises this high above the floor
         let flare = 0.12; // inner walls nearly vertical (a solid well, not a bowl)
-                          // The tray floor has real thickness down to the table: the walls' outer
-                          // faces and the open-front edge drop this far below the felt, so the felt
-                          // reads as a pad set into a solid tray rather than paint on the tabletop.
+        // The tray floor has real thickness down to the table: the walls' outer
+        // faces and the open-front edge drop this far below the felt, so the felt
+        // reads as a pad set into a solid tray rather than paint on the tabletop.
         let floor_thick = FLOOR_THICK;
 
         // Felt is matte — no plastic sheen — so the overhead light reads as a soft
@@ -1159,10 +1159,10 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         let y = -HY - 1.15; // sits below the table's apron, with daylight between
         let (x0, x1, z0, z1) = (-26.0, 26.0, -26.0, 9.0);
         let ts = 5.0; // board tile size in world units — ~1.25-unit-wide planks
-                      // Boards run front-to-back (seams at constant x, converging into the
-                      // distance). Unlike left-to-right boards — whose seams bunch and blur into
-                      // the shallow grazing band behind the tray — these stay separated across the
-                      // width, so the floor still reads as boards at a shallow angle, not "blank".
+        // Boards run front-to-back (seams at constant x, converging into the
+        // distance). Unlike left-to-right boards — whose seams bunch and blur into
+        // the shallow grazing band behind the tray — these stay separated across the
+        // width, so the floor still reads as boards at a shallow angle, not "blank".
         let uv = |x: f32, z: f32| (x / ts, z / ts);
         // A single quad, double-sided. Its near edge sits behind the camera, so its
         // triangles straddle the near plane — which used to make the rasterizer drop
@@ -1247,10 +1247,10 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         use crate::physics::{HY, HZ};
         let top = -HY - FLOOR_THICK; // the tray's wooden base sits flush on it
         let bot = top - 0.6; // apron depth — the thickness of the tabletop
-                             // The slab's depth follows the tray: the outer rail reaches ≈ HZ + 0.75
-                             // in z, and the chips sit just past the open front (≈ HZ + 1), so the
-                             // z extents keep a fixed apron margin beyond both rather than assuming
-                             // the tray's old depth. Width clears the rail + chips with room spare.
+        // The slab's depth follows the tray: the outer rail reaches ≈ HZ + 0.75
+        // in z, and the chips sit just past the open front (≈ HZ + 1), so the
+        // z extents keep a fixed apron margin beyond both rather than assuming
+        // the tray's old depth. Width clears the rail + chips with room spare.
         let (x0, x1, z0, z1) = (-5.4, 5.4, -(HZ + 1.7), HZ + 2.5); // clears tray, walls, chips
         let ts = 2.6;
         let uv = |a: f32, b: f32| (a / ts, b / ts);
@@ -1265,7 +1265,7 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
             .with_diffuse(0.6)
             .with_specular(0.0)
             .with_texture(grain_texture(Rgb(74, 54, 38))); // the table's edge, in shade
-                                                           // Top surface (front-facing from above).
+        // Top surface (front-facing from above).
         scene.add_object(
             SceneObject::new(dquad(
                 [
@@ -1326,9 +1326,9 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
         let seg = 12u32;
         let (r, ch) = (0.42, 0.09); // chip radius, height
         let table_y = -HY - FLOOR_THICK; // the tabletop the stacks rest on
-                                         // A cheap integer hash → u32, so stack heights and per-chip colour order
-                                         // are varied deterministically (no RNG). Different `k` picks different
-                                         // draws off the same stack index, so no two stacks share a tidy repeat.
+        // A cheap integer hash → u32, so stack heights and per-chip colour order
+        // are varied deterministically (no RNG). Different `k` picks different
+        // draws off the same stack index, so no two stacks share a tidy repeat.
         let chip_rnd = |si: u32, k: u32| {
             hash32(
                 si.wrapping_mul(0x9E37_79B1)
@@ -1508,8 +1508,8 @@ fn render_arena(frame: &mut Frame, app: &mut App, area: Rect) {
     if app.shaking() {
         let grip = 0.35 + 0.65 * app.power();
         let t = app.shake_t() * crate::app::CUP_SWAY_RATE; // the sway/rattle phase
-                                                           // The cup's normalised sway comes from the app — the same value the
-                                                           // throw aims away from — so the dice always fly from the drawn cup.
+        // The cup's normalised sway comes from the app — the same value the
+        // throw aims away from — so the dice always fly from the drawn cup.
         let sway = app.cup_offset() * crate::physics::HX * 0.6;
         let bob = (t * 2.0).sin().abs() * 0.09 * grip; // two hops per sway cycle
         let lean = t.cos() * 0.14 * grip; // sway velocity ∝ cos: lean into the swing
