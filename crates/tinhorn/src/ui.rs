@@ -23,7 +23,7 @@ impl ArenaStyle {
     pub(crate) const DEFAULT: ArenaStyle = ArenaStyle {
         floor: Rgb(22, 64, 42), // deep green baize
         wall: Rgb(66, 40, 28),  // dark warm mahogany
-        lip_top: 1.35,          // a low rail, room shows over it
+        lip_top: 0.85,          // a shallow tray lip — dice tray, not a deep box
     };
 }
 

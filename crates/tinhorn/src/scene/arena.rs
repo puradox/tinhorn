@@ -326,34 +326,56 @@ fn chip_color(materials: &mut Assets<StandardMaterial>, idx: usize) -> Handle<St
     })
 }
 
-/// A free-hanging stage-curtain panel: a `folds`-wave corrugated vertical sheet,
-/// `w` wide × `h` tall, facing +Z. Real fold geometry with flat-ish facet normals
-/// so the key/rim light genuinely shades the crests and valleys, rather than a
-/// flat slab. A whisker of outward relaxation toward the floor so it hangs free.
+/// A free-hanging stage-curtain panel: a heavy velvet drape `w` wide × `h` tall,
+/// facing +Z. A single clean cosine corrugation reads as a machined washboard, so
+/// the fold profile layers three *incommensurate* waves — the pleats never line
+/// up into a regular pattern, varying in width and depth like gathered fabric —
+/// and the amplitude swells toward the floor so the drape splays as it falls, with
+/// a gentle forward belly. Normals come from the profile's own slope (finite
+/// differences in both directions), so the key/rim light pools in the valleys and
+/// catches the crests instead of flat-shading a slab.
 fn curtain_mesh(w: f32, h: f32, folds: u32) -> Mesh {
-    let cols = folds * 6; // facets across the width
-    let rows = 10u32; // segments down the drop
-    let amp = 0.32; // fold depth (z)
+    let cols = folds * 8; // facets across the width — enough to round each pleat
+    let rows = 24u32; // segments down the drop, for a smooth swell
     let tau = std::f32::consts::TAU;
+    let f = folds as f32;
+
+    // The fold depth at (u across, v down): three waves at unrelated frequencies
+    // so the pleats stay irregular, swelling deeper toward the floor.
+    let profile = |u: f32, v: f32| -> f32 {
+        let amp = 0.5 * (0.6 + 0.7 * v); // shallow gather up top → deep splay below
+        let a = (u * f * tau).sin();
+        let b = (u * f * 2.3 * tau + 1.7).sin();
+        let c = (u * f * 0.55 * tau + 4.1).sin();
+        amp * (0.62 * a + 0.26 * b + 0.34 * c)
+    };
+    // A gentle forward bow so heavy fabric bellies toward the room as it hangs,
+    // rather than falling as a flat plane.
+    let belly = |v: f32| -> f32 { 0.6 * v * v };
+
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
+    let eps = 1.0e-3;
     for r in 0..=rows {
         let v = r as f32 / rows as f32; // 0 top → 1 bottom
         let y = (0.5 - v) * h;
-        let relax = 1.0 + v * 0.12; // fold amplitude relaxes a touch at the floor
         for c in 0..=cols {
             let u = c as f32 / cols as f32;
             let x = (u - 0.5) * w;
-            let phase = u * folds as f32 * tau;
-            let z = phase.cos() * amp * relax;
+            let z = profile(u, v) + belly(v);
             positions.push([x, y, z]);
             uvs.push([u, v]);
-            // Normal from the wave slope dz/dx, pointing toward +Z (the room).
-            let dz_dx = -phase.sin() * amp * relax * folds as f32 * tau / w;
-            let n = Vec3::new(-dz_dx, 0.0, 1.0).normalize();
+            // Surface slope in u and v → normal facing +Z (the room).
+            let dz_du = (profile(u + eps, v) - profile(u - eps, v)) / (2.0 * eps);
+            let dz_dv = (profile(u, v + eps) - profile(u, v - eps) + belly(v + eps)
+                - belly(v - eps))
+                / (2.0 * eps);
+            let tu = Vec3::new(w, 0.0, dz_du);
+            let tv = Vec3::new(0.0, -h, dz_dv);
+            let n = tv.cross(tu).normalize();
             normals.push([n.x, n.y, n.z]);
         }
     }
