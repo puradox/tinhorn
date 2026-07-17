@@ -53,6 +53,36 @@ fn textured(
     })
 }
 
+/// Set an image to wrap, so a `uv_transform` scale actually tiles it instead of
+/// clamping to one stretched copy.
+fn repeat(mut img: Image) -> Image {
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    img
+}
+
+/// A textured material whose UVs are scaled so the texture *tiles* `scale` times
+/// per face (narrow grain on a wide wall, instead of one stretched-flat copy).
+fn textured_tiled(
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    tex: &crate::render3d::texture::Texture,
+    rough: f32,
+    scale: Vec2,
+) -> Handle<StandardMaterial> {
+    let image = images.add(repeat(tex_image(tex)));
+    materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(image),
+        uv_transform: Affine2::from_scale(scale),
+        perceptual_roughness: rough,
+        ..default()
+    })
+}
+
 // Furniture tones the tray palette doesn't carry (approximating render_arena).
 const RAIL: Rgb = Rgb(128, 86, 58); // lighter wood along the wall tops
 const TABLE: Rgb = Rgb(92, 60, 40); // mahogany table slab
@@ -97,15 +127,19 @@ pub fn spawn(
     //     (not a flat single tone) on the body, plus a distinctly lighter, fatter
     //     top rail proud of the wall and a lit inner face flaring up from the felt
     //     edge — so a wall reads as a solid framed lip, not a coloured slab. ---
-    let wall = textured(
+    let wall = textured_tiled(
         materials,
-        images.add(tex_image(&crate::ui::grain_texture(style.wall))),
+        images,
+        &crate::ui::grain_texture(style.wall),
         0.75,
+        Vec2::new(5.0, 2.0),
     );
-    let rail = textured(
+    let rail = textured_tiled(
         materials,
-        images.add(tex_image(&crate::ui::grain_texture(RAIL))),
+        images,
+        &crate::ui::grain_texture(RAIL),
         0.5,
+        Vec2::new(6.0, 1.0),
     );
     let inner = matte(materials, lerp_rgb(style.wall, RAIL, 0.4), 0.7);
     let wall_y = FELT_TOP + lip * 0.5;
@@ -230,11 +264,13 @@ pub fn spawn(
     //     the floor to well above the frame with a velvet streak texture. ---
     let velvet = images.add(tex_image(&crate::ui::velvet_texture(CURTAIN)));
     let curtain = textured(materials, velvet, 0.92);
+    // Close in and tall/wide, so the drapes fill the sides of the frame from the
+    // floor to above the top — a proscenium framing the tray, not thin far strips.
     for side in [-1.0f32, 1.0] {
         commands.spawn((
-            Mesh3d(meshes.add(curtain_mesh(5.5, 20.0, 6))),
+            Mesh3d(meshes.add(curtain_mesh(7.0, 30.0, 7))),
             MeshMaterial3d(curtain.clone()),
-            Transform::from_xyz(side * 7.0, rug_y + 9.0, -11.0),
+            Transform::from_xyz(side * 6.2, rug_y + 13.0, -6.0),
         ));
     }
 

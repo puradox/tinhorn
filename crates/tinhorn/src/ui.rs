@@ -1682,7 +1682,13 @@ pub fn render_bevy(
         // report it back so the render target can track it.
         app.arena_w = inner.width as f32;
         app.arena_h = inner.height as f32;
-        view = (inner.width, inner.height * 2);
+        // Ask for a supersampled render (ARENA_SS× the half-block grid); the blit
+        // box-downsamples it, so dice and wall edges come out smooth instead of
+        // boxy — the same trick the software renderer's SUPERSAMPLE did.
+        view = (
+            inner.width * ARENA_SS as u16,
+            inner.height * 2 * ARENA_SS as u16,
+        );
 
         blit_bevy_arena(frame.buffer_mut(), inner, pixels, img_w, img_h);
 
@@ -1712,10 +1718,16 @@ pub fn render_bevy(
     view
 }
 
-/// Blit a row-padded RGBA8 Bevy render (sized to `inner`'s half-block grid, so
-/// `img_w == inner.width` and `img_h == inner.height*2`) into `inner` as
-/// half-block cells: each cell takes its two stacked pixels as fg (upper) and bg
-/// (lower). A no-op until the first readback of the right size lands.
+/// Supersample factor: the Bevy arena is rendered at this multiple of the
+/// half-block grid and box-downsampled in the blit, for cheap anti-aliasing.
+const ARENA_SS: u32 = 2;
+
+/// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg =
+/// upper pixel, bg = lower). The render is supersampled — `img_w`/`img_h` are
+/// `ARENA_SS×` the `inner.width`/`inner.height*2` grid — so each output subpixel
+/// box-averages an `ss`×`ss` block, smoothing the boxy edges. Then a warm-graded
+/// radial vignette (the software `render3d_view::vignette`) pulls the eye in. A
+/// no-op until the first readback of the right size lands.
 fn blit_bevy_arena(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -1727,15 +1739,24 @@ fn blit_bevy_arena(
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
         return;
     }
-    let sample = |x: u32, y: u32| -> (u8, u8, u8) {
-        let x = x.min(img_w - 1) as usize;
-        let y = y.min(img_h - 1) as usize;
-        let i = y * stride + x * 4;
-        (pixels[i], pixels[i + 1], pixels[i + 2])
+    // How many render pixels per output subpixel, in each axis (usually ARENA_SS).
+    let ss = (img_w / (inner.width as u32).max(1)).max(1);
+    // Box-average the `ss`×`ss` render block for output subpixel cell `(cx, cy)`.
+    let block = |cx: u32, cy: u32| -> (u8, u8, u8) {
+        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+        for dy in 0..ss {
+            for dx in 0..ss {
+                let px = (cx * ss + dx).min(img_w - 1) as usize;
+                let py = (cy * ss + dy).min(img_h - 1) as usize;
+                let i = py * stride + px * 4;
+                r += pixels[i] as u32;
+                g += pixels[i + 1] as u32;
+                b += pixels[i + 2] as u32;
+            }
+        }
+        let n = (ss * ss).max(1);
+        ((r / n) as u8, (g / n) as u8, (b / n) as u8)
     };
-    // A warm-graded radial vignette (quartic, biting only near the edges) so the
-    // void recedes and the eye is pulled into the lit tray — the same grade the
-    // software `render3d_view::vignette` applies.
     let (fw, fh) = (inner.width as f32, inner.height as f32 * 2.0);
     let graded = |c: (u8, u8, u8), nx: f32, ny: f32| -> Color {
         let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
@@ -1749,9 +1770,8 @@ fn blit_bevy_arena(
     };
     for row in 0..inner.height {
         for col in 0..inner.width {
-            let ix = (col as u32).min(img_w - 1);
-            let up = sample(ix, row as u32 * 2);
-            let lo = sample(ix, row as u32 * 2 + 1);
+            let up = block(col as u32, row as u32 * 2);
+            let lo = block(col as u32, row as u32 * 2 + 1);
             let nx = (col as f32 + 0.5) / fw - 0.5;
             let cell = &mut buf[(inner.x + col, inner.y + row)];
             cell.set_char('▀');
