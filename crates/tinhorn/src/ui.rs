@@ -1733,17 +1733,32 @@ fn blit_bevy_arena(
         let i = y * stride + x * 4;
         (pixels[i], pixels[i + 1], pixels[i + 2])
     };
+    // A warm-graded radial vignette (quartic, biting only near the edges) so the
+    // void recedes and the eye is pulled into the lit tray — the same grade the
+    // software `render3d_view::vignette` applies.
+    let (fw, fh) = (inner.width as f32, inner.height as f32 * 2.0);
+    let graded = |c: (u8, u8, u8), nx: f32, ny: f32| -> Color {
+        let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
+        let f = 1.0 - 0.34 * d2 * d2;
+        let (fr, fg, fb) = (f * 1.04, f, f * 0.95);
+        Color::Rgb(
+            (c.0 as f32 * fr).min(255.0) as u8,
+            (c.1 as f32 * fg).min(255.0) as u8,
+            (c.2 as f32 * fb) as u8,
+        )
+    };
     for row in 0..inner.height {
         for col in 0..inner.width {
             let ix = (col as u32).min(img_w - 1);
             let up = sample(ix, row as u32 * 2);
             let lo = sample(ix, row as u32 * 2 + 1);
+            let nx = (col as f32 + 0.5) / fw - 0.5;
             let cell = &mut buf[(inner.x + col, inner.y + row)];
             cell.set_char('▀');
             cell.set_style(
                 Style::default()
-                    .fg(Color::Rgb(up.0, up.1, up.2))
-                    .bg(Color::Rgb(lo.0, lo.1, lo.2)),
+                    .fg(graded(up, nx, (row as f32 * 2.0 + 0.5) / fh - 0.5))
+                    .bg(graded(lo, nx, (row as f32 * 2.0 + 1.5) / fh - 0.5)),
             );
         }
     }

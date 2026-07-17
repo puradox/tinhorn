@@ -155,9 +155,16 @@ pub fn spawn(
         Transform::from_xyz(0.0, rug_y + 0.01, 1.0),
     ));
 
-    // --- Broad room floor of lit oak floorboards, well below the rug. ---
+    // --- Broad room floor of oak floorboards, well below the rug. Unlit (like
+    //     the software floor's pure-ambient treatment) so it stays a genuinely
+    //     bright oak at every angle instead of falling dark when ambient is low. ---
     let floor_tex = images.add(tex_image(&crate::ui::floor_texture(OAK)));
-    let floor = textured(materials, floor_tex, 0.85);
+    let floor = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(floor_tex),
+        unlit: true,
+        ..default()
+    });
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(46.0, 0.1, 46.0))),
         MeshMaterial3d(floor),

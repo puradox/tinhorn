@@ -222,9 +222,13 @@ fn setup(
         }),
         Transform::from_translation(convert::vec3(cam.position))
             .looking_at(convert::vec3(cam.target), Vec3::Y),
+        // Low ambient so the warm key light can carve a spotlit pool on the felt
+        // (the drama the software renderer gets from per-fragment falloff). The
+        // room stays visible because its floor/backdrop are *unlit*, not because
+        // ambient floods everything flat.
         AmbientLight {
-            color: Color::srgb(0.72, 0.72, 0.8),
-            brightness: 420.0,
+            color: Color::srgb(0.5, 0.55, 0.7),
+            brightness: 90.0,
             ..default()
         },
         // Recede far geometry into the room; a warm colour so the floor's far
