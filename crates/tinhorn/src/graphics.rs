@@ -199,6 +199,25 @@ pub fn encode_apc(payload: &[u8], img_w: u32, img_h: u32, cols: u16, rows: u16) 
     out
 }
 
+/// Wrap a *file path* (not the pixels) in the kitty APC — `t=f`, so the terminal
+/// loads the raw RGB from disk instead of the pty. The pty then carries only ~50
+/// bytes, which is what unblocks the per-frame stdout write (the measured
+/// bottleneck); the file holds raw `f=24` RGB (no `o=z` — a local file has no
+/// bandwidth problem, so we skip the zlib CPU too). The header otherwise mirrors
+/// [`encode_apc`]. The path is short, so this is always a single un-chunked APC.
+pub fn encode_apc_path(path: &str, img_w: u32, img_h: u32, cols: u16, rows: u16) -> Vec<u8> {
+    let b64 = BASE64_STANDARD.encode(path.as_bytes());
+    let header =
+        format!("a=T,f=24,t=f,i=1,p=1,z=-1073741825,C=1,q=2,s={img_w},v={img_h},c={cols},r={rows}");
+    let mut out = Vec::with_capacity(header.len() + b64.len() + 6);
+    out.extend_from_slice(b"\x1b_G");
+    out.extend_from_slice(header.as_bytes());
+    out.push(b';');
+    out.extend_from_slice(b64.as_bytes());
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
 /// Delete just our placement (keeping the image data), for while a pane covers the
 /// arena — the placement is re-emitted when the pane closes. Targets our fixed
 /// `i=1,p=1`, so no other program's images are touched.
@@ -443,5 +462,23 @@ mod tests {
     fn delete_escapes_are_exact() {
         assert_eq!(delete_placement_apc(), b"\x1b_Ga=d,d=i,i=1,p=1,q=2;\x1b\\");
         assert_eq!(delete_all_apc(), b"\x1b_Ga=d,d=I,i=1,q=2;\x1b\\");
+    }
+
+    #[test]
+    fn file_apc_carries_the_base64_path_and_t_f() {
+        let apc = encode_apc_path("/tmp/tinhorn-42.rgb", 60, 50, 30, 25);
+        let chunks = parse_apcs(&apc);
+        assert_eq!(chunks.len(), 1, "a path fits one APC");
+        let (control, payload) = &chunks[0];
+        // File transfer, raw RGB (no o=z), our fixed ids, and the pixel/cell dims.
+        for key in [
+            "a=T", "f=24", "t=f", "i=1", "p=1", "s=60", "v=50", "c=30", "r=25",
+        ] {
+            assert!(control.contains(key), "header missing {key}: {control}");
+        }
+        assert!(!control.contains("o=z"), "the file holds raw RGB, no zlib");
+        // The payload is the base64-encoded path.
+        let decoded = BASE64_STANDARD.decode(payload).unwrap();
+        assert_eq!(decoded, b"/tmp/tinhorn-42.rgb");
     }
 }

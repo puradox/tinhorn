@@ -116,7 +116,11 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
     let mut app = base_app(expr, seed, muted, mode);
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
-        .insert_resource(KittyState::default())
+        .insert_resource(KittyState {
+            file: std::env::var_os("TINHORN_KITTY_FILE")
+                .map(|_| std::env::temp_dir().join(format!("tinhorn-{}.rgb", std::process::id()))),
+            ..default()
+        })
         .insert_resource(FrameStats {
             show: cfg!(debug_assertions) || std::env::var_os("TINHORN_FPS").is_some(),
             ..default()
@@ -162,12 +166,16 @@ struct Sim(DiceApp);
 #[derive(Resource, Clone, Copy)]
 struct Graphics(GraphicsMode);
 
-/// Whether the kitty image is currently placed on screen. Gates the delete /
-/// re-place when a pane opens over the arena — the pane renders with `Clear` +
-/// default-bg text, so a placed image would show through it at any z.
+/// Kitty emission state. `placed` gates the delete / re-place when a pane opens over
+/// the arena (the pane's `Clear` + default-bg text would show a placed image through
+/// at any z). `file` is the experimental transmit path: `Some(temp path)` when
+/// `TINHORN_KITTY_FILE` is set, so frames go via a `t=f` file reference (raw pixels
+/// on disk, a tiny pty write) instead of base64-in-escape — the fix for the measured
+/// stdout-write bottleneck, kept opt-in until it's verified against the terminal.
 #[derive(Resource, Default)]
 struct KittyState {
     placed: bool,
+    file: Option<PathBuf>,
 }
 
 /// The debug frame-rate readout. `fps` is an EMA of the real per-frame `dt`; `stage`
@@ -618,20 +626,31 @@ fn emit_kitty(
         &panel.burns,
     );
     let prep = ms(t0);
+    let (w, h) = (panel.inner.width, panel.inner.height);
 
-    let t1 = Instant::now();
-    let compressed = graphics::compress(&rgb);
-    let zip = ms(t1);
-
-    let t2 = Instant::now();
-    let apc = graphics::encode_apc(
-        &compressed,
-        arena.w,
-        arena.h,
-        panel.inner.width,
-        panel.inner.height,
-    );
-    let b64 = ms(t2);
+    // `zip` and `b64` are timed for whichever transmit path is live: for the direct
+    // path they're zlib and base64+chunk; for the file path `zip` is the raw-pixel
+    // file write and `b64` the (tiny) path-APC build.
+    let (zip, b64, apc) = if let Some(path) = &state.file {
+        let t1 = Instant::now();
+        let wrote = std::fs::write(path, &rgb).is_ok();
+        let zip = ms(t1);
+        let t2 = Instant::now();
+        let apc = if wrote {
+            graphics::encode_apc_path(&path.to_string_lossy(), arena.w, arena.h, w, h)
+        } else {
+            // File write failed — fall back to the direct path for this frame.
+            graphics::encode_apc(&graphics::compress(&rgb), arena.w, arena.h, w, h)
+        };
+        (zip, ms(t2), apc)
+    } else {
+        let t1 = Instant::now();
+        let compressed = graphics::compress(&rgb);
+        let zip = ms(t1);
+        let t2 = Instant::now();
+        let apc = graphics::encode_apc(&compressed, arena.w, arena.h, w, h);
+        (zip, ms(t2), apc)
+    };
 
     let t3 = Instant::now();
     let ok = graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok();
@@ -697,13 +716,17 @@ fn draw_fps_overlay(
 /// before `CleanupPlugin` drops `RatatuiContext` in `Last` and leaves the alt
 /// screen — so the escape lands while the session is still live. A no-op outside
 /// kitty mode, and targeted to `i=1` so it can't disturb anything else on screen.
-fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>) {
+fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>, state: Res<KittyState>) {
     if exits.is_empty() {
         return;
     }
     exits.clear();
     if let GraphicsMode::Kitty { .. } = gfx.0 {
         let _ = graphics::emit_raw(&graphics::delete_all_apc());
+        // Remove the file-transfer scratch frame, if we used one.
+        if let Some(path) = &state.file {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
