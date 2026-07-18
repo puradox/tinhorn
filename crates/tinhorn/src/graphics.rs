@@ -122,6 +122,11 @@ fn detect_scale() -> u32 {
 /// the half-block blit uses, so the two paths grade the picture identically.
 /// `None` when the buffer is empty or shorter than a full frame (a stale readback
 /// mid-resize, or before the first frame lands).
+///
+/// This per-pixel pass over the whole readback is the single biggest slice of the
+/// per-frame main-thread cost, so it's **split across cores** by row band — each
+/// thread fills a disjoint chunk of the output with the exact same per-pixel math,
+/// so the result stays byte-identical. Rows are independent, so no synchronization.
 pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     if img_w == 0 || img_h == 0 {
         return None;
@@ -131,18 +136,34 @@ pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
         return None; // short / stale readback
     }
     let (fw, fh) = (img_w as f32, img_h as f32);
-    let mut out = Vec::with_capacity((img_w * img_h * 3) as usize);
-    for y in 0..img_h as usize {
-        let ny = (y as f32 + 0.5) / fh - 0.5;
-        for x in 0..img_w as usize {
-            let i = y * stride + x * 4;
-            let nx = (x as f32 + 0.5) / fw - 0.5;
-            let (fr, fg, fb) = crate::ui::vignette(nx, ny);
-            out.push((pixels[i] as f32 * fr).min(255.0) as u8);
-            out.push((pixels[i + 1] as f32 * fg).min(255.0) as u8);
-            out.push((pixels[i + 2] as f32 * fb).min(255.0) as u8);
+    let row_out = img_w as usize * 3;
+    let mut out = vec![0u8; img_h as usize * row_out];
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, img_h as usize);
+    let band = (img_h as usize).div_ceil(threads);
+    std::thread::scope(|s| {
+        for (t, chunk) in out.chunks_mut(band * row_out).enumerate() {
+            let y0 = t * band;
+            s.spawn(move || {
+                for (r, orow) in chunk.chunks_exact_mut(row_out).enumerate() {
+                    let y = y0 + r;
+                    let ny = (y as f32 + 0.5) / fh - 0.5;
+                    for x in 0..img_w as usize {
+                        let i = y * stride + x * 4;
+                        let nx = (x as f32 + 0.5) / fw - 0.5;
+                        let (fr, fg, fb) = crate::ui::vignette(nx, ny);
+                        let o = x * 3;
+                        orow[o] = (pixels[i] as f32 * fr).min(255.0) as u8;
+                        orow[o + 1] = (pixels[i + 1] as f32 * fg).min(255.0) as u8;
+                        orow[o + 2] = (pixels[i + 2] as f32 * fb).min(255.0) as u8;
+                    }
+                }
+            });
         }
-    }
+    });
     Some(out)
 }
 
