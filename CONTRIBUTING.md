@@ -148,9 +148,9 @@ truth, and the Bevy entities are a pure view of it.
   pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
   (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for
   flicker-free replace, `q=2` so no response reaches the input stream), after the draw.
-  (`encode_apc_path` is an experimental `t=f` alternative — `TINHORN_KITTY_FILE` —
-  that references a file of raw pixels so the pty carries only a path, since
-  profiling showed the per-frame cost is the stdout write, not the readback.) Lives
+  (`encode_apc_path` is the **default** `t=f` path: it references a file of raw pixels
+  so the pty carries only a path — profiling showed the per-frame cost was the stdout
+  write, not the readback; `TINHORN_KITTY_DIRECT` forces the base64 path back.) Lives
   outside the vendored `term/` (the re-sync contract) and named `graphics` so it
   never collides with `term/…/kitty.rs` (the keyboard protocol).
 - **`paint`** (binary) — the small `Rgb`/`Texture` types the overlays and the

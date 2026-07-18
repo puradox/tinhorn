@@ -46,7 +46,7 @@ TINHORN_FPS=1 cargo run --release           # same overlay on a release build (t
 #   readback) · pack · zip (zlib) · b64 · wr (stdout write — pty backpressure).
 cargo run --features profiling -- 3d6       # deep per-system chrome trace → trace-<ts>.json
 #   (load in https://ui.perfetto.dev; `--features profiling-tracy` streams to Tracy)
-TINHORN_KITTY_FILE=1 cargo run              # experimental: t=f file transmit (skips the pty write)
+TINHORN_KITTY_DIRECT=1 cargo run            # force base64-in-escape transmit (kitty file t=f is the default)
 ```
 
 The three GPU render smoke tests in the binary are `#[ignore]`d (they need a real
@@ -249,10 +249,10 @@ and `drain_sounds` plays whatever the physics queued.
   clean up on pane-open and on quit. `scale_for` maps the cell pixel height to the
   render scale; `MAX_IMG_W` caps the transmitted width. Everything is pure and
   unit-tested bar the two impure edges (`resolve`, `emit`). Profiling found the
-  per-frame cost is the stdout write (pty backpressure) + zlib, **not** the readback;
-  `encode_apc_path` is an **experimental `t=f`** path (`TINHORN_KITTY_FILE`) that
-  hands the terminal a file of raw RGB so the pty carries only a path — opt-in until
-  it's verified against the terminal, the base64 path staying the default.
+  per-frame cost was the stdout write (pty backpressure) + zlib, **not** the readback,
+  so `encode_apc_path` (`t=f`) hands the terminal a file of raw RGB and the pty carries
+  only a path — **the default** in kitty mode; `TINHORN_KITTY_DIRECT` forces the
+  base64-in-escape path back for a terminal that won't read a transmitted file.
 
 - **`paint`** (bin) — the small CPU `Rgb` (8-bit tint/palette) and `Texture`
   (row-major RGBA) types the overlays and the procedural generators use. They
