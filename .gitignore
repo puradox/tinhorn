@@ -6,3 +6,6 @@
 
 # macOS
 .DS_Store
+
+# Profiling output (`--features profiling` writes a chrome trace here; can be huge)
+trace-*.json
