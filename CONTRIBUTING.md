@@ -150,7 +150,8 @@ truth, and the Bevy entities are a pure view of it.
   flicker-free replace, `q=2` so no response reaches the input stream), after the draw.
   (`encode_apc_path` is the **default** `t=f` path: it references a file of raw pixels
   so the pty carries only a path — profiling showed the per-frame cost was the stdout
-  write, not the readback; `TINHORN_KITTY_DIRECT` forces the base64 path back.) Lives
+  write, not the readback. It can't cross an SSH hop, so the emitter auto-falls back to
+  base64 there; `TINHORN_KITTY_DIRECT` forces base64 too.) Lives
   outside the vendored `term/` (the re-sync contract) and named `graphics` so it
   never collides with `term/…/kitty.rs` (the keyboard protocol).
 - **`paint`** (binary) — the small `Rgb`/`Texture` types the overlays and the

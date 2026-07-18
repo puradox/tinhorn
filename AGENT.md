@@ -251,8 +251,10 @@ and `drain_sounds` plays whatever the physics queued.
   unit-tested bar the two impure edges (`resolve`, `emit`). Profiling found the
   per-frame cost was the stdout write (pty backpressure) + zlib, **not** the readback,
   so `encode_apc_path` (`t=f`) hands the terminal a file of raw RGB and the pty carries
-  only a path — **the default** in kitty mode; `TINHORN_KITTY_DIRECT` forces the
-  base64-in-escape path back for a terminal that won't read a transmitted file.
+  only a path — **the default** whenever it can work. It can't cross an SSH hop (the
+  file is on the remote host, the terminal reads locally), so `over_ssh()` auto-falls
+  back to the base64 path there; `TINHORN_KITTY_DIRECT` forces base64 too, for a local
+  terminal that restricts which files it will read.
 
 - **`paint`** (bin) — the small CPU `Rgb` (8-bit tint/palette) and `Texture`
   (row-major RGBA) types the overlays and the procedural generators use. They

@@ -120,6 +120,14 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) -> A
     app
 }
 
+/// Are we running over SSH? A file-transmitted kitty image (`t=f`) can't work then —
+/// the file is written on this (remote) host but the terminal reads it on the local
+/// one, so the emitter must fall back to base64 through the pty (the only medium an
+/// SSH hop forwards). `SSH_CONNECTION`/`SSH_TTY` are set by sshd on the session.
+fn over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
 /// The interactive path: terminal context, input, per-frame compose, sound. In
 /// kitty mode `draw_ui` also emits the image after the draw, `KittyState` gates the
 /// pane-open placement delete, and `kitty_cleanup` removes the image on quit.
@@ -128,11 +136,13 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
         .insert_resource(KittyState {
-            // File transmission is the default in kitty mode (the pty carries a `t=f`
-            // path, not the whole frame). `TINHORN_KITTY_DIRECT` forces the base64
-            // path back, for a terminal that won't read file-transmitted images.
-            file: std::env::var_os("TINHORN_KITTY_DIRECT")
-                .is_none()
+            // File transmission (`t=f`) is used whenever it *can* be — always, on a
+            // local session. It can't cross an SSH hop (the file lands on this remote
+            // host, but the terminal reads it on the local one, different
+            // filesystems), so fall back to base64-through-the-pty there, the only
+            // medium SSH forwards. `TINHORN_KITTY_DIRECT` forces base64 too — a manual
+            // override for a local terminal that restricts which files it will read.
+            file: (!over_ssh() && std::env::var_os("TINHORN_KITTY_DIRECT").is_none())
                 .then(|| std::env::temp_dir().join(format!("tinhorn-{}.rgb", std::process::id()))),
             ..default()
         })
@@ -183,10 +193,11 @@ struct Graphics(GraphicsMode);
 
 /// Kitty emission state. `placed` gates the delete / re-place when a pane opens over
 /// the arena (the pane's `Clear` + default-bg text would show a placed image through
-/// at any z). `file` selects the transmit path: `Some(temp path)` — the default —
-/// sends each frame as a `t=f` file reference (raw pixels on disk, a tiny pty write),
-/// the fix for the stdout-write bottleneck; `None` (forced by `TINHORN_KITTY_DIRECT`)
-/// falls back to base64-in-escape, for a terminal that won't read a transmitted file.
+/// at any z). `file` selects the transmit path: `Some(temp path)` sends each frame as
+/// a `t=f` file reference (raw pixels on disk, a tiny pty write) — the fix for the
+/// stdout-write bottleneck, and the default whenever it can work; `None` falls back to
+/// base64-in-escape, used automatically over SSH (a file can't cross the hop) or when
+/// `TINHORN_KITTY_DIRECT` forces it.
 #[derive(Resource, Default)]
 struct KittyState {
     placed: bool,
