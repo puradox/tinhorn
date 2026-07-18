@@ -232,8 +232,8 @@ and `drain_sounds` plays whatever the physics queued.
   tmux/screen**, which inherit `KITTY_WINDOW_ID` yet eat the graphics APC), else
   `blocks`; `kitty`/`blocks` force it. The per-frame payload pipeline: `pack_rgb`
   strips wgpu's 256-byte row padding, drops alpha (`f=24`), and applies the shared
-  `ui::vignette`; `encode_frame` runs zlib-fast (`o=z`) → base64 → 4096-byte APC
-  chunks (`a=T`, a **fixed** `i=1,p=1` so a same-id retransmit is kitty's
+  `ui::vignette`; `compress` runs zlib-fast (`o=z`) and `encode_apc` does base64 →
+  4096-byte APC chunks (`a=T`, a **fixed** `i=1,p=1` so a same-id retransmit is kitty's
   flicker-free in-place replace, a deep negative `z` under non-default backgrounds,
   `C=1` so the cursor doesn't move, and `q=2` so no response ever lands in
   crossterm's input stream). `emit`/`emit_raw` write to stdout; the delete escapes

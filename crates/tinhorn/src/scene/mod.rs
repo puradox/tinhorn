@@ -14,7 +14,7 @@
 //! constructs a Bevy `App`, so scripting stays GPU-free.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::term::event::KeyMessage;
 use crate::term::{RatatuiContext, RatatuiPlugins};
@@ -118,8 +118,8 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
         .insert_resource(Sound(None))
         .insert_resource(KittyState::default())
         .insert_resource(FrameStats {
-            fps: 0.0,
             show: cfg!(debug_assertions) || std::env::var_os("TINHORN_FPS").is_some(),
+            ..default()
         })
         .add_systems(PreUpdate, input_system)
         .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
@@ -170,14 +170,45 @@ struct KittyState {
     placed: bool,
 }
 
-/// The debug frame-rate readout. `fps` is an EMA of the real per-frame `dt`, drawn
-/// in the arena's top border alongside the render-target size (the biggest perf
-/// signal for the kitty path). `show` is fixed at startup: on in a debug build, or
-/// whenever `TINHORN_FPS` is set (so a release build can be profiled too).
+/// The debug frame-rate readout. `fps` is an EMA of the real per-frame `dt`; `stage`
+/// holds EMA'd per-stage kitty-transmit times (ms). Both are drawn in the arena's
+/// top border with the render-target size. `show` is fixed at startup: on in a debug
+/// build, or whenever `TINHORN_FPS` is set (so a release build can be profiled too).
 #[derive(Resource, Default)]
 struct FrameStats {
     fps: f32,
     show: bool,
+    stage: StageMs,
+}
+
+/// EMA'd wall-clock times (ms) for the per-frame kitty transmit stages, so the
+/// overlay can show where the frame budget goes: `prep` = pack + number burn,
+/// `zip` = zlib, `b64` = base64 + APC chunking, `wr` = the stdout write + flush
+/// (which also catches terminal backpressure). Whatever's left of the frame time is
+/// the Bevy render + GPU→CPU readback.
+#[derive(Clone, Copy, Default)]
+struct StageMs {
+    prep: f32,
+    zip: f32,
+    b64: f32,
+    wr: f32,
+}
+
+impl FrameStats {
+    /// Fold this frame's stage times into the EMAs.
+    fn record(&mut self, prep: f32, zip: f32, b64: f32, wr: f32) {
+        let ema = |old: f32, new: f32| {
+            if old > 0.0 {
+                old * 0.9 + new * 0.1
+            } else {
+                new
+            }
+        };
+        self.stage.prep = ema(self.stage.prep, prep);
+        self.stage.zip = ema(self.stage.zip, zip);
+        self.stage.b64 = ema(self.stage.b64, b64);
+        self.stage.wr = ema(self.stage.wr, wr);
+    }
 }
 
 /// Tags a Bevy entity as the view of `sim.0.dice[index]`.
@@ -523,7 +554,9 @@ fn draw_ui(
             inst
         };
     }
-    let (show_fps, fps) = (stats.show, stats.fps);
+    // The overlay shows the *previous* frame's stage times (emit runs after this
+    // draw); one frame stale is invisible against the EMA.
+    let (show_fps, fps, stage) = (stats.show, stats.fps, stats.stage);
 
     let mut reported = (view.w, view.h);
     let mut panel = None;
@@ -534,7 +567,7 @@ fn draw_ui(
         }
         panel = report.kitty;
         if show_fps {
-            draw_fps_overlay(frame, fps, mode, arena.w, arena.h);
+            draw_fps_overlay(frame, fps, stage, mode, arena.w, arena.h);
         }
     })?;
     view.w = reported.0;
@@ -544,7 +577,7 @@ fn draw_ui(
     // write the image APC over the arena origin, or delete it while a pane covers it.
     if let (GraphicsMode::Kitty { .. }, Some(panel)) = (mode, panel) {
         let pane_open = sim.0.pane != tinhorn_core::app::Pane::None;
-        emit_kitty(&panel, &arena, pane_open, &mut kitty);
+        emit_kitty(&panel, &arena, pane_open, &mut kitty, &mut stats);
     }
     Ok(())
 }
@@ -555,7 +588,13 @@ fn draw_ui(
 /// empty/stale readback (startup, or just after `resize_arena` clears `pixels`) is
 /// skipped, leaving the previous placement up, since the readback lags the size
 /// request by a frame or two.
-fn emit_kitty(panel: &ui::KittyPanel, arena: &ArenaImage, pane_open: bool, state: &mut KittyState) {
+fn emit_kitty(
+    panel: &ui::KittyPanel,
+    arena: &ArenaImage,
+    pane_open: bool,
+    state: &mut KittyState,
+    stats: &mut FrameStats,
+) {
     if pane_open {
         if state.placed {
             let _ = graphics::emit_raw(&graphics::delete_placement_apc());
@@ -563,6 +602,10 @@ fn emit_kitty(panel: &ui::KittyPanel, arena: &ArenaImage, pane_open: bool, state
         }
         return;
     }
+    // Time each transmit stage (ms) so the overlay can show where the frame goes.
+    let ms = |t: Instant| t.elapsed().as_secs_f32() * 1000.0;
+
+    let t0 = Instant::now();
     let Some(mut rgb) = graphics::pack_rgb(&arena.pixels, arena.w, arena.h) else {
         return;
     };
@@ -574,34 +617,67 @@ fn emit_kitty(panel: &ui::KittyPanel, arena: &ArenaImage, pane_open: bool, state
         panel.inner.height,
         &panel.burns,
     );
-    let apc = graphics::encode_frame(
-        &rgb,
+    let prep = ms(t0);
+
+    let t1 = Instant::now();
+    let compressed = graphics::compress(&rgb);
+    let zip = ms(t1);
+
+    let t2 = Instant::now();
+    let apc = graphics::encode_apc(
+        &compressed,
         arena.w,
         arena.h,
         panel.inner.width,
         panel.inner.height,
     );
-    if graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok() {
+    let b64 = ms(t2);
+
+    let t3 = Instant::now();
+    let ok = graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok();
+    let wr = ms(t3);
+
+    if ok {
         state.placed = true;
     }
+    stats.record(prep, zip, b64, wr);
 }
 
-/// Draw the debug FPS readout in the arena's top border (right-aligned), alongside
-/// the mode and render-target size — the size being the biggest perf signal for the
-/// kitty path, since it renders/reads-back/encodes that many pixels every frame.
+/// Draw the debug FPS readout in the arena's top border (right-aligned), with the
+/// render-target size. In kitty mode it also breaks the frame down by transmit
+/// stage — `rest` (Bevy render + GPU→CPU readback + the rest), `pack`, `zip`
+/// (zlib), `b64`, `wr` (stdout write) — so the bottleneck is legible at a glance;
+/// it falls back to the short form when the border is too narrow for the breakdown.
 fn draw_fps_overlay(
     frame: &mut ratatui::Frame,
     fps: f32,
+    stage: StageMs,
     mode: GraphicsMode,
     img_w: u32,
     img_h: u32,
 ) {
-    let tag = match mode {
-        GraphicsMode::Blocks => "blocks",
-        GraphicsMode::Kitty { .. } => "kitty",
-    };
-    let label = format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
     let area = frame.area();
+    let short = |tag: &str| format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
+    let label = match mode {
+        GraphicsMode::Blocks => short("blocks"),
+        GraphicsMode::Kitty { .. } => {
+            let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+            let sum = stage.prep + stage.zip + stage.b64 + stage.wr;
+            let rest = (frame_ms - sum).max(0.0);
+            let full = format!(
+                " {fps:.0}fps {img_w}×{img_h}  rest {rest:.0} pack {p:.0} zip {z:.0} b64 {b:.0} wr {w:.0} ms ",
+                p = stage.prep,
+                z = stage.zip,
+                b = stage.b64,
+                w = stage.wr,
+            );
+            if full.chars().count() as u16 + 2 <= area.width {
+                full
+            } else {
+                short("kitty")
+            }
+        }
+    };
     let w = label.chars().count() as u16;
     if area.width <= w + 2 {
         return; // too narrow — don't corrupt the border
@@ -826,29 +902,59 @@ mod tests {
     }
 
     #[test]
-    fn fps_overlay_shows_rate_mode_and_render_size() {
-        // The overlay is the perf diagnostic: it must carry the frame rate, the mode,
-        // and the render-target size (the size being the whole point — it's what
-        // reveals why kitty is heavy).
-        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    fn fps_overlay_shows_kitty_stage_breakdown() {
+        // The perf diagnostic: on a wide-enough border, kitty mode carries the frame
+        // rate, the render size, and the per-stage times — so a dominant stage (here
+        // zip=78ms) is legible at a glance.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let stage = StageMs {
+            prep: 3.0,
+            zip: 78.0,
+            b64: 4.0,
+            wr: 5.0,
+        };
         terminal
-            .draw(|f| draw_fps_overlay(f, 42.0, GraphicsMode::Kitty { scale: 8 }, 1600, 1200))
+            .draw(|f| {
+                draw_fps_overlay(
+                    f,
+                    11.0,
+                    stage,
+                    GraphicsMode::Kitty { scale: 12 },
+                    1440,
+                    1080,
+                )
+            })
             .unwrap();
         let row = top_row(&terminal);
-        assert!(row.contains("42 fps"), "frame rate missing: {row:?}");
-        assert!(row.contains("kitty"), "mode tag missing: {row:?}");
-        assert!(row.contains("1600×1200"), "render size missing: {row:?}");
+        assert!(row.contains("11fps"), "frame rate missing: {row:?}");
+        assert!(row.contains("1440×1080"), "render size missing: {row:?}");
+        assert!(
+            row.contains("zip 78"),
+            "the zlib stage time must show: {row:?}"
+        );
+        assert!(
+            row.contains("wr 5"),
+            "the write stage time must show: {row:?}"
+        );
     }
 
     #[test]
-    fn fps_overlay_skips_a_too_narrow_frame() {
-        // Narrower than the label: it must be skipped, not panic or corrupt the row.
-        let mut terminal = Terminal::new(TestBackend::new(10, 6)).unwrap();
-        terminal
-            .draw(|f| draw_fps_overlay(f, 30.0, GraphicsMode::Blocks, 200, 160))
-            .unwrap();
+    fn fps_overlay_falls_back_and_skips() {
+        // Blocks short form fits a modest width…
+        let mut wide = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        wide.draw(|f| {
+            draw_fps_overlay(f, 60.0, StageMs::default(), GraphicsMode::Blocks, 240, 180)
+        })
+        .unwrap();
+        assert!(top_row(&wide).contains("60 fps"), "{:?}", top_row(&wide));
+        // …but a tiny frame is skipped, not panicking or corrupting the row.
+        let mut tiny = Terminal::new(TestBackend::new(10, 6)).unwrap();
+        tiny.draw(|f| {
+            draw_fps_overlay(f, 30.0, StageMs::default(), GraphicsMode::Blocks, 200, 160)
+        })
+        .unwrap();
         assert!(
-            !top_row(&terminal).contains("fps"),
+            !top_row(&tiny).contains("fps"),
             "should skip when too narrow"
         );
     }

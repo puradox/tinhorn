@@ -146,9 +146,19 @@ pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Encode packed RGB into the kitty APC escape stream that transmits *and* places
-/// the image over the arena. Pipeline: zlib-fast (`o=z`) → base64 → 4096-byte
-/// chunks. The first chunk carries the full control block, the rest only `m`:
+/// zlib-fast-compress packed RGB (the kitty `o=z` payload). Split from
+/// [`encode_apc`] so the emitter can time compression on its own — it's the
+/// single heaviest step of the transmit for a large frame.
+pub fn compress(rgb: &[u8]) -> Vec<u8> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(rgb)
+        .expect("zlib write into a Vec is infallible");
+    enc.finish().expect("zlib finish into a Vec is infallible")
+}
+
+/// Wrap a (zlib-compressed) payload in the kitty APC escape stream that transmits
+/// *and* places the image over the arena: base64 → 4096-byte chunks. The first
+/// chunk carries the full control block, the rest only `m`:
 ///
 /// - `a=T` transmit-and-display, `f=24` RGB, `o=z` zlib.
 /// - `i=1,p=1` — a **fixed** image + placement id, so re-emitting each frame is
@@ -159,12 +169,8 @@ pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
 ///   non-default cell backgrounds and the chrome/overlays draw above it.
 /// - `C=1` don't move the cursor; `q=2` suppress ALL responses, so nothing kitty
 ///   sends back ever lands in crossterm's input stream and reads as a keypress.
-pub fn encode_frame(rgb: &[u8], img_w: u32, img_h: u32, cols: u16, rows: u16) -> Vec<u8> {
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
-    enc.write_all(rgb)
-        .expect("zlib write into a Vec is infallible");
-    let compressed = enc.finish().expect("zlib finish into a Vec is infallible");
-    let b64 = BASE64_STANDARD.encode(compressed);
+pub fn encode_apc(payload: &[u8], img_w: u32, img_h: u32, cols: u16, rows: u16) -> Vec<u8> {
+    let b64 = BASE64_STANDARD.encode(payload);
 
     let bytes = b64.as_bytes();
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
@@ -367,7 +373,7 @@ mod tests {
                 h as u8
             })
             .collect();
-        let stream = encode_frame(&rgb, 60, 50, 30, 25);
+        let stream = encode_apc(&compress(&rgb), 60, 50, 30, 25);
         let chunks = parse_apcs(&stream);
         assert!(chunks.len() >= 2, "the payload should span multiple chunks");
 
@@ -421,7 +427,7 @@ mod tests {
     fn encode_frame_single_chunk() {
         // A tiny, compressible frame fits one chunk: full header AND m=0.
         let rgb = vec![7u8; 30];
-        let stream = encode_frame(&rgb, 5, 2, 5, 1);
+        let stream = encode_apc(&compress(&rgb), 5, 2, 5, 1);
         let chunks = parse_apcs(&stream);
         assert_eq!(chunks.len(), 1, "small frames fit a single chunk");
         assert!(chunks[0].0.contains("a=T"));

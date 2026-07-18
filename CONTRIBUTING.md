@@ -145,9 +145,9 @@ truth, and the Bevy entities are a pure view of it.
   output path for terminals that speak it (kitty, Ghostty, WezTerm), half-blocks
   everywhere else. `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
   `kitty_capable`, never under tmux/screen; `kitty`/`blocks` force it). The payload
-  pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib →
-  base64 → chunked kitty APCs (`encode_frame`, fixed `i=1,p=1` for flicker-free
-  replace, `q=2` so no response reaches the input stream), emitted after the draw.
+  pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
+  (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for
+  flicker-free replace, `q=2` so no response reaches the input stream), after the draw.
   Lives outside the vendored `term/` (the re-sync contract) and named `graphics` so
   it never collides with `term/…/kitty.rs` (the keyboard protocol).
 - **`paint`** (binary) — the small `Rgb`/`Texture` types the overlays and the
