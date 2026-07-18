@@ -38,6 +38,15 @@ cargo test -p tinhorn-core     # the ~64 GPU-free sim/ceremony tests, no Bevy
 TINHORN_BEVY_SNAPSHOT=/tmp/arena.png cargo run -- 4d6!kh3
 TINHORN_SNAP_COLS=120 TINHORN_SNAP_ROWS=44 TINHORN_BEVY_SNAPSHOT=/tmp/a.png cargo run -- d20
 TINHORN_SNAP_FRAME=8 TINHORN_BEVY_SNAPSHOT=/tmp/a.png cargo run -- 3d6   # mid-roll, not settled
+
+# Perf/debug overlays & profiling (interactive; see the `scene::FrameStats` overlay).
+cargo run                                   # debug build: FPS + render-size overlay on by default
+TINHORN_FPS=1 cargo run --release           # same overlay on a release build (the real numbers)
+#   In kitty mode the overlay also breaks the frame down: rest (render + GPU→CPU
+#   readback) · pack · zip (zlib) · b64 · wr (stdout write — pty backpressure).
+cargo run --features profiling -- 3d6       # deep per-system chrome trace → trace-<ts>.json
+#   (load in https://ui.perfetto.dev; `--features profiling-tracy` streams to Tracy)
+TINHORN_KITTY_FILE=1 cargo run              # experimental: t=f file transmit (skips the pty write)
 ```
 
 The three GPU render smoke tests in the binary are `#[ignore]`d (they need a real
@@ -239,7 +248,11 @@ and `drain_sounds` plays whatever the physics queued.
   crossterm's input stream). `emit`/`emit_raw` write to stdout; the delete escapes
   clean up on pane-open and on quit. `scale_for` maps the cell pixel height to the
   render scale; `MAX_IMG_W` caps the transmitted width. Everything is pure and
-  unit-tested bar the two impure edges (`resolve`, `emit`).
+  unit-tested bar the two impure edges (`resolve`, `emit`). Profiling found the
+  per-frame cost is the stdout write (pty backpressure) + zlib, **not** the readback;
+  `encode_apc_path` is an **experimental `t=f`** path (`TINHORN_KITTY_FILE`) that
+  hands the terminal a file of raw RGB so the pty carries only a path — opt-in until
+  it's verified against the terminal, the base64 path staying the default.
 
 - **`paint`** (bin) — the small CPU `Rgb` (8-bit tint/palette) and `Texture`
   (row-major RGBA) types the overlays and the procedural generators use. They
@@ -331,6 +344,16 @@ and `drain_sounds` plays whatever the physics queued.
   the APC). All kitty code lives in `graphics`, never the vendored `term/` (the
   PROVENANCE re-sync contract) — its own `term/…/kitty.rs` is the unrelated
   keyboard protocol.
+- **Two levels of perf tooling, both TUI-safe** (never print to stdout — it *is*
+  the terminal). The `scene::FrameStats` overlay is the quick glance: FPS + the
+  render-target size, and in kitty mode a per-stage transmit breakdown (rest / pack
+  / zip / b64 / wr); on by default in debug builds, or `TINHORN_FPS=1` on a release
+  build (measure release — the workspace optimizes deps but not our own crate, so a
+  debug build inflates *our* loops like `pack_rgb`). For a system-level flamegraph,
+  `--features profiling` turns on Bevy's per-system tracing spans and writes a chrome
+  trace on quit (`profiling-tracy` streams to Tracy instead); the `profile_span!`
+  macro adds our non-system blocks (compose, kitty emit) and is a no-op without the
+  feature.
 - Audio opens the **default output device only** (`foley.rs::open_sink`, on the
   audio thread). Never call rodio's `open_default_sink()` or enumerate devices:
   the fallback walks every audio device including microphones, which is its own

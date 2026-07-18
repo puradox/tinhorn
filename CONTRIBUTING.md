@@ -148,8 +148,11 @@ truth, and the Bevy entities are a pure view of it.
   pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
   (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for
   flicker-free replace, `q=2` so no response reaches the input stream), after the draw.
-  Lives outside the vendored `term/` (the re-sync contract) and named `graphics` so
-  it never collides with `term/…/kitty.rs` (the keyboard protocol).
+  (`encode_apc_path` is an experimental `t=f` alternative — `TINHORN_KITTY_FILE` —
+  that references a file of raw pixels so the pty carries only a path, since
+  profiling showed the per-frame cost is the stdout write, not the readback.) Lives
+  outside the vendored `term/` (the re-sync contract) and named `graphics` so it
+  never collides with `term/…/kitty.rs` (the keyboard protocol).
 - **`paint`** (binary) — the small `Rgb`/`Texture` types the overlays and the
   procedural textures use; they outlived the deleted software rasterizer.
 - **`cli`** (binary) — clap argument parsing and the one-shot output paths (bare
@@ -261,6 +264,17 @@ TINHORN_BEVY_SNAPSHOT=/tmp/arena.png cargo run -- 4d6!kh3   # PNG + a text frame
 TINHORN_SNAP_COLS=120 TINHORN_SNAP_ROWS=44 …                # compose at a larger size
 TINHORN_SNAP_FRAME=8 …                                      # capture mid-roll, not settled
 ```
+
+For **chasing frame-time regressions**, both tools stay off stdout (it's the
+terminal): the `scene::FrameStats` overlay in the arena's top border shows FPS + the
+render-target size — and, in kitty mode, a per-stage transmit breakdown (rest /
+pack / zip / b64 / wr) — on by default in debug, or `TINHORN_FPS=1` on a release
+build. **Measure release** for real numbers: the workspace optimizes dependencies
+but not our own crate, so a debug build inflates our own loops (`pack_rgb`, the
+blit). For a per-system flamegraph, `cargo run --features profiling` turns on Bevy's
+tracing spans and writes a chrome trace (`trace-<ts>.json`, for Perfetto) on quit;
+`--features profiling-tracy` streams to Tracy instead. (This is how we found the
+kitty lag was the stdout write + zlib, not the GPU→CPU readback.)
 
 wgpu runs headless, so the snapshot works in CI and over ssh. Beyond the chrome,
 the suite covers notation parsing (including the `vs` grammar and its overflow

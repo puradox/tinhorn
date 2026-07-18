@@ -9,6 +9,18 @@ readme = "../../README.md"
 keywords = ["dice", "roll", "rpg", "ttrpg"]
 categories = ["command-line-utilities", "games"]
 
+[features]
+# Deep per-system profiling for chasing frame-time regressions (works on debug
+# builds, where the workspace already optimizes deps but not our own code — so our
+# hot spots stand out). Bevy instruments every system with tracing spans; on quit a
+# chrome trace `trace-<timestamp>.json` is written next to the binary — load it in
+# https://ui.perfetto.dev or chrome://tracing. Writes to a file, never stdout, so
+# it's safe over the TUI. Run: `cargo run --features profiling -- 3d6`.
+profiling = ["bevy/trace_chrome"]
+# The same instrumentation, streamed live to the Tracy profiler GUI instead (needs
+# a matching Tracy server running): `cargo run --features profiling-tracy -- 3d6`.
+profiling-tracy = ["bevy/trace_tracy"]
+
 [dependencies]
 tinhorn-core = { workspace = true }
 ratatui = { workspace = true, features = ["unstable-widget-ref"] }

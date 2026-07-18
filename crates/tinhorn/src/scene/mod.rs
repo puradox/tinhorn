@@ -50,6 +50,17 @@ const MAX_CLICKS_PER_FRAME: usize = 8;
 const SNAP_COLS: u16 = 100;
 const SNAP_ROWS: u16 = 38;
 
+/// A tracing span for a hot block, compiled only under the `profiling` /
+/// `profiling-tracy` features (see Cargo.toml), so ordinary builds pay nothing. It
+/// gives our non-system work — the compose and the kitty emit inside the one
+/// `draw_ui` system — its own bars in the trace, next to Bevy's per-system spans.
+macro_rules! profile_span {
+    ($name:expr) => {
+        #[cfg(any(feature = "profiling", feature = "profiling-tracy"))]
+        let _profile_guard = bevy::log::info_span!($name).entered();
+    };
+}
+
 /// Entry point (interactive or headless snapshot). Only called off the
 /// interactive CLI path, never one-shot. `arg` is the `--graphics` flag; the
 /// snapshot path forces half-blocks (it composes to a `TestBackend`/PNG and has no
@@ -568,16 +579,20 @@ fn draw_ui(
 
     let mut reported = (view.w, view.h);
     let mut panel = None;
-    context.draw(|frame| {
-        let report = ui::render_bevy_mode(frame, &mut sim.0, &arena.pixels, arena.w, arena.h, mode);
-        if report.view.0 > 0 {
-            reported = (report.view.0 as u32, report.view.1 as u32);
-        }
-        panel = report.kitty;
-        if show_fps {
-            draw_fps_overlay(frame, fps, stage, mode, arena.w, arena.h);
-        }
-    })?;
+    {
+        profile_span!("compose");
+        context.draw(|frame| {
+            let report =
+                ui::render_bevy_mode(frame, &mut sim.0, &arena.pixels, arena.w, arena.h, mode);
+            if report.view.0 > 0 {
+                reported = (report.view.0 as u32, report.view.1 as u32);
+            }
+            panel = report.kitty;
+            if show_fps {
+                draw_fps_overlay(frame, fps, stage, mode, arena.w, arena.h);
+            }
+        })?;
+    }
     view.w = reported.0;
     view.h = reported.1;
 
@@ -610,6 +625,7 @@ fn emit_kitty(
         }
         return;
     }
+    profile_span!("kitty_emit");
     // Time each transmit stage (ms) so the overlay can show where the frame goes.
     let ms = |t: Instant| t.elapsed().as_secs_f32() * 1000.0;
 
