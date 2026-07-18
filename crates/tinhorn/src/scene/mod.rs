@@ -117,6 +117,10 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
         .insert_resource(KittyState::default())
+        .insert_resource(FrameStats {
+            fps: 0.0,
+            show: cfg!(debug_assertions) || std::env::var_os("TINHORN_FPS").is_some(),
+        })
         .add_systems(PreUpdate, input_system)
         .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
         .add_systems(PostUpdate, kitty_cleanup)
@@ -164,6 +168,16 @@ struct Graphics(GraphicsMode);
 #[derive(Resource, Default)]
 struct KittyState {
     placed: bool,
+}
+
+/// The debug frame-rate readout. `fps` is an EMA of the real per-frame `dt`, drawn
+/// in the arena's top border alongside the render-target size (the biggest perf
+/// signal for the kitty path). `show` is fixed at startup: on in a debug build, or
+/// whenever `TINHORN_FPS` is set (so a release build can be profiled too).
+#[derive(Resource, Default)]
+struct FrameStats {
+    fps: f32,
+    show: bool,
 }
 
 /// Tags a Bevy entity as the view of `sim.0.dice[index]`.
@@ -483,6 +497,7 @@ fn choreograph(
 
 /// Compose the interactive frame (Bevy arena blit + all chrome) into the terminal,
 /// and report the arena panel size back so the render target can track it.
+#[allow(clippy::too_many_arguments)] // a Bevy system's params are its dependencies
 fn draw_ui(
     mut context: ResMut<RatatuiContext>,
     mut sim: ResMut<Sim>,
@@ -490,8 +505,26 @@ fn draw_ui(
     mut view: ResMut<ArenaView>,
     gfx: Res<Graphics>,
     mut kitty: ResMut<KittyState>,
+    time: Res<Time>,
+    mut stats: ResMut<FrameStats>,
 ) -> Result {
     let mode = gfx.0;
+
+    // Smooth the real frame rate for the debug overlay: 1/dt, EMA-filtered so it
+    // isn't a jittery blur. `dt` is the wall-clock gap between Update runs, so this
+    // is the *actual* loop rate — if the encode/readback overruns the 1/60 s budget,
+    // the number falls, which is the whole point.
+    let dt = time.delta_secs();
+    if dt > 0.0 {
+        let inst = 1.0 / dt;
+        stats.fps = if stats.fps > 0.0 {
+            stats.fps * 0.9 + inst * 0.1
+        } else {
+            inst
+        };
+    }
+    let (show_fps, fps) = (stats.show, stats.fps);
+
     let mut reported = (view.w, view.h);
     let mut panel = None;
     context.draw(|frame| {
@@ -500,6 +533,9 @@ fn draw_ui(
             reported = (report.view.0 as u32, report.view.1 as u32);
         }
         panel = report.kitty;
+        if show_fps {
+            draw_fps_overlay(frame, fps, mode, arena.w, arena.h);
+        }
     })?;
     view.w = reported.0;
     view.h = reported.1;
@@ -548,6 +584,36 @@ fn emit_kitty(panel: &ui::KittyPanel, arena: &ArenaImage, pane_open: bool, state
     if graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok() {
         state.placed = true;
     }
+}
+
+/// Draw the debug FPS readout in the arena's top border (right-aligned), alongside
+/// the mode and render-target size — the size being the biggest perf signal for the
+/// kitty path, since it renders/reads-back/encodes that many pixels every frame.
+fn draw_fps_overlay(
+    frame: &mut ratatui::Frame,
+    fps: f32,
+    mode: GraphicsMode,
+    img_w: u32,
+    img_h: u32,
+) {
+    let tag = match mode {
+        GraphicsMode::Blocks => "blocks",
+        GraphicsMode::Kitty { .. } => "kitty",
+    };
+    let label = format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
+    let area = frame.area();
+    let w = label.chars().count() as u16;
+    if area.width <= w + 2 {
+        return; // too narrow — don't corrupt the border
+    }
+    frame.buffer_mut().set_string(
+        area.width - w - 1,
+        0,
+        label,
+        ratatui::style::Style::default()
+            .fg(ratatui::style::Color::Black)
+            .bg(ratatui::style::Color::Yellow),
+    );
 }
 
 /// On quit, delete our kitty image so nothing is left behind in the scrollback.
@@ -745,5 +811,45 @@ fn color_rgb(c: TColor) -> [u8; 3] {
         TColor::LightBlue => [130, 170, 240],
         TColor::LightCyan => [140, 220, 230],
         _ => [13, 17, 23],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn top_row(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area().width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn fps_overlay_shows_rate_mode_and_render_size() {
+        // The overlay is the perf diagnostic: it must carry the frame rate, the mode,
+        // and the render-target size (the size being the whole point — it's what
+        // reveals why kitty is heavy).
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|f| draw_fps_overlay(f, 42.0, GraphicsMode::Kitty { scale: 8 }, 1600, 1200))
+            .unwrap();
+        let row = top_row(&terminal);
+        assert!(row.contains("42 fps"), "frame rate missing: {row:?}");
+        assert!(row.contains("kitty"), "mode tag missing: {row:?}");
+        assert!(row.contains("1600×1200"), "render size missing: {row:?}");
+    }
+
+    #[test]
+    fn fps_overlay_skips_a_too_narrow_frame() {
+        // Narrower than the label: it must be skipped, not panic or corrupt the row.
+        let mut terminal = Terminal::new(TestBackend::new(10, 6)).unwrap();
+        terminal
+            .draw(|f| draw_fps_overlay(f, 30.0, GraphicsMode::Blocks, 200, 160))
+            .unwrap();
+        assert!(
+            !top_row(&terminal).contains("fps"),
+            "should skip when too narrow"
+        );
     }
 }
