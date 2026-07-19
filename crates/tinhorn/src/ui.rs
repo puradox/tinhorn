@@ -1262,44 +1262,74 @@ fn quadrant_blit(
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
         return;
     }
+    let (w, h) = (inner.width as usize, inner.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
     // Render pixels per sub-pixel in each axis: the sub-pixel grid is 2× the cell
     // grid on both axes, so `ssx`/`ssy` are `QUAD_SS/2` and `QUAD_SS` respectively.
     let (subw, subh) = (inner.width as u32 * 2, inner.height as u32 * 2);
     let ssx = (img_w / subw.max(1)).max(1);
     let ssy = (img_h / subh.max(1)).max(1);
     let (fw, fh) = (subw as f32, subh as f32);
-    // Box-average the `ssx`×`ssy` render block for sub-pixel `(sx, sy)`, warm-graded.
-    let subpx = |sx: u32, sy: u32| -> (u8, u8, u8) {
-        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-        for dy in 0..ssy {
-            for dx in 0..ssx {
-                let px = (sx * ssx + dx).min(img_w - 1) as usize;
-                let py = (sy * ssy + dy).min(img_h - 1) as usize;
-                let i = py * stride + px * 4;
-                r += pixels[i] as u32;
-                g += pixels[i + 1] as u32;
-                b += pixels[i + 2] as u32;
-            }
-        }
-        let n = (ssx * ssy).max(1);
-        let (fr, fg, fb) = vignette((sx as f32 + 0.5) / fw - 0.5, (sy as f32 + 0.5) / fh - 0.5);
-        (
-            ((r / n) as f32 * fr).min(255.0) as u8,
-            ((g / n) as f32 * fg).min(255.0) as u8,
-            ((b / n) as f32 * fb).min(255.0) as u8,
-        )
-    };
     let fit = if half_block { half_cell } else { quad_cell };
-    for row in 0..inner.height {
-        for col in 0..inner.width {
-            let (sx, sy) = (col as u32 * 2, row as u32 * 2);
-            let (ch, fg, bg) = fit([
-                subpx(sx, sy),         // TL
-                subpx(sx + 1, sy),     // TR
-                subpx(sx, sy + 1),     // BL
-                subpx(sx + 1, sy + 1), // BR
-            ]);
-            let cell = &mut buf[(inner.x + col, inner.y + row)];
+
+    // Fit every cell to its `(glyph, fg, bg)` **in parallel by row band** — the box-
+    // average over the supersampled render plus the 2-colour fit is the per-frame cost
+    // (the buffer write below is trivial), and it scales with the arena area, so at a
+    // full-screen size the serial version bottlenecks the blocks path. Rows are
+    // independent and the output chunks disjoint, so the result is byte-identical to a
+    // serial pass with no synchronization — the same split `graphics::pack_rgb` uses.
+    let mut out = vec![(' ', Color::Reset, Color::Reset); w * h];
+    let threads = crate::graphics::core_count().clamp(1, h);
+    let band = h.div_ceil(threads);
+    std::thread::scope(|s| {
+        for (t, chunk) in out.chunks_mut(band * w).enumerate() {
+            let row0 = t * band;
+            s.spawn(move || {
+                // Box-average the `ssx`×`ssy` render block for sub-pixel `(sx, sy)`, warm-graded.
+                let subpx = |sx: u32, sy: u32| -> (u8, u8, u8) {
+                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                    for dy in 0..ssy {
+                        for dx in 0..ssx {
+                            let px = (sx * ssx + dx).min(img_w - 1) as usize;
+                            let py = (sy * ssy + dy).min(img_h - 1) as usize;
+                            let i = py * stride + px * 4;
+                            r += pixels[i] as u32;
+                            g += pixels[i + 1] as u32;
+                            b += pixels[i + 2] as u32;
+                        }
+                    }
+                    let n = (ssx * ssy).max(1);
+                    let (fr, fg, fb) =
+                        vignette((sx as f32 + 0.5) / fw - 0.5, (sy as f32 + 0.5) / fh - 0.5);
+                    (
+                        ((r / n) as f32 * fr).min(255.0) as u8,
+                        ((g / n) as f32 * fg).min(255.0) as u8,
+                        ((b / n) as f32 * fb).min(255.0) as u8,
+                    )
+                };
+                for (r_local, slot_row) in chunk.chunks_exact_mut(w).enumerate() {
+                    let sy = (row0 + r_local) as u32 * 2;
+                    for (col, slot) in slot_row.iter_mut().enumerate() {
+                        let sx = col as u32 * 2;
+                        *slot = fit([
+                            subpx(sx, sy),         // TL
+                            subpx(sx + 1, sy),     // TR
+                            subpx(sx, sy + 1),     // BL
+                            subpx(sx + 1, sy + 1), // BR
+                        ]);
+                    }
+                }
+            });
+        }
+    });
+
+    // Trivial serial write of the fitted cells into the ratatui buffer.
+    for row in 0..h {
+        for col in 0..w {
+            let (ch, fg, bg) = out[row * w + col];
+            let cell = &mut buf[(inner.x + col as u16, inner.y + row as u16)];
             cell.set_char(ch);
             cell.set_style(Style::default().fg(fg).bg(bg));
         }

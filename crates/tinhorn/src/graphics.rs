@@ -48,10 +48,10 @@ pub const MAX_IMG_W: u32 = 1600;
 /// bytes (the protocol's documented 4096-byte limit).
 const CHUNK: usize = 4096;
 
-/// The machine's core count, cached: [`pack_rgb`] splits its row-band work across
-/// it every frame, but it can't change during a run, so `available_parallelism`
-/// runs once, not on the hot path.
-fn core_count() -> usize {
+/// The machine's core count, cached: the per-frame readback passes ([`pack_rgb`]
+/// and `ui::quadrant_blit`) split their row-band work across it, but it can't change
+/// during a run, so `available_parallelism` runs once, not on the hot path.
+pub(crate) fn core_count() -> usize {
     use std::sync::OnceLock;
     static CORES: OnceLock<usize> = OnceLock::new();
     *CORES.get_or_init(|| {
