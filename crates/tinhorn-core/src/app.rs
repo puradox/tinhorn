@@ -57,9 +57,26 @@ pub struct Die {
     explode: Option<parse::Compare>,
     /// Set once a die has had its chance to explode, so it can't spawn twice.
     exploded: bool,
+    /// Set once this die's crit ceremony (gold burst + ring) has fired, so it
+    /// can't fire twice. On an exploding term a maxed die celebrates the instant
+    /// it settles — before its sibling drops — instead of waiting for the whole
+    /// chain to come to rest; this flag stops [`App::record_roll`] re-bursting it
+    /// at the end. Plain (non-exploding) pools leave it false and still get the
+    /// one batched chord when everything settles.
+    celebrated: bool,
     age: f32, // seconds airborne; a hard cap forces a rest so nothing tumbles forever
     /// Handle to this die's Rapier rigid body (invalid until spawned).
     body: RigidBodyHandle,
+}
+
+impl Die {
+    /// A kept die at rest on its proudest face — [`crit_face`] applied to this
+    /// die. The one home for the (kept · settled · max-face) triple, shared by
+    /// [`App::crit_dice`] and the settle-time / end-of-roll burst passes so the
+    /// crit-eligibility rule can't drift between them.
+    fn is_crit(&self) -> bool {
+        self.kept && self.settled && crit_face(self.sides, self.final_value)
+    }
 }
 
 /// THE statement of the staked-check rule: `(success, margin)` for a total
@@ -520,11 +537,15 @@ impl App {
             }
         }
         self.particles.clear();
-        self.sounds.retain(|s| {
-            matches!(
-                s,
-                SoundEvent::Crit | SoundEvent::Fumble | SoundEvent::Success | SoundEvent::Failure
-            )
+        // Keep only the climax sounds — and collapse the crit ring to one. The
+        // animated path rings once per explosion wave, spaced across frames; an
+        // insta roll fast-forwards the whole cascade into this single frame, so
+        // every wave's ring would land at once (a bell choir). Voice one chime.
+        let mut crit_kept = false;
+        self.sounds.retain(|s| match s {
+            SoundEvent::Crit => !std::mem::replace(&mut crit_kept, true),
+            SoundEvent::Fumble | SoundEvent::Success | SoundEvent::Failure => true,
+            _ => false,
         });
         if let Some(d) = self.dice.first() {
             self.sounds.insert(0, SoundEvent::Settle { sides: d.sides });
@@ -596,6 +617,7 @@ impl App {
             kept: true,
             explode,
             exploded: false,
+            celebrated: false,
             age: 0.0,
             body: RigidBodyHandle::invalid(),
         }
@@ -735,9 +757,7 @@ impl App {
     /// Kept dice that settled on their proudest face — [`crit_face`] on any
     /// die type (a 6 on a d6 counts as much as a 20 on a d20).
     pub fn crit_dice(&self) -> impl Iterator<Item = &Die> {
-        self.dice
-            .iter()
-            .filter(|d| d.kept && d.settled && crit_face(d.sides, d.final_value))
+        self.dice.iter().filter(|d| d.is_crit())
     }
 
     /// Kept dice of any type that settled on a 1 ([`fumble_face`]).
@@ -977,6 +997,11 @@ impl App {
     /// the airborne clock), and spawn the dice that exploding faces call for.
     fn sync_and_settle(&mut self, dt: f32) {
         let mut to_explode: Vec<(u32, usize, i32, parse::Compare)> = Vec::new();
+        // Maxed dice on an exploding term that came to rest this step: they get
+        // their gold *now*, as they land, rather than at the end of the whole
+        // chain — so a `d6!` cascade rings and flares on every six instead of
+        // sitting silent until the last die stops (see `celebrate_crits`).
+        let mut just_crit: Vec<usize> = Vec::new();
         for i in 0..self.dice.len() {
             if self.dice[i].settled {
                 continue;
@@ -1021,8 +1046,20 @@ impl App {
                         to_explode.push((sides, term, mult, cmp));
                     }
                 }
+
+                // A kept max on an exploding term celebrates the instant it lands
+                // (a plain pool waits for the batched chord in `record_roll`, so
+                // its non-exploding crits stay one flare — this is what makes an
+                // explosion cascade feel live). Gated on the term, not on whether
+                // it actually spawned, so a six that hit the cap still flares.
+                // (`settled` was just set above, so `is_crit` folds in the max-face
+                // check.)
+                if explode.is_some() && self.dice[i].is_crit() {
+                    just_crit.push(i);
+                }
             }
         }
+        self.celebrate_crits(&just_crit);
 
         // Drop the explosion dice from the top, exactly like a fresh throw.
         // They inherit their term's reroll rules so a spawned die obeys the same
@@ -1055,6 +1092,27 @@ impl App {
         }
     }
 
+    /// Fire the crit ceremony for a batch of maxed dice that came to rest
+    /// together: punch the camera, spray gold from each, ring once. Dice that
+    /// settle in the same step are one chord (a fistful of sixes, not a bell
+    /// choir); an exploding cascade lands its sixes in separate steps, so each
+    /// wave earns its own ring. The flash is set *before* projecting so the
+    /// bursts ride the same punched-in camera the next frames render through
+    /// (see [`Self::world_to_cell`]). Each die is marked `celebrated` so the
+    /// end-of-roll pass in [`Self::record_roll`] can never burst it twice.
+    fn celebrate_crits(&mut self, dice: &[usize]) {
+        if dice.is_empty() {
+            return;
+        }
+        self.flash = 1.0; // gold flare + camera punch, before the bursts are placed
+        for &i in dice {
+            let (x, y) = self.world_to_cell(self.dice[i].pos);
+            self.burst(x, y, true);
+            self.dice[i].celebrated = true;
+        }
+        self.emit_priority(SoundEvent::Crit);
+    }
+
     /// Append the just-settled roll to the history (newest last), capped —
     /// and let the moment land: crit bursts, fumble dust, the staked verdict.
     fn record_roll(&mut self) {
@@ -1074,28 +1132,24 @@ impl App {
             self.history.drain(0..overflow);
         }
 
-        // Every maxed die bursts gold and every 1 slumps, but the ring and the
-        // thud play once per roll however many dice earned them — a fistful of
-        // sixes is one chord, not a bell choir. Positions are copied out first
-        // so the burst can borrow the RNG mutably.
-        let crit_pos: Vec<Vec3> = self.crit_dice().map(|d| d.pos).collect();
+        // Every maxed die bursts gold and every 1 slumps. A plain pool's crits
+        // all flare together here — a fistful of sixes is one chord, not a bell
+        // choir — while an exploding-term crit already rang as it landed
+        // (`celebrate_crits`), so only the un-celebrated ones remain: the whole
+        // of a plain pool, none of a `d6!` cascade. The fumble thud plays once.
+        let crit_idx: Vec<usize> = (0..self.dice.len())
+            .filter(|&i| self.dice[i].is_crit() && !self.dice[i].celebrated)
+            .collect();
+        // Fumble positions are copied out first so the burst can borrow the RNG
+        // mutably; fumbles are never celebrated early (the settle-time path only
+        // ever fires for crits), so every one of them is handled here.
         let fumble_pos: Vec<Vec3> = self.fumble_dice().map(|d| d.pos).collect();
-        // Fire the flash *before* projecting the bursts: the next frames render
-        // through the punched-in camera, so the bursts must be placed by it too
-        // or the gold would erupt beside the die instead of from it.
-        if !crit_pos.is_empty() {
-            self.flash = 1.0; // fire the gold flare + camera punch
-        }
-        let crits: Vec<(f32, f32)> = crit_pos.iter().map(|&p| self.world_to_cell(p)).collect();
+        self.celebrate_crits(&crit_idx);
+        // Placed after the crit flare so a fumble alongside a crit rides the same
+        // punched-in camera the gold does (see [`Self::world_to_cell`]).
         let fumbles: Vec<(f32, f32)> = fumble_pos.iter().map(|&p| self.world_to_cell(p)).collect();
-        for &(x, y) in &crits {
-            self.burst(x, y, true);
-        }
         for &(x, y) in &fumbles {
             self.burst(x, y, false);
-        }
-        if !crits.is_empty() {
-            self.emit_priority(SoundEvent::Crit);
         }
         if !fumbles.is_empty() {
             self.emit_priority(SoundEvent::Fumble);
@@ -2488,6 +2542,104 @@ mod tests {
                 "a settled die never got its explosion check"
             );
         }
+    }
+
+    #[test]
+    fn an_exploding_crit_flares_the_moment_it_lands_not_at_chain_end() {
+        // The point of the change: a `d6!` cascade rings and sparks on every six
+        // *as it settles* — while the sibling it just dropped is still tumbling —
+        // instead of sitting silent until the last die of the chain comes to rest.
+        for seed in 0..200 {
+            let mut app = seeded("6d6!", seed);
+            // Need a base six so the pool actually explodes.
+            if !app.dice.iter().any(|d| d.final_value == 6) {
+                continue;
+            }
+            let mut rang_while_live = None;
+            for _ in 0..20000 {
+                app.update(1.0 / 60.0);
+                if app.sounds.contains(&SoundEvent::Crit) {
+                    // The first ring: the six that just landed spawned a sibling
+                    // in the same step, so the arena must still be in motion.
+                    rang_while_live = Some(!app.all_settled());
+                    break;
+                }
+                if app.all_settled() {
+                    break;
+                }
+            }
+            assert_eq!(
+                rang_while_live,
+                Some(true),
+                "seed {seed}: the crit ring waited for the whole chain to finish"
+            );
+            assert!(
+                app.particles.iter().any(|p| p.bright),
+                "seed {seed}: the six landed but no gold flew"
+            );
+            return;
+        }
+        panic!("no seed in range rolled a six to explode");
+    }
+
+    #[test]
+    fn an_exploding_crit_is_celebrated_exactly_once() {
+        // The early flare must not double up: a die that flared as it landed is
+        // marked spent, so `record_roll`'s end-of-roll pass leaves it alone. Once
+        // settled, `celebrated` is set on exactly the kept sixes — never a die
+        // that wasn't a crit, and never left off one that was.
+        for seed in 0..200 {
+            let mut app = seeded("6d6!", seed);
+            if !app.dice.iter().any(|d| d.final_value == 6) {
+                continue;
+            }
+            settle(&mut app, 20000).expect("exploding pool never settled");
+            for d in &app.dice {
+                let is_crit = d.kept && crit_face(d.sides, d.final_value);
+                assert_eq!(
+                    d.celebrated, is_crit,
+                    "seed {seed}: die (value {}, kept {}) celebrated={} but crit={is_crit}",
+                    d.final_value, d.kept, d.celebrated
+                );
+            }
+            assert!(
+                app.dice.iter().any(|d| d.celebrated),
+                "seed {seed}: no six was ever celebrated"
+            );
+            return;
+        }
+        panic!("no seed in range rolled a six to explode");
+    }
+
+    #[test]
+    fn insta_collapses_an_exploding_cascade_to_one_crit_ring() {
+        // The animated path rings once per explosion wave, spaced across frames.
+        // An insta roll fast-forwards the whole cascade into one frame, so every
+        // wave's ring would pile up there — a bell choir. `insta_roll` must voice
+        // exactly one, however many sixes the cascade turned up.
+        for seed in 0..200 {
+            let mut app = seeded("", seed);
+            app.input = "6d6!".to_string();
+            app.insta_roll();
+            // Only meaningful once several waves fired — otherwise there'd be one
+            // ring to begin with and the collapse wouldn't be under test.
+            if app.crit_dice().count() < 2 {
+                continue;
+            }
+            let rings = app
+                .sounds
+                .iter()
+                .filter(|s| **s == SoundEvent::Crit)
+                .count();
+            assert_eq!(
+                rings,
+                1,
+                "seed {seed}: {} crit dice collapsed to {rings} rings, want 1",
+                app.crit_dice().count()
+            );
+            return;
+        }
+        panic!("no seed produced a multi-crit exploding cascade");
     }
 
     #[test]
