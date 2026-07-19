@@ -953,7 +953,7 @@ fn draw_arena_overlays(
         let num_scale = number_scale(ref_w * FACE_FRAC_W, ref_h * FACE_FRAC_H, max_digits);
         for die in &app.dice {
             match mode {
-                GraphicsMode::Blocks => {
+                GraphicsMode::Blocks { .. } => {
                     draw_die_number(frame, inner, camera, die, cols, rows, num_scale)
                 }
                 GraphicsMode::Kitty { .. } => {
@@ -1061,15 +1061,16 @@ pub fn render_bevy_mode(
         // kitty only raises the scale, so `arena_aspect`/`project_to_cell` stay the
         // single source of the framing.
         match mode {
-            GraphicsMode::Blocks => {
+            GraphicsMode::Blocks { half_block } => {
                 // Supersample (QUAD_SS× the quadrant sub-pixel grid); the blit
                 // box-downsamples it into 2×2-per-cell quadrant glyphs — twice the
-                // resolution of half-blocks, and the same "cols × 2·rows" aspect.
+                // resolution of half-blocks, and the same "cols × 2·rows" aspect —
+                // or seam-free half-blocks where those glyphs would tile poorly.
                 view = (
                     inner.width * QUAD_SS as u16,
                     inner.height * 2 * QUAD_SS as u16,
                 );
-                quadrant_blit(frame.buffer_mut(), inner, pixels, img_w, img_h);
+                quadrant_blit(frame.buffer_mut(), inner, pixels, img_w, img_h, half_block);
             }
             GraphicsMode::Kitty { scale } => {
                 let s = kitty_scale(scale, inner.width);
@@ -1117,7 +1118,15 @@ pub fn render_bevy(
     img_w: u32,
     img_h: u32,
 ) -> (u16, u16) {
-    render_bevy_mode(frame, app, pixels, img_w, img_h, GraphicsMode::Blocks).view
+    render_bevy_mode(
+        frame,
+        app,
+        pixels,
+        img_w,
+        img_h,
+        GraphicsMode::Blocks { half_block: false },
+    )
+    .view
 }
 
 /// Knock the requested kitty scale down until the transmitted image width stays
@@ -1208,6 +1217,21 @@ fn quad_cell(sub: [(u8, u8, u8); 4]) -> (char, Color, Color) {
     (QUAD_GLYPHS[mask as usize], fg, bg)
 }
 
+/// Collapse a cell's four sub-pixels to a **half-block** `▀` — `fg` the top row's
+/// average, `bg` the bottom's. Used on terminals (macOS Terminal.app) that tile the
+/// 2×2 quadrant glyphs with seams but render `▀` pixel-perfect: half the horizontal
+/// resolution of [`quad_cell`], but seam-free.
+fn half_cell(sub: [(u8, u8, u8); 4]) -> (char, Color, Color) {
+    let mix = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+        Color::Rgb(
+            ((a.0 as u16 + b.0 as u16) / 2) as u8,
+            ((a.1 as u16 + b.1 as u16) / 2) as u8,
+            ((a.2 as u16 + b.2 as u16) / 2) as u8,
+        )
+    };
+    ('▀', mix(sub[0], sub[1]), mix(sub[2], sub[3]))
+}
+
 /// The warm radial vignette applied to the arena: darkens toward the corners and
 /// warms the tint a touch (a whisper more red, a whisper less blue). Returns the
 /// per-channel multipliers `(fr, fg, fb)` for a normalised offset-from-centre
@@ -1223,13 +1247,16 @@ pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
 /// cell is a 2×2 grid of sub-pixels (`cols*2 × rows*2` overall — double a
 /// half-block's resolution), box-downsampled from the `QUAD_SS×` supersampled
 /// render, warm-graded by the radial vignette, and fitted to a 2-colour quadrant
-/// glyph ([`quad_cell`]). A no-op until the first readback of the right size lands.
+/// glyph ([`quad_cell`]) — or, when `half_block` is set (a terminal that seams the
+/// quadrants), a seam-free `▀` half-block per cell ([`half_cell`]). A no-op until the
+/// first readback of the right size lands.
 fn quadrant_blit(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     pixels: &[u8],
     img_w: u32,
     img_h: u32,
+    half_block: bool,
 ) {
     let stride = crate::graphics::readback_stride(img_w); // wgpu 256-byte row pad
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
@@ -1262,10 +1289,11 @@ fn quadrant_blit(
             ((b / n) as f32 * fb).min(255.0) as u8,
         )
     };
+    let fit = if half_block { half_cell } else { quad_cell };
     for row in 0..inner.height {
         for col in 0..inner.width {
             let (sx, sy) = (col as u32 * 2, row as u32 * 2);
-            let (ch, fg, bg) = quad_cell([
+            let (ch, fg, bg) = fit([
                 subpx(sx, sy),         // TL
                 subpx(sx + 1, sy),     // TR
                 subpx(sx, sy + 1),     // BL
@@ -1940,6 +1968,22 @@ mod tests {
     }
 
     #[test]
+    fn half_cell_is_a_seam_free_upper_block() {
+        let w = (240, 240, 240);
+        let k = (10, 10, 10);
+        // Always `▀` (the glyph terminals tile perfectly): fg = top-row average,
+        // bg = bottom-row average, regardless of the horizontal split.
+        assert_eq!(
+            half_cell([w, w, k, k]),
+            ('▀', Color::Rgb(240, 240, 240), Color::Rgb(10, 10, 10))
+        );
+        assert_eq!(
+            half_cell([(200, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]),
+            ('▀', Color::Rgb(100, 0, 0), Color::Rgb(0, 0, 0))
+        );
+    }
+
+    #[test]
     fn glyph_raster_matches_the_font() {
         // At scale 1, GlyphRaster marks Ink exactly where DIGIT_FONT lights a bit,
         // and never Ink where it doesn't (a hole is outline or clear, not a stroke).
@@ -2043,9 +2087,16 @@ mod tests {
         .unwrap();
         let mut kitty_none = false;
         t2.draw(|f| {
-            kitty_none = render_bevy_mode(f, &mut app, &[], 0, 0, GraphicsMode::Blocks)
-                .kitty
-                .is_none();
+            kitty_none = render_bevy_mode(
+                f,
+                &mut app,
+                &[],
+                0,
+                0,
+                GraphicsMode::Blocks { half_block: false },
+            )
+            .kitty
+            .is_none();
         })
         .unwrap();
         assert!(kitty_none, "blocks mode reports no kitty panel");

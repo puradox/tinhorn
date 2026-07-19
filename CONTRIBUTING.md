@@ -144,7 +144,9 @@ truth, and the Bevy entities are a pure view of it.
   it's building toward.
 - **`graphics`** (binary) — the **kitty graphics protocol** arena: the pixel-perfect
   output path for terminals that speak it (kitty, Ghostty, WezTerm), quadrant-glyph
-  blocks everywhere else. `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
+  blocks everywhere else (falling back to seam-free half-blocks on a terminal that
+  tiles the 2×2 glyphs poorly — macOS Terminal.app, `quadrants_tile_cleanly`).
+  `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
   `kitty_capable`, never under tmux/screen; `kitty`/`blocks` force it). The payload
   pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
   (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for

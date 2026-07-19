@@ -172,7 +172,12 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
             .unwrap_or(default)
     };
     // The snapshot path always composes to a TestBackend/PNG: force half-blocks.
-    let mut app = base_app(expr, seed, muted, GraphicsMode::Blocks);
+    let mut app = base_app(
+        expr,
+        seed,
+        muted,
+        GraphicsMode::Blocks { half_block: false },
+    );
     app.insert_resource(Snapshot {
         path,
         frames: 0,
@@ -726,7 +731,8 @@ fn draw_fps_overlay(
     let area = frame.area();
     let short = |tag: &str| format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
     let label = match mode {
-        GraphicsMode::Blocks => short("blocks"),
+        // "quad" vs "half" makes the seam-avoiding fallback visible in the overlay.
+        GraphicsMode::Blocks { half_block } => short(if half_block { "half" } else { "quad" }),
         GraphicsMode::Kitty { .. } => {
             let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
             let sum = stage.prep + stage.zip + stage.b64 + stage.wr;
@@ -1051,17 +1057,14 @@ mod tests {
     fn fps_overlay_falls_back_and_skips() {
         // Blocks short form fits a modest width…
         let mut wide = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        wide.draw(|f| {
-            draw_fps_overlay(f, 60.0, StageMs::default(), GraphicsMode::Blocks, 240, 180)
-        })
-        .unwrap();
+        let blocks = GraphicsMode::Blocks { half_block: false };
+        wide.draw(|f| draw_fps_overlay(f, 60.0, StageMs::default(), blocks, 240, 180))
+            .unwrap();
         assert!(top_row(&wide).contains("60 fps"), "{:?}", top_row(&wide));
         // …but a tiny frame is skipped, not panicking or corrupting the row.
         let mut tiny = Terminal::new(TestBackend::new(10, 6)).unwrap();
-        tiny.draw(|f| {
-            draw_fps_overlay(f, 30.0, StageMs::default(), GraphicsMode::Blocks, 200, 160)
-        })
-        .unwrap();
+        tiny.draw(|f| draw_fps_overlay(f, 30.0, StageMs::default(), blocks, 200, 160))
+            .unwrap();
         assert!(
             !top_row(&tiny).contains("fps"),
             "should skip when too narrow"

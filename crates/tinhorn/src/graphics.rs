@@ -18,12 +18,14 @@ use base64::prelude::{BASE64_STANDARD, Engine};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
-/// The chosen output path for the arena. `Blocks` is the universal `▀` half-block
-/// blit; `Kitty` places the GPU frame as a real image, at `scale` render pixels
-/// per half-block sub-pixel (so the image is `cols*scale` × `rows*2*scale`).
+/// The chosen output path for the arena. `Blocks` is the universal text-glyph blit —
+/// **quadrant** glyphs (2×2 sub-pixels/cell) normally, or seamless half-blocks
+/// (`half_block: true`) on a terminal that doesn't tile the quadrants cleanly.
+/// `Kitty` places the GPU frame as a real image, at `scale` render pixels per
+/// half-block sub-pixel (so the image is `cols*scale` × `rows*2*scale`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphicsMode {
-    Blocks,
+    Blocks { half_block: bool },
     Kitty { scale: u32 },
 }
 
@@ -86,6 +88,15 @@ pub fn kitty_capable(term: &str, term_program: &str, kitty_window_id: bool, in_t
         || tp == "wezterm"
 }
 
+/// Does this terminal tile the 2×2 quadrant glyphs (`▖▗▘▙▚▛▜▝▞▟`) seamlessly?
+/// Most terminals special-case the block-element glyphs to render pixel-perfect,
+/// edge-to-edge — but macOS Terminal.app draws the quadrants through its font, which
+/// leaves visible seams, so there the blit falls back to half-blocks (which it *does*
+/// tile perfectly). Hermetic; the caller passes `TERM_PROGRAM` in.
+pub fn quadrants_tile_cleanly(term_program: &str) -> bool {
+    term_program != "Apple_Terminal"
+}
+
 /// The render scale (pixels per half-block sub-pixel) for a cell that is
 /// `cell_px_h` pixels tall: half its height (a sub-pixel is a half-cell), clamped
 /// to a sane `2..=12`, and `8` when the ioctl reports a zero pixel size (many
@@ -102,14 +113,18 @@ pub fn scale_for(cell_px_h: u32) -> u32 {
 /// environment and the terminal pixel size. One of the two impure edges; the
 /// hermetic pieces it leans on ([`kitty_capable`], [`scale_for`]) are unit-tested.
 pub fn resolve(arg: GraphicsArg) -> GraphicsMode {
+    let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    // The text-glyph fallback: quadrants normally, half-blocks where they'd seam.
+    let blocks = GraphicsMode::Blocks {
+        half_block: !quadrants_tile_cleanly(&term_program),
+    };
     match arg {
-        GraphicsArg::Blocks => GraphicsMode::Blocks,
+        GraphicsArg::Blocks => blocks,
         GraphicsArg::Kitty => GraphicsMode::Kitty {
             scale: detect_scale(),
         },
         GraphicsArg::Auto => {
             let term = std::env::var("TERM").unwrap_or_default();
-            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
             let kitty_window_id = std::env::var_os("KITTY_WINDOW_ID").is_some();
             let in_tmux = std::env::var_os("TMUX").is_some();
             if kitty_capable(&term, &term_program, kitty_window_id, in_tmux) {
@@ -117,7 +132,7 @@ pub fn resolve(arg: GraphicsArg) -> GraphicsMode {
                     scale: detect_scale(),
                 }
             } else {
-                GraphicsMode::Blocks
+                blocks
             }
         }
     }
@@ -317,6 +332,16 @@ mod tests {
         assert!(!kitty_capable("screen", "", true, false)); // TERM=screen*
         assert!(!kitty_capable("tmux-256color", "", true, false)); // TERM=tmux*
         assert!(!kitty_capable("xterm-kitty", "ghostty", false, true)); // $TMUX vetoes kitty TERM
+    }
+
+    #[test]
+    fn quadrants_tile_cleanly_except_apple_terminal() {
+        // Modern terminals tile the 2×2 glyphs pixel-perfect; macOS Terminal.app is
+        // the one that seams them, so it (and only it) falls back to half-blocks.
+        for tp in ["ghostty", "iTerm.app", "WezTerm", "vscode", ""] {
+            assert!(quadrants_tile_cleanly(tp), "{tp} should tile quadrants");
+        }
+        assert!(!quadrants_tile_cleanly("Apple_Terminal"));
     }
 
     #[test]
