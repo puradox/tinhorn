@@ -115,8 +115,9 @@ truth, and the Bevy entities are a pure view of it.
   after the draw (`kitty_cleanup` clears it on quit) — and `drain_sounds` plays
   what the physics queued. A headless `Camera3d` renders into an offscreen image
   that's **read back to the CPU with Bevy 0.19's built-in `gpu_readback`**
-  (`Readback` + `ReadbackComplete`) and, in `blocks` mode, blitted as half-blocks
-  (in `kitty` mode the same readback is transmitted as an image) — with HDR +
+  (`Readback` + `ReadbackComplete`) and, in `blocks` mode, blitted as quadrant
+  glyphs (2×2 sub-pixels per cell, twice a half-block's resolution; in `kitty` mode
+  the same readback is transmitted as an image) — with HDR +
   filmic tonemapping, MSAA, screen-space
   ambient occlusion, shadow maps, distance fog, a 2× supersample, and a warm
   vignette. `scene/arena.rs` builds the static casino furniture (felt, mahogany
@@ -142,8 +143,8 @@ truth, and the Bevy entities are a pure view of it.
   dim `…` until every die has landed — so the animation never spoils the number
   it's building toward.
 - **`graphics`** (binary) — the **kitty graphics protocol** arena: the pixel-perfect
-  output path for terminals that speak it (kitty, Ghostty, WezTerm), half-blocks
-  everywhere else. `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
+  output path for terminals that speak it (kitty, Ghostty, WezTerm), quadrant-glyph
+  blocks everywhere else. `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
   `kitty_capable`, never under tmux/screen; `kitty`/`blocks` force it). The payload
   pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
   (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for

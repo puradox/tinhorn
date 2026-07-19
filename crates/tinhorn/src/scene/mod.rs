@@ -5,8 +5,9 @@
 //! keys to the shared `handle_key`, `advance_sim` steps the physics,
 //! `sync_dice_scene` mirrors `app.dice` into `DieView` entities, the camera and
 //! lights choreograph off the sim's envelopes, and `draw_ui` composes the CPU
-//! read-back of the Bevy render (blitted as half-blocks) with all of tinhorn's
-//! ratatui chrome via [`ui::render_bevy`]. The render target autoresizes to the
+//! read-back of the Bevy render (blitted as quadrant glyphs, or a real kitty image)
+//! with all of tinhorn's ratatui chrome via [`ui::render_bevy`]. The render target
+//! autoresizes to the
 //! arena panel so the blit is 1:1 and the burned-number overlays land on their
 //! dice.
 //!
@@ -63,7 +64,7 @@ macro_rules! profile_span {
 
 /// Entry point (interactive or headless snapshot). Only called off the
 /// interactive CLI path, never one-shot. `arg` is the `--graphics` flag; the
-/// snapshot path forces half-blocks (no TTY to resolve against), the interactive
+/// snapshot path forces blocks (no TTY to resolve against), the interactive
 /// path resolves it against the terminal.
 pub fn run(expr: String, seed: Option<u64>, muted: bool, arg: GraphicsArg) {
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
@@ -901,15 +902,20 @@ fn save_snapshot(
     exit.write_default();
 }
 
-/// Dump a composed frame as text (the `▀` arena fill blanked to spaces, so the
-/// burned die numbers and the chrome read clearly) for headless validation.
+/// Dump a composed frame as text (the arena's quadrant-glyph fill blanked to
+/// spaces, so the burned die numbers and the chrome read clearly) for headless
+/// validation.
 fn print_frame_text(buf: &ratatui::buffer::Buffer) {
     let area = *buf.area();
     let mut out = String::from("\n");
     for y in 0..area.height {
         for x in 0..area.width {
             let sym = buf[(area.x + x, area.y + y)].symbol();
-            out.push_str(if sym == "▀" { " " } else { sym });
+            let is_arena = sym
+                .chars()
+                .next()
+                .is_some_and(|c| ui::quad_pattern(c).is_some());
+            out.push_str(if is_arena { " " } else { sym });
         }
         out.push('\n');
     }
@@ -925,27 +931,36 @@ struct Snapshot {
     at_frame: Option<u32>,
 }
 
-/// Encode a composed ratatui buffer as a PNG (two stacked pixels per cell for the
-/// `▀` half-block cells; a flat cell colour otherwise), so the whole UI — arena
-/// and chrome — can be eyeballed from a non-interactive shell.
+/// Encode a composed ratatui buffer as a PNG — **2×2 pixels per cell**, expanding
+/// each arena quadrant glyph back into its four sub-pixels (`fg`/`bg` per the glyph
+/// mask) and painting chrome/digit cells as a flat colour — so the whole UI, arena
+/// and chrome, can be eyeballed from a non-interactive shell.
 fn save_frame_png(
     buf: &ratatui::buffer::Buffer,
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let area = *buf.area();
-    let (pw, ph) = (area.width as usize, area.height as usize * 2);
+    let (pw, ph) = (area.width as usize * 2, area.height as usize * 2);
     let mut px = vec![0u8; pw * ph * 4];
     for cy in 0..area.height {
         for cx in 0..area.width {
             let cell = &buf[(area.x + cx, area.y + cy)];
-            let (top, bot) = if cell.symbol() == "▀" {
-                (color_rgb(cell.fg), color_rgb(cell.bg))
-            } else {
-                (color_rgb(cell.fg), color_rgb(cell.fg))
+            let ch = cell.symbol().chars().next().unwrap_or(' ');
+            // A quadrant glyph expands to its 2×2 sub-pixels; anything else (chrome,
+            // a scale-0 digit) fills the block with its fg colour.
+            let sub: [[u8; 3]; 4] = match ui::quad_pattern(ch) {
+                Some(mask) => {
+                    let (fg, bg) = (color_rgb(cell.fg), color_rgb(cell.bg));
+                    [0, 1, 2, 3].map(|i| if mask & (1 << i) != 0 { fg } else { bg })
+                }
+                None => [color_rgb(cell.fg); 4],
             };
-            for (row, [r, g, b]) in [(cy as usize * 2, top), (cy as usize * 2 + 1, bot)] {
-                let i = (row * pw + cx as usize) * 4;
-                px[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+            // Sub-pixel order 0=TL, 1=TR, 2=BL, 3=BR → offsets in the 2×2 block.
+            for (i, (dx, dy)) in [(0, (0, 0)), (1, (1, 0)), (2, (0, 1)), (3, (1, 1))] {
+                let (x, y) = (cx as usize * 2 + dx, cy as usize * 2 + dy);
+                let o = (y * pw + x) * 4;
+                let [r, g, b] = sub[i];
+                px[o..o + 4].copy_from_slice(&[r, g, b, 255]);
             }
         }
     }
