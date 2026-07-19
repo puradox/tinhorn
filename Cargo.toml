@@ -15,6 +15,11 @@ ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4", features = ["derive"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+# The kitty graphics arena's payload pipeline (see `tinhorn/src/graphics.rs`):
+# zlib the raw RGB, base64 it, chunk it into APC escapes. flate2 defaults to the
+# pure-Rust miniz_oxide backend, so no C toolchain is pulled in.
+base64 = "0.22"
+flate2 = "1.1"
 
 # The animation wants LTO; kept at the workspace root so it applies to the
 # whole build.

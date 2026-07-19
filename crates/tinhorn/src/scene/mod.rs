@@ -14,7 +14,7 @@
 //! constructs a Bevy `App`, so scripting stays GPU-free.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::term::event::KeyMessage;
 use crate::term::{RatatuiContext, RatatuiPlugins};
@@ -37,6 +37,7 @@ use tinhorn_core::app::{App as DiceApp, Die, SoundEvent};
 use tinhorn_core::{dice_geom, physics, view_math};
 
 use crate::foley::Foley;
+use crate::graphics::{self, GraphicsArg, GraphicsMode};
 use crate::{Action, handle_key, ui};
 
 mod arena;
@@ -49,13 +50,26 @@ const MAX_CLICKS_PER_FRAME: usize = 8;
 const SNAP_COLS: u16 = 100;
 const SNAP_ROWS: u16 = 38;
 
+/// A tracing span for a hot block, compiled only under the `profiling` /
+/// `profiling-tracy` features (see Cargo.toml), so ordinary builds pay nothing. It
+/// gives our non-system work — the compose and the kitty emit inside the one
+/// `draw_ui` system — its own bars in the trace, next to Bevy's per-system spans.
+macro_rules! profile_span {
+    ($name:expr) => {
+        #[cfg(any(feature = "profiling", feature = "profiling-tracy"))]
+        let _profile_guard = bevy::log::info_span!($name).entered();
+    };
+}
+
 /// Entry point (interactive or headless snapshot). Only called off the
-/// interactive CLI path, never one-shot.
-pub fn run(expr: String, seed: Option<u64>, muted: bool) {
+/// interactive CLI path, never one-shot. `arg` is the `--graphics` flag; the
+/// snapshot path forces half-blocks (it composes to a `TestBackend`/PNG and has no
+/// TTY to resolve against), the interactive path resolves it against the terminal.
+pub fn run(expr: String, seed: Option<u64>, muted: bool, arg: GraphicsArg) {
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
         run_snapshot(&expr, seed, muted, PathBuf::from(path));
     } else {
-        run_interactive(&expr, seed, muted);
+        run_interactive(&expr, seed, muted, graphics::resolve(arg));
     }
 }
 
@@ -64,7 +78,7 @@ pub fn run(expr: String, seed: Option<u64>, muted: bool) {
 /// transitively, so DefaultPlugins carries a WindowPlugin and no loop driver —
 /// render headless (no primary window, don't exit when there are none) and drive
 /// the loop ourselves at ~60 fps.
-fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
+fn base_app(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) -> App {
     let mut sim = match seed {
         Some(s) => DiceApp::with_seed(expr.to_string(), s),
         None => DiceApp::new(expr.to_string()),
@@ -88,6 +102,7 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
     ))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.03)))
     .insert_resource(Sim(sim))
+    .insert_resource(Graphics(mode))
     .insert_resource(ArenaView { w: 0, h: 0 })
     .init_resource::<ArenaImage>()
     .add_systems(Startup, setup)
@@ -105,14 +120,46 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool) -> App {
     app
 }
 
-/// The interactive path: terminal context, input, per-frame compose, sound.
-fn run_interactive(expr: &str, seed: Option<u64>, muted: bool) {
-    let mut app = base_app(expr, seed, muted);
+/// Are we running over SSH? A file-transmitted kitty image (`t=f`) can't work then —
+/// the file is written on this (remote) host but the terminal reads it on the local
+/// one, so the emitter must fall back to base64 through the pty (the only medium an
+/// SSH hop forwards). `SSH_CONNECTION`/`SSH_TTY` are set by sshd on the session.
+fn over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// The interactive path: terminal context, input, per-frame compose, sound. In
+/// kitty mode `draw_ui` also emits the image after the draw, `KittyState` gates the
+/// pane-open placement delete, and `kitty_cleanup` removes the image on quit.
+fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) {
+    let mut app = base_app(expr, seed, muted, mode);
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
+        .insert_resource(KittyState {
+            // File transmission (`t=f`) is used whenever it *can* be — always, on a
+            // local session. It can't cross an SSH hop (the file lands on this remote
+            // host, but the terminal reads it on the local one, different
+            // filesystems), so fall back to base64-through-the-pty there, the only
+            // medium SSH forwards. `TINHORN_KITTY_DIRECT` forces base64 too — a manual
+            // override for a local terminal that restricts which files it will read.
+            file: (!over_ssh() && std::env::var_os("TINHORN_KITTY_DIRECT").is_none())
+                .then(|| std::env::temp_dir().join(format!("tinhorn-{}.rgb", std::process::id()))),
+            ..default()
+        })
+        .insert_resource(FrameStats {
+            show: cfg!(debug_assertions) || std::env::var_os("TINHORN_FPS").is_some(),
+            ..default()
+        })
         .add_systems(PreUpdate, input_system)
         .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
-        .run();
+        .add_systems(PostUpdate, kitty_cleanup);
+    // In kitty mode, chain a teardown onto `term`'s restore panic hook so a crash
+    // mid-roll cleans up the arena image + scratch file too (the graceful path is
+    // `kitty_cleanup`). PostStartup, so `term`'s Startup hook is already installed.
+    if let GraphicsMode::Kitty { .. } = mode {
+        app.add_systems(PostStartup, install_kitty_panic_hook);
+    }
+    app.run();
 }
 
 /// The validation path: render until the roll settles, dump a full-frame PNG.
@@ -125,7 +172,8 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
-    let mut app = base_app(expr, seed, muted);
+    // The snapshot path always composes to a TestBackend/PNG: force half-blocks.
+    let mut app = base_app(expr, seed, muted, GraphicsMode::Blocks);
     app.insert_resource(Snapshot {
         path,
         frames: 0,
@@ -144,6 +192,68 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
 /// The core sim — the single source of truth. Only the input system writes it.
 #[derive(Resource)]
 struct Sim(DiceApp);
+
+/// The resolved arena renderer for this session, fixed at startup.
+#[derive(Resource, Clone, Copy)]
+struct Graphics(GraphicsMode);
+
+/// Kitty emission state. `placed` gates the delete / re-place when a pane opens over
+/// the arena (the pane's `Clear` + default-bg text would show a placed image through
+/// at any z). `file` selects the transmit path: `Some(temp path)` sends each frame as
+/// a `t=f` file reference (raw pixels on disk, a tiny pty write) — the fix for the
+/// stdout-write bottleneck, and the default whenever it can work; `None` falls back to
+/// base64-in-escape, used automatically over SSH (a file can't cross the hop) or when
+/// `TINHORN_KITTY_DIRECT` forces it.
+#[derive(Resource, Default)]
+struct KittyState {
+    placed: bool,
+    file: Option<PathBuf>,
+}
+
+/// The debug frame-rate readout. `fps` is an EMA of the real per-frame `dt`; `stage`
+/// holds EMA'd per-stage kitty-transmit times (ms). Both are drawn in the arena's
+/// top border with the render-target size. `show` is fixed at startup: on in a debug
+/// build, or whenever `TINHORN_FPS` is set (so a release build can be profiled too).
+#[derive(Resource, Default)]
+struct FrameStats {
+    fps: f32,
+    show: bool,
+    stage: StageMs,
+}
+
+/// EMA'd wall-clock times (ms) for the per-frame kitty transmit stages, so the
+/// overlay can show where the frame budget goes: `prep` = pack + number burn,
+/// `zip` = zlib, `b64` = base64 + APC chunking, `wr` = the stdout write + flush
+/// (which also catches terminal backpressure). Whatever's left of the frame time is
+/// the Bevy render + GPU→CPU readback.
+#[derive(Clone, Copy, Default)]
+struct StageMs {
+    prep: f32,
+    zip: f32,
+    b64: f32,
+    wr: f32,
+}
+
+/// The overlay's exponential moving average: 0.9/0.1 smoothing, seeded on the
+/// first sample so a stat isn't dragged up from zero. Shared by the fps readout
+/// and every per-stage transmit time.
+fn ema(old: f32, new: f32) -> f32 {
+    if old > 0.0 {
+        old * 0.9 + new * 0.1
+    } else {
+        new
+    }
+}
+
+impl FrameStats {
+    /// Fold this frame's stage times into the EMAs.
+    fn record(&mut self, prep: f32, zip: f32, b64: f32, wr: f32) {
+        self.stage.prep = ema(self.stage.prep, prep);
+        self.stage.zip = ema(self.stage.zip, zip);
+        self.stage.b64 = ema(self.stage.b64, b64);
+        self.stage.wr = ema(self.stage.wr, wr);
+    }
+}
 
 /// Tags a Bevy entity as the view of `sim.0.dice[index]`.
 #[derive(Component)]
@@ -462,22 +572,241 @@ fn choreograph(
 
 /// Compose the interactive frame (Bevy arena blit + all chrome) into the terminal,
 /// and report the arena panel size back so the render target can track it.
+#[allow(clippy::too_many_arguments)] // a Bevy system's params are its dependencies
 fn draw_ui(
     mut context: ResMut<RatatuiContext>,
     mut sim: ResMut<Sim>,
     arena: Res<ArenaImage>,
     mut view: ResMut<ArenaView>,
+    gfx: Res<Graphics>,
+    mut kitty: ResMut<KittyState>,
+    time: Res<Time>,
+    mut stats: ResMut<FrameStats>,
 ) -> Result {
+    let mode = gfx.0;
+
+    // Smooth the real frame rate for the debug overlay: 1/dt, EMA-filtered so it
+    // isn't a jittery blur. `dt` is the wall-clock gap between Update runs, so this
+    // is the *actual* loop rate — if the encode/readback overruns the 1/60 s budget,
+    // the number falls, which is the whole point.
+    let dt = time.delta_secs();
+    if dt > 0.0 {
+        stats.fps = ema(stats.fps, 1.0 / dt);
+    }
+    // The overlay shows the *previous* frame's stage times (emit runs after this
+    // draw); one frame stale is invisible against the EMA.
+    let (show_fps, fps, stage) = (stats.show, stats.fps, stats.stage);
+
     let mut reported = (view.w, view.h);
-    context.draw(|frame| {
-        let (w, h) = ui::render_bevy(frame, &mut sim.0, &arena.pixels, arena.w, arena.h);
-        if w > 0 {
-            reported = (w as u32, h as u32);
-        }
-    })?;
+    let mut panel = None;
+    {
+        profile_span!("compose");
+        context.draw(|frame| {
+            let report =
+                ui::render_bevy_mode(frame, &mut sim.0, &arena.pixels, arena.w, arena.h, mode);
+            if report.view.0 > 0 {
+                reported = (report.view.0 as u32, report.view.1 as u32);
+            }
+            panel = report.kitty;
+            if show_fps {
+                draw_fps_overlay(frame, fps, stage, mode, arena.w, arena.h);
+            }
+        })?;
+    }
     view.w = reported.0;
     view.h = reported.1;
+
+    // Kitty emission runs strictly AFTER the draw (ratatui owns stdout during it):
+    // write the image APC over the arena origin, or delete it while a pane covers it.
+    if let (GraphicsMode::Kitty { .. }, Some(panel)) = (mode, panel) {
+        let pane_open = sim.0.pane != tinhorn_core::app::Pane::None;
+        emit_kitty(&panel, &arena, pane_open, &mut kitty, &mut stats);
+    }
     Ok(())
+}
+
+/// The scratch sibling a `t=f` frame is staged in before being renamed over the
+/// terminal-referenced path. Same directory ⇒ same filesystem ⇒ the rename is
+/// atomic. Also removed on cleanup, in case a write died between stage and rename.
+fn scratch_tmp(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// Write `data` to `path` atomically: stage it in a sibling `.tmp`, then rename that
+/// over `path`. The terminal, reading `path` for a `t=f` transmit, then always sees
+/// one whole frame (the old inode or the new) — never the truncate-in-progress a
+/// plain `std::fs::write` to the reused path would expose to a concurrent read.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = scratch_tmp(path);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Place — or, while a pane covers the arena, remove — the kitty image for this
+/// frame. A pane renders with `Clear` + default-bg text, so a placed image would
+/// show through it at any z; delete the placement once and re-place on close. An
+/// empty/stale readback (startup, or just after `resize_arena` clears `pixels`) is
+/// skipped, leaving the previous placement up, since the readback lags the size
+/// request by a frame or two.
+fn emit_kitty(
+    panel: &ui::KittyPanel,
+    arena: &ArenaImage,
+    pane_open: bool,
+    state: &mut KittyState,
+    stats: &mut FrameStats,
+) {
+    if pane_open {
+        if state.placed {
+            let _ = graphics::emit_raw(&graphics::delete_placement_apc());
+            state.placed = false;
+        }
+        return;
+    }
+    profile_span!("kitty_emit");
+    // Time each transmit stage (ms) so the overlay can show where the frame goes.
+    let ms = |t: Instant| t.elapsed().as_secs_f32() * 1000.0;
+
+    let t0 = Instant::now();
+    let Some(mut rgb) = graphics::pack_rgb(&arena.pixels, arena.w, arena.h) else {
+        return;
+    };
+    ui::burn_numbers(
+        &mut rgb,
+        arena.w,
+        arena.h,
+        panel.inner.width,
+        panel.inner.height,
+        &panel.burns,
+    );
+    let prep = ms(t0);
+    let (w, h) = (panel.inner.width, panel.inner.height);
+
+    // `zip` and `b64` are timed for whichever transmit path is live: for the direct
+    // path they're zlib and base64+chunk; for the file path `zip` is the raw-pixel
+    // file write and `b64` the (tiny) path-APC build.
+    let (zip, b64, apc) = if let Some(path) = &state.file {
+        let t1 = Instant::now();
+        let wrote = write_atomic(path, &rgb).is_ok();
+        let zip = ms(t1);
+        let t2 = Instant::now();
+        let apc = if wrote {
+            graphics::encode_apc_path(&path.to_string_lossy(), arena.w, arena.h, w, h)
+        } else {
+            // File write failed — fall back to the direct path for this frame.
+            graphics::encode_apc(&graphics::compress(&rgb), arena.w, arena.h, w, h)
+        };
+        (zip, ms(t2), apc)
+    } else {
+        let t1 = Instant::now();
+        let compressed = graphics::compress(&rgb);
+        let zip = ms(t1);
+        let t2 = Instant::now();
+        let apc = graphics::encode_apc(&compressed, arena.w, arena.h, w, h);
+        (zip, ms(t2), apc)
+    };
+
+    let t3 = Instant::now();
+    let ok = graphics::emit(panel.inner.x, panel.inner.y, &apc).is_ok();
+    let wr = ms(t3);
+
+    if ok {
+        state.placed = true;
+    }
+    stats.record(prep, zip, b64, wr);
+}
+
+/// Draw the debug FPS readout in the arena's top border (right-aligned), with the
+/// render-target size. In kitty mode it also breaks the frame down by transmit
+/// stage — `rest` (Bevy render + GPU→CPU readback + the rest), `pack`, `zip`
+/// (zlib), `b64`, `wr` (stdout write) — so the bottleneck is legible at a glance;
+/// it falls back to the short form when the border is too narrow for the breakdown.
+fn draw_fps_overlay(
+    frame: &mut ratatui::Frame,
+    fps: f32,
+    stage: StageMs,
+    mode: GraphicsMode,
+    img_w: u32,
+    img_h: u32,
+) {
+    let area = frame.area();
+    let short = |tag: &str| format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
+    let label = match mode {
+        GraphicsMode::Blocks => short("blocks"),
+        GraphicsMode::Kitty { .. } => {
+            let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
+            let sum = stage.prep + stage.zip + stage.b64 + stage.wr;
+            let rest = (frame_ms - sum).max(0.0);
+            let full = format!(
+                " {fps:.0}fps {img_w}×{img_h}  rest {rest:.0} pack {p:.0} zip {z:.0} b64 {b:.0} wr {w:.0} ms ",
+                p = stage.prep,
+                z = stage.zip,
+                b = stage.b64,
+                w = stage.wr,
+            );
+            if full.chars().count() as u16 + 2 <= area.width {
+                full
+            } else {
+                short("kitty")
+            }
+        }
+    };
+    let w = label.chars().count() as u16;
+    if area.width <= w + 2 {
+        return; // too narrow — don't corrupt the border
+    }
+    frame.buffer_mut().set_string(
+        area.width - w - 1,
+        0,
+        label,
+        ratatui::style::Style::default()
+            .fg(ratatui::style::Color::Black)
+            .bg(ratatui::style::Color::Yellow),
+    );
+}
+
+/// Tear down the kitty image and its scratch files: delete our `i=1` image from the
+/// terminal (so it isn't stranded in the scrollback) and remove the `t=f` scratch
+/// frame plus its `.tmp` sibling. Shared by the graceful `kitty_cleanup` and the
+/// panic hook, so an abnormal exit leaves the terminal as clean as a normal one.
+/// Targeted to `i=1`, so it can't disturb anything else on screen; idempotent, so
+/// running it twice (a panic after a partial cleanup) is harmless.
+fn kitty_teardown(file: &Option<PathBuf>) {
+    let _ = graphics::emit_raw(&graphics::delete_all_apc());
+    if let Some(path) = file {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(scratch_tmp(path));
+    }
+}
+
+/// On quit, delete our kitty image so nothing is left behind in the scrollback.
+/// Runs in PostUpdate — after `input_system` writes `AppExit` in PreUpdate, but
+/// before `CleanupPlugin` drops `RatatuiContext` in `Last` and leaves the alt
+/// screen — so the escape lands while the session is still live. A no-op outside
+/// kitty mode. The panic path is covered separately by [`install_kitty_panic_hook`].
+fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>, state: Res<KittyState>) {
+    if exits.is_empty() {
+        return;
+    }
+    exits.clear();
+    if let GraphicsMode::Kitty { .. } = gfx.0 {
+        kitty_teardown(&state.file);
+    }
+}
+
+/// Chain the kitty teardown onto the terminal-restore panic hook the vendored `term`
+/// installs in `Startup`. Runs in `PostStartup` (once that hook is in place, so
+/// `take_hook` captures it) and only in kitty mode: on a panic we delete the image
+/// and remove the scratch file *before* deferring to `term`'s restore — so a crash
+/// mid-roll doesn't strand the arena image in the scrollback the way the graceful
+/// `kitty_cleanup` avoids. Hooks fire even under `panic = "abort"`, where a Drop
+/// guard would not.
+fn install_kitty_panic_hook(state: Res<KittyState>) {
+    let file = state.file.clone();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        kitty_teardown(&file);
+        prev(info);
+    }));
 }
 
 /// Drain the sim's queued sounds into the lazily-spawned player (capping the
@@ -660,5 +989,100 @@ fn color_rgb(c: TColor) -> [u8; 3] {
         TColor::LightBlue => [130, 170, 240],
         TColor::LightCyan => [140, 220, 230],
         _ => [13, 17, 23],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn top_row(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area().width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn fps_overlay_shows_kitty_stage_breakdown() {
+        // The perf diagnostic: on a wide-enough border, kitty mode carries the frame
+        // rate, the render size, and the per-stage times — so a dominant stage (here
+        // zip=78ms) is legible at a glance.
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let stage = StageMs {
+            prep: 3.0,
+            zip: 78.0,
+            b64: 4.0,
+            wr: 5.0,
+        };
+        terminal
+            .draw(|f| {
+                draw_fps_overlay(
+                    f,
+                    11.0,
+                    stage,
+                    GraphicsMode::Kitty { scale: 12 },
+                    1440,
+                    1080,
+                )
+            })
+            .unwrap();
+        let row = top_row(&terminal);
+        assert!(row.contains("11fps"), "frame rate missing: {row:?}");
+        assert!(row.contains("1440×1080"), "render size missing: {row:?}");
+        assert!(
+            row.contains("zip 78"),
+            "the zlib stage time must show: {row:?}"
+        );
+        assert!(
+            row.contains("wr 5"),
+            "the write stage time must show: {row:?}"
+        );
+    }
+
+    #[test]
+    fn fps_overlay_falls_back_and_skips() {
+        // Blocks short form fits a modest width…
+        let mut wide = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        wide.draw(|f| {
+            draw_fps_overlay(f, 60.0, StageMs::default(), GraphicsMode::Blocks, 240, 180)
+        })
+        .unwrap();
+        assert!(top_row(&wide).contains("60 fps"), "{:?}", top_row(&wide));
+        // …but a tiny frame is skipped, not panicking or corrupting the row.
+        let mut tiny = Terminal::new(TestBackend::new(10, 6)).unwrap();
+        tiny.draw(|f| {
+            draw_fps_overlay(f, 30.0, StageMs::default(), GraphicsMode::Blocks, 200, 160)
+        })
+        .unwrap();
+        assert!(
+            !top_row(&tiny).contains("fps"),
+            "should skip when too narrow"
+        );
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_scratch() {
+        // The `t=f` frame is staged in a `.tmp` and renamed over the reused path, so a
+        // concurrent terminal read never catches a truncated file. Assert the whole
+        // frame lands, a rewrite fully replaces it, and no `.tmp` is left behind.
+        let path = std::env::temp_dir().join(format!("tinhorn-test-{}.rgb", std::process::id()));
+        let tmp = scratch_tmp(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+
+        write_atomic(&path, &[1, 2, 3]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
+        assert!(
+            !tmp.exists(),
+            "the .tmp sibling is renamed away, not left behind"
+        );
+
+        // A rewrite (the every-frame case) atomically swaps in the whole new frame.
+        write_atomic(&path, &[9, 9]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [9, 9]);
+        assert!(!tmp.exists());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

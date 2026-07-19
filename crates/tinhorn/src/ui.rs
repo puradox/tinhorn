@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, Die, Pane, Particle, Stats};
+use crate::graphics::GraphicsMode;
 use crate::paint::Rgb;
 
 /// The arena's palette in one place: the felt, and the mahogany tray lip with
@@ -516,13 +517,117 @@ pub(crate) fn number_scale(die_w: f32, die_h: f32, n_digits: i32) -> i32 {
     scale
 }
 
-/// Draw one die's number into the arena at the frame's shared `scale` — computed
-/// once for the whole roll so every die reads the same, never a mix of a big
-/// number on the nearest die and single cells on the rest. Scale 0 is the crisp
-/// single-cell overlay (small dice, or the whole roll on a narrow terminal); ≥1
-/// renders the digits as an outlined [`DIGIT_FONT`] glyph sitting on the
-/// read-face. Both ride the read-face and share [`face_ink`], so colour, the
-/// airborne duck-out, and the settle burn behave identically at every size.
+/// One die's number, resolved to everything the two render paths need to place a
+/// digit — computed once by [`plan_die_number`] so the cell overlay and the kitty
+/// pixel burn can never disagree. `center` is in arena *cell* coordinates (`0..cols`
+/// wide, `0..rows` tall — the arena's inner origin is NOT folded in, so both the
+/// cell painter and the pixel rasteriser can place from it); `scale` is the shared
+/// [`number_scale`] size (0 = the crisp single-cell overlay, ≥1 = the block glyph);
+/// `ink`/`mods` come from [`face_ink`] (the airborne dim decoy, the settled burn);
+/// `outline` is the die-tinted glyph surround. The scale-0 overlay's dark inset is
+/// the shared [`NUMBER_PLATE`] constant, applied at paint time by both paths.
+pub(crate) struct NumberBurn {
+    pub(crate) label: String,
+    pub(crate) center: (f32, f32),
+    pub(crate) scale: i32,
+    pub(crate) ink: Color,
+    pub(crate) mods: Modifier,
+    pub(crate) outline: Color,
+}
+
+/// Resolve one die's number for the frame's shared `scale` (computed once for the
+/// whole roll so every die reads the same size). Carries the front half of the
+/// overlay — [`read_face`] → [`face_ink`] (the decoy/settle/duck-out rules) → the
+/// anchor projected through [`project_to_cell`] — so both render paths share it
+/// verbatim. `None` when the number ducks out (edge-on) or projects behind the eye.
+/// Scale 0 anchors on the read-face centroid (a small label rides the top face);
+/// ≥1 anchors on the die centre (from the near-overhead read the silhouette *is*
+/// the top face, so centring keeps the digits contained rather than sliding off a
+/// small top facet on a d20).
+pub(crate) fn plan_die_number(
+    camera: &tinhorn_core::view_math::Camera,
+    die: &Die,
+    cols: f32,
+    rows: f32,
+    scale: i32,
+) -> Option<NumberBurn> {
+    use tinhorn_core::view_math::project_to_cell;
+    let to_cam = (camera.position - die.pos).normalize_or_zero();
+    let (read_centroid, clarity) = read_face(
+        tinhorn_core::dice_geom::face_geometry(die.sides),
+        die.rot,
+        to_cam,
+    );
+    let (ink, mods) = face_ink(die, clarity)?;
+    let label = die.shown.to_string();
+
+    let center = if scale < 1 {
+        let anchor = die.pos + die.rot * (read_centroid * crate::physics::DIE_R);
+        project_to_cell(camera, anchor, cols, rows)?
+    } else {
+        project_to_cell(camera, die.pos, cols, rows)?
+    };
+
+    // Outline the number in a dark tint of *this die's* colour rather than a
+    // generic black, so on a small die (where the digits cover most of it) the
+    // number's surround still carries the die's hue — that's how you read which
+    // number belongs to which die when the die itself is mostly hidden.
+    let base = if die.kept {
+        die_rgb(die.color_idx)
+    } else {
+        Rgb(120, 120, 120)
+    };
+    let outline = Color::Rgb(
+        (base.0 as f32 * 0.42) as u8,
+        (base.1 as f32 * 0.42) as u8,
+        (base.2 as f32 * 0.42) as u8,
+    );
+
+    Some(NumberBurn {
+        label,
+        center,
+        scale,
+        ink,
+        mods,
+        outline,
+    })
+}
+
+/// Paint a resolved [`NumberBurn`] into the ratatui buffer (the half-block cell
+/// path). Scale 0 is the crisp single centred cell per digit on a dark plate; ≥1
+/// composites the outlined [`DIGIT_FONT`] glyph as `▀` half-blocks. `center` is
+/// arena-local, so the inner origin is added here.
+fn paint_die_number(frame: &mut Frame, inner: Rect, burn: &NumberBurn) {
+    let (cx, cy) = burn.center;
+    if burn.scale < 1 {
+        let label = &burn.label;
+        let style = Style::default()
+            .bg(NUMBER_PLATE)
+            .fg(burn.ink)
+            .add_modifier(burn.mods);
+        let x = (inner.x as f32 + cx - label.len() as f32 / 2.0).round() as i32;
+        let y = (inner.y as f32 + cy).round() as i32;
+        let max_x = (inner.right() as i32 - label.len() as i32).max(inner.x as i32);
+        let x = x.clamp(inner.x as i32, max_x) as u16;
+        let y = y.clamp(inner.y as i32, inner.bottom() as i32 - 1) as u16;
+        frame.buffer_mut().set_string(x, y, label, style);
+    } else {
+        let center = (inner.x as f32 + cx, inner.y as f32 + cy);
+        draw_big_number(
+            frame,
+            inner,
+            center,
+            &burn.label,
+            burn.scale,
+            burn.ink,
+            burn.outline,
+        );
+    }
+}
+
+/// Plan and paint one die's number into the arena (the cell path). Splitting plan
+/// from paint lets the kitty path collect the plans and burn them into pixels
+/// instead ([`plan_die_number`] + `burn_numbers`), sharing every placement rule.
 fn draw_die_number(
     frame: &mut Frame,
     inner: Rect,
@@ -532,57 +637,86 @@ fn draw_die_number(
     rows: f32,
     scale: i32,
 ) {
-    let to_cam = (camera.position - die.pos).normalize_or_zero();
-    let (read_centroid, clarity) = read_face(
-        tinhorn_core::dice_geom::face_geometry(die.sides),
-        die.rot,
-        to_cam,
-    );
-    let Some((ink, mods)) = face_ink(die, clarity) else {
-        return;
-    };
-    let label = die.shown.to_string();
+    if let Some(burn) = plan_die_number(camera, die, cols, rows, scale) {
+        paint_die_number(frame, inner, &burn);
+    }
+}
 
-    if scale < 1 {
-        // The crisp overlay: one centred cell per digit on a dark plate, sitting on
-        // the read-face (a small label rides the top face nicely).
-        let anchor = die.pos + die.rot * (read_centroid * crate::physics::DIE_R);
-        let Some((cx, cy)) = tinhorn_core::view_math::project_to_cell(camera, anchor, cols, rows)
-        else {
-            return;
-        };
-        let style = Style::default().bg(NUMBER_PLATE).fg(ink).add_modifier(mods);
-        let x = (inner.x as f32 + cx - label.len() as f32 / 2.0).round() as i32;
-        let y = (inner.y as f32 + cy).round() as i32;
-        let max_x = (inner.right() as i32 - label.len() as i32).max(inner.x as i32);
-        let x = x.clamp(inner.x as i32, max_x) as u16;
-        let y = y.clamp(inner.y as i32, inner.bottom() as i32 - 1) as u16;
-        frame.buffer_mut().set_string(x, y, &label, style);
-    } else {
-        // The block number centres on the die itself (not the read-face centroid):
-        // from the near-overhead read the die's silhouette *is* its top face, and
-        // centring keeps the digits contained on it rather than sliding off toward
-        // a small top facet on a d20.
-        let Some((cx, cy)) = tinhorn_core::view_math::project_to_cell(camera, die.pos, cols, rows)
-        else {
-            return;
-        };
-        let center = (inner.x as f32 + cx, inner.y as f32 + cy);
-        // Outline the number in a dark tint of *this die's* colour rather than a
-        // generic black, so on a small die (where the digits cover most of it) the
-        // number's surround still carries the die's hue — that's how you read which
-        // number belongs to which die when the die itself is mostly hidden.
-        let base = if die.kept {
-            die_rgb(die.color_idx)
+/// One glyph sub-pixel's role in a number raster: a lit font stroke, its dark
+/// outline dilation, or clear (the die shows through). Shared by the two render
+/// paths — the cell path composites it into `▀` half-blocks ([`draw_big_number`]),
+/// the kitty path fills image rects from it (`burn_numbers`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum GlyphPx {
+    Ink,
+    Outline,
+    Clear,
+}
+
+/// The rasteriser for a number `label` at `scale`, resolving each sub-pixel of the
+/// [`DIGIT_FONT`] to a [`GlyphPx`]. THE single source of the digit shapes: both
+/// render paths ask it the same question ([`GlyphRaster::px`]) so a cell glyph and
+/// a burned-in pixel glyph can never differ. The glyph box is
+/// [`width_sub`](Self::width_sub)×[`height_sub`](Self::height_sub) sub-pixels; a
+/// half-block cell packs two sub-rows.
+pub(crate) struct GlyphRaster {
+    digits: Vec<u8>,
+    scale: i32,
+    gw: i32,    // glyph-box width in sub-pixels: n digits × 3 + (n−1) gaps, scaled
+    h_sub: i32, // glyph-box height in sub-pixels
+}
+
+impl GlyphRaster {
+    pub(crate) fn new(label: &str, scale: i32) -> Self {
+        let digits: Vec<u8> = label.bytes().filter(u8::is_ascii_digit).collect();
+        let n = digits.len() as i32;
+        Self {
+            digits,
+            scale,
+            gw: (4 * n - 1) * scale,
+            h_sub: 5 * scale,
+        }
+    }
+
+    /// Glyph-box width in sub-pixels (negative when the label had no digits).
+    pub(crate) fn width_sub(&self) -> i32 {
+        self.gw
+    }
+
+    /// Glyph-box height in sub-pixels.
+    pub(crate) fn height_sub(&self) -> i32 {
+        self.h_sub
+    }
+
+    /// Is sub-pixel `(x cell column, sub row)` a lit font stroke? Off outside the
+    /// grid and in the one-column gap between digits.
+    fn lit(&self, x: i32, sub: i32) -> bool {
+        if x < 0 || sub < 0 || x >= self.gw || sub >= self.h_sub {
+            return false;
+        }
+        let n = self.digits.len() as i32;
+        let span = 4 * self.scale; // 3 glyph columns + 1 gap, scaled
+        let di = x / span;
+        let local_x = x - di * span;
+        if di >= n || local_x >= 3 * self.scale {
+            return false;
+        }
+        let (fx, fy) = ((local_x / self.scale) as usize, (sub / self.scale) as usize);
+        (DIGIT_FONT[(self.digits[di as usize] - b'0') as usize][fy] >> (2 - fx)) & 1 == 1
+    }
+
+    /// Classify sub-pixel `(x, sub)`. The outline is a *tight* one-sub-pixel
+    /// dilation of the strokes on every side — enough to separate the number from
+    /// any die colour, but thin so the die still shows around and between the digits
+    /// (that colour is how you tell dice apart), not a solid tile blotting it out.
+    pub(crate) fn px(&self, x: i32, sub: i32) -> GlyphPx {
+        if self.lit(x, sub) {
+            GlyphPx::Ink
+        } else if (-1..=1).any(|dx| (-1..=1).any(|ds| self.lit(x + dx, sub + ds))) {
+            GlyphPx::Outline
         } else {
-            Rgb(120, 120, 120)
-        };
-        let outline = Color::Rgb(
-            (base.0 as f32 * 0.42) as u8,
-            (base.1 as f32 * 0.42) as u8,
-            (base.2 as f32 * 0.42) as u8,
-        );
-        draw_big_number(frame, inner, center, &label, scale, ink, outline);
+            GlyphPx::Clear
+        }
     }
 }
 
@@ -592,9 +726,9 @@ fn draw_die_number(
 /// stroke gets the `outline` colour (a dark tint of the die, so the number stays
 /// tied to its die), and everything else is left transparent — so the die shows
 /// through and the number reads as ink *on the face* rather than a plate covering
-/// it. Compositing is per sub-pixel: a cell becomes `▀` with its upper and lower
-/// halves coloured independently (ink, outline, or the die pixel already in the
-/// buffer). Cells outside `area` clip cleanly.
+/// it. Compositing is per sub-pixel via [`GlyphRaster`]: a cell becomes `▀` with
+/// its upper and lower halves coloured independently (ink, outline, or the die
+/// pixel already in the buffer). Cells outside `area` clip cleanly.
 fn draw_big_number(
     frame: &mut Frame,
     area: Rect,
@@ -605,49 +739,12 @@ fn draw_big_number(
     outline: Color,
 ) {
     let (cx, cy) = center;
-    let digits: Vec<u8> = label.bytes().filter(u8::is_ascii_digit).collect();
-    let n = digits.len() as i32;
-    if n == 0 {
-        return;
+    let raster = GlyphRaster::new(label, scale);
+    let (gw, h_sub) = (raster.width_sub(), raster.height_sub());
+    if gw <= 0 {
+        return; // no digits in the label
     }
-    let gw = (4 * n - 1) * scale; // cells wide: n digits × 3 + (n−1) gaps, scaled
-    let h_sub = 5 * scale; // half-block sub-rows tall
     let gh = (h_sub + 1) / 2; // cells tall (two sub-rows per cell, last may be half)
-    // Is glyph sub-pixel `(x cell, sub row)` a lit font pixel? Off outside the grid
-    // and in the one-column gap between digits.
-    let lit = |x: i32, sub: i32| -> bool {
-        if x < 0 || sub < 0 || x >= gw || sub >= h_sub {
-            return false;
-        }
-        let span = 4 * scale; // 3 glyph columns + 1 gap, scaled
-        let di = x / span;
-        let local_x = x - di * span;
-        if di >= n || local_x >= 3 * scale {
-            return false;
-        }
-        let (fx, fy) = ((local_x / scale) as usize, (sub / scale) as usize);
-        (DIGIT_FONT[(digits[di as usize] - b'0') as usize][fy] >> (2 - fx)) & 1 == 1
-    };
-    // Each sub-pixel: a lit stroke, its dark outline, or clear. The outline is a
-    // *tight* one-sub-pixel dilation of the strokes on every side — enough to
-    // separate the number from any die colour, but thin so the die still shows
-    // around and between the digits (that colour is how you tell dice apart), not
-    // a solid tile blotting the die out.
-    #[derive(PartialEq)]
-    enum Px {
-        Ink,
-        Outline,
-        Clear,
-    }
-    let sub = |x: i32, s: i32| -> Px {
-        if lit(x, s) {
-            Px::Ink
-        } else if (-1..=1).any(|dx| (-1..=1).any(|ds| lit(x + dx, s + ds))) {
-            Px::Outline
-        } else {
-            Px::Clear
-        }
-    };
 
     let x0 = (cx - gw as f32 / 2.0).round() as i32;
     let y0 = (cy - gh as f32 / 2.0).round() as i32;
@@ -666,18 +763,18 @@ fn draw_big_number(
             {
                 continue;
             }
-            let (up, lo) = (sub(col, 2 * row), sub(col, 2 * row + 1));
-            if up == Px::Clear && lo == Px::Clear {
+            let (up, lo) = (raster.px(col, 2 * row), raster.px(col, 2 * row + 1));
+            if up == GlyphPx::Clear && lo == GlyphPx::Clear {
                 continue; // leave the die pixel untouched — the number isn't here
             }
             let cell = &mut buf[(x as u16, y as u16)];
             // The die's own sub-pixels are already in the buffer: a HalfBlock `▀`
             // cell holds fg = upper pixel, bg = lower pixel. Clear keeps them.
             let (die_up, die_lo) = (cell.fg, cell.bg);
-            let paint = |p: &Px, die: Color| match p {
-                Px::Ink => ink,
-                Px::Outline => outline,
-                Px::Clear => die,
+            let paint = |p: &GlyphPx, die: Color| match p {
+                GlyphPx::Ink => ink,
+                GlyphPx::Outline => outline,
+                GlyphPx::Clear => die,
             };
             cell.set_char('▀');
             cell.set_style(
@@ -686,6 +783,137 @@ fn draw_big_number(
                     .bg(paint(&lo, die_lo)),
             );
         }
+    }
+}
+
+/// Rasterise the resolved [`NumberBurn`]s into the packed RGB frame — the kitty
+/// path's equivalent of [`draw_big_number`]'s half-block compositing. One glyph
+/// sub-pixel maps to `sx × sy` image pixels, where `sx = img_w/inner_w` and
+/// `sy = img_h/(inner_h*2)` are derived from the **actual** image dims (like the
+/// blit's `ss`), so a resize-transition frame — image not yet the requested size —
+/// still burns each digit in the right spot. Ink and outline sub-pixels fill a
+/// rect; clear sub-pixels leave the die pixels showing through. Scale 0 (the tiny
+/// single-cell overlay) has no half-block glyph, so it rasters at scale 1 with a
+/// half-size sub-pixel over a dark [`NUMBER_PLATE`] backing rect. `rgb` is tight
+/// (three bytes/pixel, no row padding); everything clips to the image bounds.
+pub(crate) fn burn_numbers(
+    rgb: &mut [u8],
+    img_w: u32,
+    img_h: u32,
+    inner_w: u16,
+    inner_h: u16,
+    burns: &[NumberBurn],
+) {
+    if img_w == 0 || img_h == 0 || inner_w == 0 || inner_h == 0 {
+        return;
+    }
+    let sx = img_w as f32 / inner_w as f32;
+    let sy = img_h as f32 / (inner_h as f32 * 2.0);
+    for burn in burns {
+        // Scale 0 has no block glyph: raster at scale 1 with a half-size sub-pixel
+        // over a plate, so a small crisp number still rides the die.
+        let (scale, sub_w, sub_h) = if burn.scale < 1 {
+            (1, sx * 0.5, sy * 0.5)
+        } else {
+            (burn.scale, sx, sy)
+        };
+        let raster = GlyphRaster::new(&burn.label, scale);
+        let (gw, h_sub) = (raster.width_sub(), raster.height_sub());
+        if gw <= 0 {
+            continue;
+        }
+        let (glyph_w, glyph_h) = (gw as f32 * sub_w, h_sub as f32 * sub_h);
+        // Centre on the die: a cell's x maps to image x as `× sx`, its y as `× 2·sy`
+        // (a cell is two half-block sub-rows tall).
+        let x_left = burn.center.0 * sx - glyph_w * 0.5;
+        let y_top = burn.center.1 * 2.0 * sy - glyph_h * 0.5;
+
+        let ink = ink_rgb(burn.ink);
+        let outline = ink_rgb(burn.outline);
+        if burn.scale < 1 {
+            // A dark backing plate a sub-pixel proud of the digits on every side, so
+            // the tiny number reads over any die colour.
+            fill_px_rect(
+                rgb,
+                img_w,
+                img_h,
+                (
+                    x_left - sub_w,
+                    y_top - sub_h,
+                    glyph_w + 2.0 * sub_w,
+                    glyph_h + 2.0 * sub_h,
+                ),
+                ink_rgb(NUMBER_PLATE),
+            );
+        }
+        // Iterate one sub-pixel *beyond* the glyph box on every side, exactly as the
+        // half-block path does: the outline dilates one sub-pixel outward from the
+        // strokes, so its top/left/right/bottom ring lives outside the box and would
+        // go unburned if the loop stopped at the edge — leaving kitty digits without
+        // the dark separation halo the cell path draws (they must never differ).
+        for s in -1..=h_sub {
+            for c in -1..=gw {
+                let color = match raster.px(c, s) {
+                    GlyphPx::Ink => ink,
+                    GlyphPx::Outline => outline,
+                    GlyphPx::Clear => continue,
+                };
+                fill_px_rect(
+                    rgb,
+                    img_w,
+                    img_h,
+                    (
+                        x_left + c as f32 * sub_w,
+                        y_top + s as f32 * sub_h,
+                        sub_w,
+                        sub_h,
+                    ),
+                    color,
+                );
+            }
+        }
+    }
+}
+
+/// Fill an axis-aligned rect `(x, y, w, h)` of the tight RGB image with `color`.
+/// Edges round so adjacent sub-pixel cells tile without gaps or overlap; clipped to
+/// the image.
+fn fill_px_rect(
+    rgb: &mut [u8],
+    img_w: u32,
+    img_h: u32,
+    rect: (f32, f32, f32, f32),
+    color: (u8, u8, u8),
+) {
+    let (x, y, w, h) = rect;
+    let x0 = (x.round() as i64).clamp(0, img_w as i64);
+    let x1 = ((x + w).round() as i64).clamp(0, img_w as i64);
+    let y0 = (y.round() as i64).clamp(0, img_h as i64);
+    let y1 = ((y + h).round() as i64).clamp(0, img_h as i64);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let i = (py as usize * img_w as usize + px as usize) * 3;
+            if i + 2 < rgb.len() {
+                rgb[i] = color.0;
+                rgb[i + 1] = color.1;
+                rgb[i + 2] = color.2;
+            }
+        }
+    }
+}
+
+/// The RGB a number's ink / outline / plate colour burns as: the named colours
+/// [`face_ink`] produces mapped to vivid tones (the kitty image is real colour, not
+/// a 16-colour cell), and `Rgb` passed straight through (the outline, the plate, and
+/// the airborne decoy are already `Rgb`).
+fn ink_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::White => (236, 236, 236),
+        Color::Yellow => (248, 216, 60),
+        Color::Red => (232, 72, 72),
+        Color::DarkGray => (120, 120, 120),
+        _ => (236, 236, 236),
     }
 }
 
@@ -718,14 +946,22 @@ fn arena_title(app: &App) -> String {
 /// every die (riding the face that points at us — anchored to that face, faded
 /// edge-on, burned to the RNG value on settle; skipped while shaking, dice in the
 /// cup), crit/fumble particles, the shake power meter, the release echo, and the
-/// idle hint. Drawn over the Bevy-rendered arena;
-/// through, so the numbers and bursts land on their dice.
+/// idle hint.
+///
+/// The die numbers are the one overlay coupled to the render model: in **Blocks**
+/// mode they composite into the cell buffer here; in **Kitty** mode they're planned
+/// and *returned* (empty otherwise) for the scene to burn into the pixels. The
+/// shake gate and the shared `number_scale` sizing live here, so both modes size
+/// the digits identically. Everything else — particles, meter, echo, hint — is
+/// pure cell chrome and draws the same in both.
 fn draw_arena_overlays(
     frame: &mut Frame,
     app: &App,
     inner: Rect,
     camera: &tinhorn_core::view_math::Camera,
-) {
+    mode: GraphicsMode,
+) -> Vec<NumberBurn> {
+    let mut burns = Vec::new();
     if !app.shaking() {
         let (cols, rows) = (inner.width as f32, inner.height as f32);
         // One number size for the whole roll, so the dice read the same — never a
@@ -743,7 +979,16 @@ fn draw_arena_overlays(
             .unwrap_or(1);
         let num_scale = number_scale(ref_w * FACE_FRAC_W, ref_h * FACE_FRAC_H, max_digits);
         for die in &app.dice {
-            draw_die_number(frame, inner, camera, die, cols, rows, num_scale);
+            match mode {
+                GraphicsMode::Blocks => {
+                    draw_die_number(frame, inner, camera, die, cols, rows, num_scale)
+                }
+                GraphicsMode::Kitty { .. } => {
+                    if let Some(burn) = plan_die_number(camera, die, cols, rows, num_scale) {
+                        burns.push(burn);
+                    }
+                }
+            }
         }
     }
 
@@ -768,22 +1013,51 @@ fn draw_arena_overlays(
         .alignment(Alignment::Center);
         frame.render_widget(hint, inner);
     }
+
+    burns
 }
 
-/// Compose the full interactive frame for the **Bevy** arena: a four-row layout
-/// (result panel, arena, input line, help bar) whose arena panel is the CPU-read
-/// Bevy render blitted as half-blocks (fg = upper pixel, bg = lower).
-/// `pixels` is the row-padded RGBA8 readback of a
-/// `img_w`×`img_h` image sized to this arena's inner cell grid, so the blit is
-/// 1:1 and the overlays (projected through the same `live_camera`) land on their
-/// dice. Returns the arena inner size so the scene can size its render target.
-pub fn render_bevy(
+/// The composed arena's report to the scene: the render-target size to request,
+/// and — in kitty mode only — the panel geometry and the per-die number burns the
+/// scene will rasterise into the pixels and place. `kitty` is `None` in half-block
+/// mode, where the numbers are already composited into the frame.
+pub struct ArenaReport {
+    pub view: (u16, u16),
+    pub kitty: Option<KittyPanel>,
+}
+
+/// Where the kitty image lands and what to burn into it: the arena inner `Rect`
+/// (origin + cell size, so the scene knows where to place the image and how the
+/// burn maps cells to pixels) and the resolved [`NumberBurn`]s (empty while
+/// shaking, when the dice are gathered in the cup).
+pub struct KittyPanel {
+    pub inner: Rect,
+    pub burns: Vec<NumberBurn>,
+}
+
+/// Compose the full interactive frame for a given [`GraphicsMode`]: a four-row
+/// layout (arena, result panel, input line, help bar) with all of tinhorn's
+/// chrome. The arena panel is the only branch between modes:
+///
+/// - **Blocks** — the CPU-read Bevy render blitted as half-blocks (fg = upper
+///   pixel, bg = lower), supersampled `ARENA_SS×` and box-downsampled; the die
+///   numbers composite straight into the buffer. `pixels` is the row-padded RGBA8
+///   readback of an `img_w`×`img_h` image sized to this grid.
+/// - **Kitty** — the arena cells are cleared to default-bg (the scene places a real
+///   image behind them, at native `scale`× resolution — no SSAA, 4× MSAA already
+///   smooths edges) and the die numbers are returned as burns for the scene to
+///   rasterise into the pixels. `pixels` is unused (the scene owns the readback).
+///
+/// The cell-space overlays (particles, meter, echo, hint) draw identically either
+/// way. Returns the render-target size and, in kitty mode, the panel + burns.
+pub fn render_bevy_mode(
     frame: &mut Frame,
     app: &mut App,
     pixels: &[u8],
     img_w: u32,
     img_h: u32,
-) -> (u16, u16) {
+    mode: GraphicsMode,
+) -> ArenaReport {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Min(5),
@@ -802,20 +1076,33 @@ pub fn render_bevy(
     frame.render_widget(block, arena_area);
 
     let mut view = (0u16, 0u16);
+    let mut kitty = None;
     if inner.width >= 4 && inner.height >= 3 {
         // Feed the arena size to the sim (launch/particle geometry reads it) and
         // report it back so the render target can track it.
         app.arena_w = inner.width as f32;
         app.arena_h = inner.height as f32;
-        // Ask for a supersampled render (ARENA_SS× the half-block grid); the blit
-        // box-downsamples it, so dice and wall edges come out smooth instead of
-        // boxy — the same trick the software renderer's SUPERSAMPLE did.
-        view = (
-            inner.width * ARENA_SS as u16,
-            inner.height * 2 * ARENA_SS as u16,
-        );
 
-        blit_bevy_arena(frame.buffer_mut(), inner, pixels, img_w, img_h);
+        // The one mode branch: how the arena panel is filled and how big a render
+        // the target should be. The "cols × 2·rows" image shape is load-bearing —
+        // kitty only raises the scale, so `arena_aspect`/`project_to_cell` stay the
+        // single source of the framing.
+        match mode {
+            GraphicsMode::Blocks => {
+                // Supersample (ARENA_SS× the half-block grid); the blit
+                // box-downsamples it, so dice and wall edges come out smooth.
+                view = (
+                    inner.width * ARENA_SS as u16,
+                    inner.height * 2 * ARENA_SS as u16,
+                );
+                blit_bevy_arena(frame.buffer_mut(), inner, pixels, img_w, img_h);
+            }
+            GraphicsMode::Kitty { scale } => {
+                let s = kitty_scale(scale, inner.width);
+                view = (inner.width * s as u16, inner.height * 2 * s as u16);
+                clear_arena(frame.buffer_mut(), inner);
+            }
+        }
 
         let aspect = tinhorn_core::view_math::arena_aspect(inner.width as f32, inner.height as f32);
         let camera = tinhorn_core::view_math::live_camera(
@@ -825,7 +1112,10 @@ pub fn render_bevy(
             app.clock(),
             app.flash(),
         );
-        draw_arena_overlays(frame, app, inner, &camera);
+        let burns = draw_arena_overlays(frame, app, inner, &camera, mode);
+        if matches!(mode, GraphicsMode::Kitty { .. }) {
+            kitty = Some(KittyPanel { inner, burns });
+        }
     }
 
     render_results(frame, app, chunks[1]);
@@ -840,12 +1130,56 @@ pub fn render_bevy(
         Pane::Stats => app.pane_scroll = render_stats_overlay(frame, app, area, scroll),
     }
 
-    view
+    ArenaReport { view, kitty }
+}
+
+/// Compose the interactive frame in half-block mode (the universal fallback). Kept
+/// at its exact original signature so the ≈30 chrome tests and the three `#[ignore]`
+/// GPU tests compile untouched; returns just the render-target size.
+pub fn render_bevy(
+    frame: &mut Frame,
+    app: &mut App,
+    pixels: &[u8],
+    img_w: u32,
+    img_h: u32,
+) -> (u16, u16) {
+    render_bevy_mode(frame, app, pixels, img_w, img_h, GraphicsMode::Blocks).view
+}
+
+/// Knock the requested kitty scale down until the transmitted image width stays
+/// under [`MAX_IMG_W`](crate::graphics::MAX_IMG_W), so a fullscreen hi-DPI arena
+/// can't ask for a multi-thousand-pixel frame every frame (readback + encode is the
+/// frame-budget bottleneck). Never below 1.
+fn kitty_scale(scale: u32, inner_w: u16) -> u32 {
+    let cap = (crate::graphics::MAX_IMG_W / (inner_w.max(1) as u32)).max(1);
+    scale.min(cap).max(1)
+}
+
+/// Clear the arena inner cells to blank default-bg cells. In kitty mode the scene
+/// places a real image behind them (a deep negative z), so the felt shows through
+/// the terminal's default background and the chrome/overlays draw on top.
+fn clear_arena(buf: &mut ratatui::buffer::Buffer, inner: Rect) {
+    for y in inner.top()..inner.bottom() {
+        for x in inner.left()..inner.right() {
+            buf[(x, y)].reset();
+        }
+    }
 }
 
 /// Supersample factor: the Bevy arena is rendered at this multiple of the
 /// half-block grid and box-downsampled in the blit, for cheap anti-aliasing.
 const ARENA_SS: u32 = 2;
+
+/// The warm radial vignette applied to the arena: darkens toward the corners and
+/// warms the tint a touch (a whisper more red, a whisper less blue). Returns the
+/// per-channel multipliers `(fr, fg, fb)` for a normalised offset-from-centre
+/// `(nx, ny)` in `[-0.5, 0.5]`. Shared by the half-block blit and the kitty pixel
+/// pack (`graphics::pack_rgb`) so both paths grade the picture identically.
+pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
+    let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
+    let f = 1.0 - 0.34 * d2 * d2;
+    (f * 1.04, f, f * 0.95)
+}
 
 /// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg =
 /// upper pixel, bg = lower). The render is supersampled — `img_w`/`img_h` are
@@ -860,7 +1194,7 @@ fn blit_bevy_arena(
     img_w: u32,
     img_h: u32,
 ) {
-    let stride = (img_w as usize * 4).div_ceil(256) * 256; // wgpu 256-byte row pad
+    let stride = crate::graphics::readback_stride(img_w); // wgpu 256-byte row pad
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
         return;
     }
@@ -884,9 +1218,7 @@ fn blit_bevy_arena(
     };
     let (fw, fh) = (inner.width as f32, inner.height as f32 * 2.0);
     let graded = |c: (u8, u8, u8), nx: f32, ny: f32| -> Color {
-        let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
-        let f = 1.0 - 0.34 * d2 * d2;
-        let (fr, fg, fb) = (f * 1.04, f, f * 0.95);
+        let (fr, fg, fb) = vignette(nx, ny);
         Color::Rgb(
             (c.0 as f32 * fr).min(255.0) as u8,
             (c.1 as f32 * fg).min(255.0) as u8,
@@ -1510,4 +1842,220 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(after),
     ]);
     frame.render_widget(Paragraph::new(line).scroll((0, scroll_x)), text_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::graphics::GraphicsMode;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
+
+    /// Every glyph in the composed frame as one flat string, for content asserts.
+    fn flatten(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// Draw one frame in `mode`, returning the arena report.
+    fn draw_mode(
+        terminal: &mut Terminal<TestBackend>,
+        app: &mut App,
+        mode: GraphicsMode,
+    ) -> ArenaReport {
+        let mut report = None;
+        terminal
+            .draw(|f| report = Some(render_bevy_mode(f, app, &[], 0, 0, mode)))
+            .unwrap();
+        report.unwrap()
+    }
+
+    #[test]
+    fn glyph_raster_matches_the_font() {
+        // At scale 1, GlyphRaster marks Ink exactly where DIGIT_FONT lights a bit,
+        // and never Ink where it doesn't (a hole is outline or clear, not a stroke).
+        for d in 0u8..=9 {
+            let raster = GlyphRaster::new(&d.to_string(), 1);
+            for (fy, row) in DIGIT_FONT[d as usize].iter().enumerate() {
+                for fx in 0i32..3 {
+                    let lit = (row >> (2 - fx)) & 1 == 1;
+                    let px = raster.px(fx, fy as i32);
+                    if lit {
+                        assert_eq!(px, GlyphPx::Ink, "digit {d} sub-pixel ({fx},{fy})");
+                    } else {
+                        assert_ne!(px, GlyphPx::Ink, "digit {d} sub-pixel ({fx},{fy})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn burn_numbers_fills_ink_and_leaves_die_showing() {
+        // A tight sentinel-filled RGB image: burning a big "8" should paint ink
+        // pixels and leave clear pixels (outside the glyph) as the sentinel.
+        let (img_w, img_h) = (60u32, 40u32);
+        let (inner_w, inner_h) = (30u16, 10u16); // sx = 2, sy = 2
+        let mut rgb = vec![9u8; (img_w * img_h * 3) as usize];
+        let burn = NumberBurn {
+            label: "8".to_string(),
+            center: (15.0, 5.0), // arena centre in cells
+            scale: 2,
+            ink: Color::White,
+            mods: Modifier::BOLD,
+            outline: Color::Rgb(10, 20, 30),
+        };
+        burn_numbers(
+            &mut rgb,
+            img_w,
+            img_h,
+            inner_w,
+            inner_h,
+            std::slice::from_ref(&burn),
+        );
+        let white = ink_rgb(Color::White);
+        let has_ink = rgb
+            .chunks_exact(3)
+            .any(|p| p[0] == white.0 && p[1] == white.1 && p[2] == white.2);
+        let has_sentinel = rgb.chunks_exact(3).any(|p| p == [9, 9, 9]);
+        assert!(has_ink, "the '8' should paint ink pixels into the frame");
+        assert!(
+            has_sentinel,
+            "clear sub-pixels must leave the die (sentinel) showing through"
+        );
+        // The outline halo dilates one sub-pixel *beyond* the glyph box (matching the
+        // half-block path). The box top sits at y=10 (center.1·2·sy − glyph_h/2), so an
+        // outline pixel must appear in the rows above it — this fails if the raster loop
+        // stops at the box edge instead of `-1..=`, leaving kitty digits haloless.
+        let outline = ink_rgb(Color::Rgb(10, 20, 30));
+        let top_ring_has_outline = (0..10u32).any(|y| {
+            (0..img_w).any(|x| {
+                let i = ((y * img_w + x) * 3) as usize;
+                rgb[i] == outline.0 && rgb[i + 1] == outline.1 && rgb[i + 2] == outline.2
+            })
+        });
+        assert!(
+            top_ring_has_outline,
+            "the outline halo must burn above the glyph box, as the cell path draws it"
+        );
+        // A zero-size image (stale/mid-resize) is a no-op, not a panic.
+        let mut empty: Vec<u8> = Vec::new();
+        burn_numbers(
+            &mut empty,
+            0,
+            0,
+            inner_w,
+            inner_h,
+            std::slice::from_ref(&burn),
+        );
+    }
+
+    #[test]
+    fn blocks_mode_equals_render_bevy() {
+        // `render_bevy` is exactly `render_bevy_mode(Blocks).view`, and Blocks mode
+        // composes an identical buffer and reports no kitty panel.
+        let mut app = App::new("2d6".to_string());
+        let mut t1 = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        let mut t2 = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        t1.draw(|f| {
+            render_bevy(f, &mut app, &[], 0, 0);
+        })
+        .unwrap(); // size the arena
+        for _ in 0..6000 {
+            app.update(1.0 / 60.0);
+            if app.all_settled() {
+                break;
+            }
+        }
+        // Same app state feeds both draws (no update between), so the buffers match.
+        t1.draw(|f| {
+            render_bevy(f, &mut app, &[], 0, 0);
+        })
+        .unwrap();
+        let mut kitty_none = false;
+        t2.draw(|f| {
+            kitty_none = render_bevy_mode(f, &mut app, &[], 0, 0, GraphicsMode::Blocks)
+                .kitty
+                .is_none();
+        })
+        .unwrap();
+        assert!(kitty_none, "blocks mode reports no kitty panel");
+        assert_eq!(
+            t1.backend().buffer(),
+            t2.backend().buffer(),
+            "render_bevy must equal render_bevy_mode(Blocks)"
+        );
+    }
+
+    #[test]
+    fn kitty_mode_clears_arena_and_collects_burns() {
+        let mut app = App::new(String::new());
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        let mode = GraphicsMode::Kitty { scale: 4 };
+
+        // First draw sizes the arena and reports a panel.
+        let r0 = draw_mode(&mut terminal, &mut app, mode);
+        let panel = r0.kitty.expect("kitty mode reports a panel");
+        // The requested view is the panel scaled by S, no supersample.
+        assert_eq!(
+            r0.view,
+            (panel.inner.width * 4, panel.inner.height * 2 * 4),
+            "kitty view = (w*S, h*2*S)"
+        );
+
+        // A settled roll → non-empty number burns, and NO half-blocks blitted into
+        // the arena (the image carries the felt; ratatui only clears + chrome).
+        app.input = "1d6".to_string();
+        app.insta_roll();
+        assert!(app.all_settled());
+        let r1 = draw_mode(&mut terminal, &mut app, mode);
+        let panel = r1.kitty.expect("kitty panel");
+        assert!(
+            !panel.burns.is_empty(),
+            "a settled die contributes a number burn"
+        );
+        let buf = terminal.backend().buffer();
+        let arena_has_block = (panel.inner.left()..panel.inner.right())
+            .flat_map(|x| (panel.inner.top()..panel.inner.bottom()).map(move |y| (x, y)))
+            .any(|(x, y)| buf[(x, y)].symbol() == "▀");
+        assert!(!arena_has_block, "kitty mode must not blit half-blocks");
+        assert!(
+            flatten(&terminal).contains("result"),
+            "the chrome still renders around the image"
+        );
+
+        // Shaking gathers the dice in the cup: no burns, but the meter renders over
+        // the image as cell chrome.
+        app.start_shake();
+        app.update(0.3);
+        let r2 = draw_mode(&mut terminal, &mut app, mode);
+        assert!(
+            r2.kitty.expect("kitty panel").burns.is_empty(),
+            "no number burns while shaking"
+        );
+        assert!(
+            flatten(&terminal).contains("power"),
+            "the power meter renders over the image"
+        );
+    }
+
+    #[test]
+    fn kitty_scale_is_capped_for_wide_arenas() {
+        // A modest arena keeps its requested scale…
+        assert_eq!(kitty_scale(8, 60), 8);
+        // …but a very wide arena is knocked down so the image width stays under cap.
+        let s = kitty_scale(8, 400);
+        assert!(
+            s * 400 <= crate::graphics::MAX_IMG_W,
+            "width under MAX_IMG_W"
+        );
+        assert!(s >= 1, "never below 1");
+    }
 }

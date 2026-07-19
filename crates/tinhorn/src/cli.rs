@@ -55,6 +55,11 @@ pub struct Cli {
     /// Start the interactive mode muted (Ctrl-Q toggles sound at runtime).
     #[arg(long)]
     pub mute: bool,
+
+    /// Arena renderer: auto detects kitty/Ghostty (real pixels, half-blocks
+    /// elsewhere); force with kitty or blocks.
+    #[arg(long, value_enum, default_value_t = crate::graphics::GraphicsArg::Auto)]
+    pub graphics: crate::graphics::GraphicsArg,
 }
 
 impl Cli {

@@ -111,28 +111,51 @@ truth, and the Bevy entities are a pure view of it.
   sim, `sync_dice_scene` diffs `app.dice` into `DieView` entities, `sync_cup`
   shows/sways the cup while shaking, `choreograph` moves the camera to match
   `view_math::live_camera` (and flinches the key light on impacts / a crit),
-  `draw_ui` composes the frame, and `drain_sounds` plays what the physics queued.
-  A headless `Camera3d` renders into an offscreen image that's **read back to the
-  CPU with Bevy 0.19's built-in `gpu_readback`** (`Readback` + `ReadbackComplete`)
-  and blitted as half-blocks — with HDR + filmic tonemapping, MSAA, screen-space
+  `draw_ui` composes the frame — and, in kitty mode, emits it as a real image
+  after the draw (`kitty_cleanup` clears it on quit) — and `drain_sounds` plays
+  what the physics queued. A headless `Camera3d` renders into an offscreen image
+  that's **read back to the CPU with Bevy 0.19's built-in `gpu_readback`**
+  (`Readback` + `ReadbackComplete`) and, in `blocks` mode, blitted as half-blocks
+  (in `kitty` mode the same readback is transmitted as an image) — with HDR +
+  filmic tonemapping, MSAA, screen-space
   ambient occlusion, shadow maps, distance fog, a 2× supersample, and a warm
   vignette. `scene/arena.rs` builds the static casino furniture (felt, mahogany
   walls + rails, table, rug, oak floor, gradient backdrop, oxblood curtains,
   poker chips) from `ui`'s `ArenaStyle` palette and its procedural textures;
   `scene/convert.rs` is the *one* place core's glam 0.33 crosses into Bevy's glam.
 - **`ui`** (binary) — ratatui rendering, now the **chrome and the arena overlays**
-  rather than a 3D renderer. `render_bevy` lays out the arena panel, the result
-  panel, the input line, and the help/Help/History/Stats panes, blits the Bevy
-  read-back into the arena, and draws the overlays: the number riding each die's
-  frontmost face (a dim decoy that ducks out edge-on, burning to the real value
-  on settle and scaling from a single cell to a dark-outlined half-block glyph as
-  a wide terminal renders the dice large), the power meter, the release echo, and
-  the crit/fumble particles. It also owns the `ArenaStyle` palette and the
+  rather than a 3D renderer. `render_bevy_mode(…, mode) -> ArenaReport` lays out the
+  arena panel, the result panel, the input line, and the help/Help/History/Stats
+  panes; in `blocks` mode it blits the Bevy read-back into the arena and composites
+  the numbers, in `kitty` mode it clears the arena cells and *returns* the numbers
+  as `NumberBurn`s for the scene to burn into the pixels (`burn_numbers`).
+  `render_bevy` is the thin `blocks` wrapper kept at its old signature. The overlays:
+  the number riding each die's frontmost face (a dim decoy that ducks out edge-on,
+  burning to the real value on settle and scaling from a single cell to a
+  dark-outlined half-block glyph as a wide terminal renders the dice large — the
+  placement and glyph raster shared by both paths via `plan_die_number`/
+  `GlyphRaster`), the power meter, the release echo, and the crit/fumble particles.
+  It also owns the `ArenaStyle` palette and the
   procedural texture generators (felt, floorboards, velvet, wood grain, backdrop)
   the Bevy furniture wraps as images. The result panel **holds the outcome back
   until the dice stop** — each chip a dim decoy until its die settles, the total a
   dim `…` until every die has landed — so the animation never spoils the number
   it's building toward.
+- **`graphics`** (binary) — the **kitty graphics protocol** arena: the pixel-perfect
+  output path for terminals that speak it (kitty, Ghostty, WezTerm), half-blocks
+  everywhere else. `resolve(--graphics)` chooses the mode (`auto` env-sniffs via
+  `kitty_capable`, never under tmux/screen; `kitty`/`blocks` force it). The payload
+  pipeline strips wgpu's row padding + alpha and grades it (`pack_rgb`), then zlib
+  (`compress`) → base64 → chunked kitty APCs (`encode_apc`, fixed `i=1,p=1` for
+  flicker-free replace, `q=2` so no response reaches the input stream), after the draw.
+  (`encode_apc_path` is the **default** `t=f` path: it references a file of raw pixels
+  so the pty carries only a path — profiling showed the per-frame cost was the stdout
+  write, not the readback. The frame is written via `write_atomic` — staged in a `.tmp`
+  sibling then renamed over the reused path — so a concurrent terminal read never
+  catches a half-written file. It can't cross an SSH hop, so the emitter auto-falls back
+  to base64 there; `TINHORN_KITTY_DIRECT` forces base64 too.) Lives
+  outside the vendored `term/` (the re-sync contract) and named `graphics` so it
+  never collides with `term/…/kitty.rs` (the keyboard protocol).
 - **`paint`** (binary) — the small `Rgb`/`Texture` types the overlays and the
   procedural textures use; they outlived the deleted software rasterizer.
 - **`cli`** (binary) — clap argument parsing and the one-shot output paths (bare
@@ -185,6 +208,15 @@ Tests guard most of these, but know them before you lean on a wall:
   then the one-shot path (an output flag or a non-terminal stdout) which calls
   `cli::run_one_shot` and returns *before* any Bevy `App` is constructed. So
   `tinhorn 3d6 | cat`, `-p`, `-v`, and `--json` stay pure and GPU-free.
+- **The kitty arena is output-only.** It changes nothing in the sim, physics, RNG
+  contract, or camera math — a test pins `--seed` identical across kitty, blocks,
+  and one-shot. The **"cols × 2·rows" image shape stays the single aspect source**
+  (kitty raises only the *scale*; `arena_aspect`/`project_to_cell` are untouched).
+  Every APC carries `q=2` (a kitty response would land in crossterm's input stream
+  and read as a keypress); emission is **strictly after `context.draw()`** (ratatui
+  owns stdout during a draw); `auto` never picks kitty **under tmux/screen** (they
+  eat the APC); and `TINHORN_BEVY_SNAPSHOT` always forces blocks. All kitty code
+  lives in `graphics`, never the vendored `term/`.
 - **The help overlay fits a 28-row terminal.** A test pins it — trim a line
   before adding one. Taller panes (or a short frame) scroll: every overlay
   lays out its whole content (history included) and `overlay_panel` takes a
@@ -222,13 +254,30 @@ three arena render smoke tests are `#[ignore]`d because they need a real adapter
 The chrome and overlays are exercised through ratatui's `TestBackend` — the caret
 and scrolling, the withheld outcome, the staked verdict, the dropped-die dimming,
 the number ducking out edge-on and scaling with the die — none of which touch the
-GPU. To actually see the rendered arena without a TTY, render it headless:
+GPU. The kitty path is covered GPU-free too: in `graphics`, the `kitty_capable`
+truth table (with the tmux veto), `scale_for`, the `pack_rgb` padding strip, and
+the APC chunk round-trip (strip → base64-decode → inflate → byte-identical RGB);
+in `ui`, glyph/font parity, the pixel number burn, `render_bevy == render_bevy_mode(Blocks)`,
+and a kitty compose that asserts no half-blocks in the arena but the numbers
+collected as burns. To actually see the rendered arena without a TTY, render it
+headless:
 
 ```sh
 TINHORN_BEVY_SNAPSHOT=/tmp/arena.png cargo run -- 4d6!kh3   # PNG + a text frame dump
 TINHORN_SNAP_COLS=120 TINHORN_SNAP_ROWS=44 …                # compose at a larger size
 TINHORN_SNAP_FRAME=8 …                                      # capture mid-roll, not settled
 ```
+
+For **chasing frame-time regressions**, both tools stay off stdout (it's the
+terminal): the `scene::FrameStats` overlay in the arena's top border shows FPS + the
+render-target size — and, in kitty mode, a per-stage transmit breakdown (rest /
+pack / zip / b64 / wr) — on by default in debug, or `TINHORN_FPS=1` on a release
+build. **Measure release** for real numbers: the workspace optimizes dependencies
+but not our own crate, so a debug build inflates our own loops (`pack_rgb`, the
+blit). For a per-system flamegraph, `cargo run --features profiling` turns on Bevy's
+tracing spans and writes a chrome trace (`trace-<ts>.json`, for Perfetto) on quit;
+`--features profiling-tracy` streams to Tracy instead. (This is how we found the
+kitty lag was the stdout write + zlib, not the GPU→CPU readback.)
 
 wgpu runs headless, so the snapshot works in CI and over ssh. Beyond the chrome,
 the suite covers notation parsing (including the `vs` grammar and its overflow

@@ -38,6 +38,15 @@ cargo test -p tinhorn-core     # the ~64 GPU-free sim/ceremony tests, no Bevy
 TINHORN_BEVY_SNAPSHOT=/tmp/arena.png cargo run -- 4d6!kh3
 TINHORN_SNAP_COLS=120 TINHORN_SNAP_ROWS=44 TINHORN_BEVY_SNAPSHOT=/tmp/a.png cargo run -- d20
 TINHORN_SNAP_FRAME=8 TINHORN_BEVY_SNAPSHOT=/tmp/a.png cargo run -- 3d6   # mid-roll, not settled
+
+# Perf/debug overlays & profiling (interactive; see the `scene::FrameStats` overlay).
+cargo run                                   # debug build: FPS + render-size overlay on by default
+TINHORN_FPS=1 cargo run --release           # same overlay on a release build (the real numbers)
+#   In kitty mode the overlay also breaks the frame down: rest (render + GPU→CPU
+#   readback) · pack · zip (zlib) · b64 · wr (stdout write — pty backpressure).
+cargo run --features profiling -- 3d6       # deep per-system chrome trace → trace-<ts>.json
+#   (load in https://ui.perfetto.dev; `--features profiling-tracy` streams to Tracy)
+TINHORN_KITTY_DIRECT=1 cargo run            # force base64-in-escape transmit (kitty file t=f is the default)
 ```
 
 The three GPU render smoke tests in the binary are `#[ignore]`d (they need a real
@@ -166,13 +175,22 @@ and `drain_sounds` plays whatever the physics queued.
     the shared shake clock; `choreograph` moves the `ArenaCamera` to match
     `view_math::live_camera` (so the overlays stay in register) and flinches the
     key light on hard impacts / a crit flare; `draw_ui` composes the frame via
-    `ui::render_bevy` and reports the arena panel size back; `drain_sounds` feeds
-    `app.take_sounds()` to the lazily-spawned `Foley` (capping the per-frame click
-    storm).
+    `ui::render_bevy_mode` (the resolved `Graphics(mode)` resource selects
+    half-blocks vs kitty) and reports the arena panel size back — and in **kitty
+    mode**, *strictly after* the draw (ratatui owns stdout during it), emits the
+    arena image as kitty-graphics APCs (`graphics::emit`) over the panel origin,
+    gated by a `KittyState` that deletes/re-places while a pane covers the arena;
+    `drain_sounds` feeds `app.take_sounds()` to the lazily-spawned `Foley` (capping
+    the per-frame click storm). `kitty_cleanup` (PostUpdate) deletes the image on
+    quit, before `CleanupPlugin` leaves the alt screen; a panic instead runs the
+    same teardown (`install_kitty_panic_hook` chains it onto `term`'s restore hook),
+    so a crash mid-roll doesn't strand the image in the scrollback.
   - Rendering: a headless `Camera3d` draws into an offscreen render-target
     `Image`, which is **read back to the CPU each frame via Bevy 0.19's built-in
     `bevy_render::gpu_readback`** (`Readback` + a `ReadbackComplete` observer);
-    `ui::blit_bevy_arena` blits the RGBA into half-blocks. Realism the old CPU
+    in the `blocks` path `ui::blit_bevy_arena` blits the RGBA into half-blocks (the
+    `kitty` path in `graphics` transmits the same readback as a real image instead).
+    Realism the old CPU
     rasterizer never had: **HDR + filmic tonemapping** (TonyMcMapface),
     **4× MSAA**, **screen-space ambient occlusion**, **shadow maps** (the key
     `PointLight`), and **`DistanceFog`**, plus a **2× supersample** (`ARENA_SS`,
@@ -192,15 +210,22 @@ and `drain_sounds` plays whatever the physics queued.
     not a silent unit bug.
 
 - **`ui`** (bin) — no longer a software renderer: it's the ratatui **chrome** plus
-  the **shared arena overlays**. `render_bevy(frame, app, pixels, img_w, img_h)`
-  lays out the four rows (arena, result panel, input line, help bar), blits the
-  Bevy read-back into the arena panel, draws the overlays, and returns the arena
-  inner size so the scene can size its render target. The overlays: the **die
-  numbers** (each riding the frontmost read-face, a spin-derived decoy while
-  airborne that ducks out edge-on and burns to `final_value` on settle, scaled
-  uniformly across the roll from a single cell up to a blocky half-block glyph
-  — `DIGIT_FONT`/`draw_big_number`/`number_scale`/`read_face`), the crit/fumble
-  **particles**, the **power meter** and **release echo**. It also owns the
+  the **shared arena overlays**. `render_bevy_mode(frame, app, pixels, img_w, img_h,
+  mode) -> ArenaReport` lays out the four rows (arena, result panel, input line,
+  help bar) and branches only on the arena panel: in `blocks` mode it blits the
+  Bevy read-back into the arena and composites the numbers; in `kitty` mode it
+  clears the arena cells (the scene places a real image behind them) and *returns*
+  the numbers as `NumberBurn`s (`ArenaReport.kitty`) for the scene to rasterise into
+  the pixels (`burn_numbers`). It returns the render-target size to request.
+  `render_bevy` is the thin `blocks` wrapper kept at its old signature so the ≈30
+  chrome tests (and the three `#[ignore]` GPU tests) compile untouched. The
+  overlays: the **die numbers** (each riding the frontmost read-face, a spin-derived
+  decoy while airborne that ducks out edge-on and burns to `final_value` on settle,
+  scaled uniformly across the roll from a single cell up to a blocky half-block
+  glyph — `DIGIT_FONT`/`GlyphRaster`/`plan_die_number`/`draw_big_number`/
+  `number_scale`/`read_face`, the placement + glyph raster both render paths share),
+  the crit/fumble **particles**, the **power meter** and **release echo**. It also
+  owns the
   **procedural texture generators** (`felt_texture`, `floor_texture`,
   `velvet_texture`, `grain_texture`, `backdrop_texture` — colour-keyed bake
   cache), the `ArenaStyle` palette (`DEFAULT`), and the result/help/pane panels.
@@ -208,6 +233,30 @@ and `drain_sounds` plays whatever the physics queued.
   a dim decoy until its die settles, then locks in bold; the Σ total is a dim `…`
   until every die has landed. (The animation must never spoil the total it's
   building toward.)
+
+- **`graphics`** (bin) — the **kitty graphics protocol** arena (the pixel-perfect
+  output path), a plain module *outside* the vendored `term/` (the PROVENANCE
+  re-sync contract), and named `graphics` not `kitty` so it never collides with
+  `term/crossterm_context/kitty.rs` (the keyboard protocol). `resolve(--graphics)`
+  picks a `GraphicsMode`: `auto` env-sniffs the terminal (`kitty_capable`: kitty /
+  Ghostty / WezTerm via `TERM`/`TERM_PROGRAM`/`KITTY_WINDOW_ID`, **never under
+  tmux/screen**, which inherit `KITTY_WINDOW_ID` yet eat the graphics APC), else
+  `blocks`; `kitty`/`blocks` force it. The per-frame payload pipeline: `pack_rgb`
+  strips wgpu's 256-byte row padding, drops alpha (`f=24`), and applies the shared
+  `ui::vignette`; `compress` runs zlib-fast (`o=z`) and `encode_apc` does base64 →
+  4096-byte APC chunks (`a=T`, a **fixed** `i=1,p=1` so a same-id retransmit is kitty's
+  flicker-free in-place replace, a deep negative `z` under non-default backgrounds,
+  `C=1` so the cursor doesn't move, and `q=2` so no response ever lands in
+  crossterm's input stream). `emit`/`emit_raw` write to stdout; the delete escapes
+  clean up on pane-open and on quit. `scale_for` maps the cell pixel height to the
+  render scale; `MAX_IMG_W` caps the transmitted width. Everything is pure and
+  unit-tested bar the two impure edges (`resolve`, `emit`). Profiling found the
+  per-frame cost was the stdout write (pty backpressure) + zlib, **not** the readback,
+  so `encode_apc_path` (`t=f`) hands the terminal a file of raw RGB and the pty carries
+  only a path — **the default** whenever it can work. It can't cross an SSH hop (the
+  file is on the remote host, the terminal reads locally), so `over_ssh()` auto-falls
+  back to the base64 path there; `TINHORN_KITTY_DIRECT` forces base64 too, for a local
+  terminal that restricts which files it will read.
 
 - **`paint`** (bin) — the small CPU `Rgb` (8-bit tint/palette) and `Texture`
   (row-major RGBA) types the overlays and the procedural generators use. They
@@ -284,7 +333,31 @@ and `drain_sounds` plays whatever the physics queued.
   a text dump; `TINHORN_SNAP_COLS/ROWS/FRAME` tune it). The main-loop's three GPU
   render smoke tests are `#[ignore]`d because they need a real adapter; the chrome
   and overlays are covered GPU-free with ratatui's `TestBackend`. Eyeball the
-  foley palette with `cargo test audible -- --ignored`.
+  foley palette with `cargo test audible -- --ignored`. `TINHORN_BEVY_SNAPSHOT`
+  **always forces `blocks`** (it composes to a `TestBackend`/PNG and has no TTY),
+  so kitty never affects the snapshot or the chrome tests.
+- **The kitty arena is an output-path feature only** — no changes to the sim,
+  physics, RNG contract, or camera math (a test pins `--seed` identical across
+  kitty / blocks / one-shot). Load-bearing rules: the **"cols × 2·rows" image
+  shape is the single aspect source** — kitty raises only the *scale*, so
+  `view_math::arena_aspect`/`project_to_cell` stay untouched and any cell-ratio
+  mismatch is the same mild stretch half-blocks already have. `q=2` is **always**
+  on every APC (a kitty response would land in crossterm's input stream and read as
+  a keypress). Emission happens **strictly after `context.draw()`** (ratatui owns
+  stdout during a draw). `auto` **never picks kitty under tmux/screen** (they eat
+  the APC). All kitty code lives in `graphics`, never the vendored `term/` (the
+  PROVENANCE re-sync contract) — its own `term/…/kitty.rs` is the unrelated
+  keyboard protocol.
+- **Two levels of perf tooling, both TUI-safe** (never print to stdout — it *is*
+  the terminal). The `scene::FrameStats` overlay is the quick glance: FPS + the
+  render-target size, and in kitty mode a per-stage transmit breakdown (rest / pack
+  / zip / b64 / wr); on by default in debug builds, or `TINHORN_FPS=1` on a release
+  build (measure release — the workspace optimizes deps but not our own crate, so a
+  debug build inflates *our* loops like `pack_rgb`). For a system-level flamegraph,
+  `--features profiling` turns on Bevy's per-system tracing spans and writes a chrome
+  trace on quit (`profiling-tracy` streams to Tracy instead); the `profile_span!`
+  macro adds our non-system blocks (compose, kitty emit) and is a no-op without the
+  feature.
 - Audio opens the **default output device only** (`foley.rs::open_sink`, on the
   audio thread). Never call rodio's `open_default_sink()` or enumerate devices:
   the fallback walks every audio device including microphones, which is its own

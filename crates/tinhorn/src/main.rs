@@ -21,6 +21,9 @@ pub use tinhorn_core::{app, parse, physics};
 
 mod cli;
 mod foley;
+// The kitty graphics protocol arena (real pixels in kitty/Ghostty); the
+// half-block blit in `ui` stays the fallback everywhere else.
+mod graphics;
 mod paint;
 mod ui;
 
@@ -60,7 +63,7 @@ fn main() -> io::Result<()> {
     // because it deliberately has no TTY; ordinary scripting (no env var) never
     // sets it, so pipes still take the GPU-free one-shot path below.
     if std::env::var_os("TINHORN_BEVY_SNAPSHOT").is_some() {
-        scene::run(expr, cli.seed, cli.mute);
+        scene::run(expr, cli.seed, cli.mute, cli.graphics);
         return Ok(());
     }
 
@@ -80,7 +83,7 @@ fn main() -> io::Result<()> {
 
     // Interactive: launch the Bevy dice arena (the only renderer). The one-shot
     // short-circuit above keeps scripting and pipes GPU-free.
-    scene::run(expr, cli.seed, cli.mute);
+    scene::run(expr, cli.seed, cli.mute, cli.graphics);
     Ok(())
 }
 

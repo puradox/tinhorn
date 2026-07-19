@@ -24,6 +24,8 @@ And what'll it cost you to see all this? Not one thin dime!
 
 - **A real physics arena.** Dice are tossed, bounced, knocked together, and
   rolled off each other's backs.
+- **[Real pixels](#real-pixels)** in kitty, Ghostty & WezTerm — the arena drawn
+  as a true image, half-blocks everywhere else. Same table, same seed.
 - **Your throw.** Shake the cup and catch the meter at its peak. Put some
   arm into it!
 - **Set the stakes.** Call your number — `d20+5 vs 15` — and the arena hands
@@ -60,6 +62,7 @@ tinhorn                  # start empty, type an expression
 tinhorn 3d6              # roll 3d6 the moment it opens
 tinhorn "d6+d8"          # quote anything with shell-special characters
 tinhorn --mute           # start silent (Ctrl-Q toggles at runtime)
+tinhorn --graphics blocks # force half-blocks (auto uses real pixels in kitty)
 ```
 
 > **macOS asked about the microphone?** Recent macOS raises that prompt for
@@ -86,6 +89,22 @@ tinhorn --mute           # start silent (Ctrl-Q toggles at runtime)
 Three roll modes cycle on `Tab`: **shake** (drop into the cup and catch the
 power meter), **roll** (dice tumble straight in), and **insta** (landed and
 tallied at once).
+
+## Real pixels
+
+In a terminal that speaks the [kitty graphics protocol][kitty-gfx] — **kitty**,
+**Ghostty**, **WezTerm** — the arena isn't half-blocks: the same GPU frame is
+handed to the terminal as a _real image_, drawn at your display's resolution
+while the chrome is painted around it. Everywhere else it falls back to the
+`▀` half-block blit, and you'd be hard-pressed to spot the switch.
+
+It's the same table under either one — same camera, same physics, the very same
+seeded RNG — so `tinhorn --seed 42 3d6` lands the identical total whether it's
+drawn in pixels, in half-blocks, or printed by `-p`. Detection sniffs the
+terminal (and stands down under tmux, which quietly eats the picture); force
+the call with `--graphics kitty` or `--graphics blocks`.
+
+[kitty-gfx]: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 
 ## Dice notation
 
