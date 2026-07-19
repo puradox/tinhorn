@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/puradox/tinhorn/compare/tinhorn-core-v0.1.5...tinhorn-core-v0.2.0) - 2026-07-19
+
+### Added
+
+- *(app)* flare exploding crits as they land, not at chain end ([#28](https://github.com/puradox/tinhorn/pull/28))
+- *(parse)* reroll modifiers (r/ro) with chained compare points ([#25](https://github.com/puradox/tinhorn/pull/25))
+
+### Other
+
+- trim verbose comments to their essential point ([#29](https://github.com/puradox/tinhorn/pull/29))
+
 ## [0.1.5](https://github.com/puradox/tinhorn/compare/tinhorn-core-v0.1.4...tinhorn-core-v0.1.5) - 2026-07-19
 
 ### Other

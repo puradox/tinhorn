@@ -1,6 +1,6 @@
 [package]
 name = "tinhorn"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A dice cup for your terminal: shake the cup, watch dice fly, hear them land."
 license = "MIT OR Apache-2.0"
