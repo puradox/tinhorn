@@ -1,12 +1,11 @@
 //! Small CPU colour + texture types used by the arena's chrome and its baked
 //! procedural textures (felt, floorboards, velvet, backdrop, wood grain).
 //!
-//! These outlived the vendored `render3d` software rasterizer they came from:
-//! the Bevy renderer wraps the baked [`Texture`]s as `Image`s and tints its
-//! overlays/materials with [`Rgb`], so they live here on their own.
+//! These outlived the vendored `render3d` software rasterizer they came from: the
+//! Bevy renderer wraps the baked [`Texture`]s as `Image`s and tints its overlays
+//! with [`Rgb`].
 
-/// RGB colour with 8-bit channels — the tint/palette type for the arena's chrome
-/// and its baked procedural textures.
+/// RGB colour with 8-bit channels — the tint/palette type for the arena's chrome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 

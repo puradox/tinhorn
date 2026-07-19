@@ -2,11 +2,10 @@
 //!
 //! In a terminal that speaks the kitty graphics protocol (kitty, Ghostty), the
 //! same GPU frame the half-block blit downsamples is instead handed to the
-//! terminal as a *real image* placed over the arena panel, while ratatui keeps
-//! painting the chrome around it. Everywhere else the `▀` half-block blit in
-//! [`crate::ui`] stays the fallback. This module owns the mode decision and the
-//! whole payload pipeline; the compose (which pixels, where the numbers burn) lives
-//! in [`crate::ui`] and the emission in [`crate::scene`].
+//! terminal as a *real image* over the arena panel, while ratatui paints the
+//! chrome around it. Everywhere else the `▀` half-block blit in [`crate::ui`]
+//! stays the fallback. This module owns the mode decision and the payload
+//! pipeline; the compose lives in [`crate::ui`], the emission in [`crate::scene`].
 //!
 //! Everything here is pure and unit-tested except the two impure edges that touch
 //! the environment ([`resolve`]) and stdout ([`emit`]/[`emit_raw`]). Named
@@ -37,11 +36,10 @@ pub enum GraphicsArg {
     Blocks,
 }
 
-/// Cap on the transmitted image width in pixels. A fullscreen arena on a hi-DPI
-/// display could otherwise ask for a several-thousand-pixel-wide frame every
-/// frame, and readback → zlib → base64 is the frame-budget bottleneck. The scale
-/// is knocked down until `cols * scale <= MAX_IMG_W`; this is the tuning knob if
-/// the encode ever drags.
+/// Cap on the transmitted image width in pixels: a fullscreen hi-DPI arena could
+/// otherwise ask for a several-thousand-pixel frame every frame, and readback →
+/// zlib → base64 is the frame-budget bottleneck. Scale is knocked down until
+/// `cols * scale <= MAX_IMG_W` — the tuning knob if the encode ever drags.
 pub const MAX_IMG_W: u32 = 1600;
 
 /// The kitty transmit chunk cap: each APC's base64 payload is at most this many
@@ -49,8 +47,8 @@ pub const MAX_IMG_W: u32 = 1600;
 const CHUNK: usize = 4096;
 
 /// The machine's core count, cached: [`pack_rgb`] splits its row-band work across
-/// it every frame, but it can't change during a run, so the `available_parallelism`
-/// syscall runs once rather than on the hot path.
+/// it every frame, but it can't change during a run, so `available_parallelism`
+/// runs once, not on the hot path.
 fn core_count() -> usize {
     use std::sync::OnceLock;
     static CORES: OnceLock<usize> = OnceLock::new();
@@ -70,12 +68,11 @@ pub(crate) fn readback_stride(img_w: u32) -> usize {
 }
 
 /// Does this terminal speak the kitty graphics protocol? A hermetic env sniff (no
-/// escape probing in v1 — the flag is the override): kitty and Ghostty set a
-/// telltale `TERM`/`TERM_PROGRAM`, kitty also exports `KITTY_WINDOW_ID`, and
-/// WezTerm announces itself via `TERM_PROGRAM`. **But never under tmux/screen**:
-/// a multiplexer inherits `KITTY_WINDOW_ID` from its host yet swallows graphics
-/// APCs, so the image would silently never land. Kept pure — the caller reads the
-/// environment and passes it in — so the whole truth table is unit-tested.
+/// escape probing — the flag is the override): kitty/Ghostty set a telltale
+/// `TERM`/`TERM_PROGRAM`, kitty also exports `KITTY_WINDOW_ID`, WezTerm announces
+/// via `TERM_PROGRAM`. **But never under tmux/screen**: a multiplexer inherits
+/// `KITTY_WINDOW_ID` yet swallows graphics APCs, so the image would never land.
+/// Kept pure — the caller passes the environment in — so the truth table is tested.
 pub fn kitty_capable(term: &str, term_program: &str, kitty_window_id: bool, in_tmux: bool) -> bool {
     if in_tmux || term.starts_with("screen") || term.starts_with("tmux") {
         return false;
@@ -144,10 +141,10 @@ fn detect_scale() -> u32 {
 /// `None` when the buffer is empty or shorter than a full frame (a stale readback
 /// mid-resize, or before the first frame lands).
 ///
-/// This per-pixel pass over the whole readback is the single biggest slice of the
+/// This per-pixel pass over the whole readback is the biggest slice of the
 /// per-frame main-thread cost, so it's **split across cores** by row band — each
-/// thread fills a disjoint chunk of the output with the exact same per-pixel math,
-/// so the result stays byte-identical. Rows are independent, so no synchronization.
+/// thread fills a disjoint output chunk with identical per-pixel math, so the
+/// result stays byte-identical. Rows are independent, so no synchronization.
 pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     if img_w == 0 || img_h == 0 {
         return None;
@@ -240,10 +237,10 @@ pub fn encode_apc(payload: &[u8], img_w: u32, img_h: u32, cols: u16, rows: u16) 
 
 /// Wrap a *file path* (not the pixels) in the kitty APC — `t=f`, so the terminal
 /// loads the raw RGB from disk instead of the pty. The pty then carries only ~50
-/// bytes, which is what unblocks the per-frame stdout write (the measured
-/// bottleneck); the file holds raw `f=24` RGB (no `o=z` — a local file has no
-/// bandwidth problem, so we skip the zlib CPU too). The header otherwise mirrors
-/// [`encode_apc`]. The path is short, so this is always a single un-chunked APC.
+/// bytes, which unblocks the per-frame stdout write (the measured bottleneck); the
+/// file holds raw `f=24` RGB (no `o=z` — a local file has no bandwidth problem, so
+/// skip the zlib CPU too). Header otherwise mirrors [`encode_apc`]; the short path
+/// is always a single un-chunked APC.
 pub fn encode_apc_path(path: &str, img_w: u32, img_h: u32, cols: u16, rows: u16) -> Vec<u8> {
     let b64 = BASE64_STANDARD.encode(path.as_bytes());
     let header =

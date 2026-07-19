@@ -13,10 +13,9 @@
 //! jump) · ↑/↓ scroll an open pane · ? help · Ctrl-H history · Ctrl-S stats ·
 //! Ctrl-Q mute · Esc quit
 
-// The roll semantics and 3D dice simulation live in the `tinhorn-core` library
-// (shared with the future chronicle web embed). Re-exported at the crate root so
-// the binary's modules keep referring to `crate::app` / `crate::parse` /
-// `crate::physics` unchanged.
+// The roll semantics and 3D dice simulation live in the `tinhorn-core` library.
+// Re-exported at the crate root so the binary's modules keep referring to
+// `crate::app` / `crate::parse` / `crate::physics`.
 pub use tinhorn_core::{app, parse, physics};
 
 mod cli;
@@ -57,11 +56,10 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let expr = cli.expression();
 
-    // Headless Bevy snapshot: an explicit request to render the arena to a PNG
-    // (`TINHORN_BEVY_SNAPSHOT=<path>`), used to validate the renderer in CI or a
-    // non-interactive shell. Checked *before* the one-shot short-circuit precisely
-    // because it deliberately has no TTY; ordinary scripting (no env var) never
-    // sets it, so pipes still take the GPU-free one-shot path below.
+    // Headless Bevy snapshot: render the arena to a PNG (`TINHORN_BEVY_SNAPSHOT=<path>`)
+    // to validate the renderer in CI or a non-interactive shell. Checked *before* the
+    // one-shot short-circuit because it deliberately has no TTY, yet ordinary scripting
+    // never sets it, so pipes still take the GPU-free one-shot path below.
     if std::env::var_os("TINHORN_BEVY_SNAPSHOT").is_some() {
         scene::run(expr, cli.seed, cli.mute, cli.graphics);
         return Ok(());
@@ -104,9 +102,8 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
     }
 
     // Pane hotkeys are global (work whether or not a pane is open) and use
-    // chords / `?` so they never collide with typed notation — `h` and `s` have
-    // to stay typeable for `kh`/`dh` and any expression containing them. Pressing
-    // a pane's key again closes it.
+    // chords / `?` so they never collide with typed notation — `h` and `s` must
+    // stay typeable for `kh`/`dh`. Pressing a pane's key again closes it.
     match code {
         KeyCode::Char('?') => {
             app.set_pane(toggle(app.pane, Pane::Help));
@@ -120,9 +117,8 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
             app.set_pane(toggle(app.pane, Pane::Stats));
             return Action::Continue;
         }
-        // Mute is global too. Q for "quiet" — Ctrl-M was the obvious chord,
-        // but on legacy encodings Ctrl-M *is* Enter (ASCII CR), so it can
-        // never be a hotkey; Ctrl-Q arrives cleanly in every terminal.
+        // Mute is global too. Q for "quiet" — Ctrl-M was the obvious chord, but on
+        // legacy encodings Ctrl-M *is* Enter (ASCII CR), so it can never be a hotkey.
         KeyCode::Char('q') if ctrl => {
             app.muted = !app.muted;
             return Action::Continue;
@@ -131,10 +127,9 @@ fn handle_key(app: &mut App, code: KeyCode, ctrl: bool) -> Action {
     }
 
     // While a pane is open it captures the rest of input: Esc/q close it, the
-    // arrows scroll a pane too tall for the screen, and everything else is
-    // ignored so the hidden expression can't be edited blind. The scroll offset
-    // is clamped to the overflow at render time, so over-scrolling past the end
-    // corrects itself on the next frame.
+    // arrows scroll a pane too tall for the screen, and everything else is ignored
+    // so the hidden expression can't be edited blind. The scroll offset is clamped
+    // to the overflow at render time, so over-scrolling corrects itself next frame.
     if app.pane != Pane::None {
         match code {
             KeyCode::Esc | KeyCode::Char('q') => app.set_pane(Pane::None),
@@ -318,11 +313,10 @@ mod tests {
             })
             .unwrap(); // size the arena
 
-        // The tray is always drawn, so to catch the *cup* we compare two frames of
-        // the same scene: roll first (dice on the felt, no idle hint) for a stable
-        // baseline, then start shaking. The cup (a solid block) and the meter paint
-        // over felt cells, so a healthy count of *changed* arena cells proves the
-        // cup rendered — a culled-to-nothing cup would change almost nothing.
+        // The tray is always drawn, so to catch the *cup* we compare two frames: roll
+        // first (dice on the felt) for a stable baseline, then start shaking. The cup
+        // and meter paint over felt cells, so a healthy count of *changed* arena cells
+        // proves the cup rendered — a culled-to-nothing cup would change almost nothing.
         let snapshot = |t: &Terminal<TestBackend>| -> Vec<(String, ratatui::style::Color)> {
             let buf = t.backend().buffer();
             (0..buf.area().width)
@@ -477,10 +471,9 @@ mod tests {
 
     #[test]
     fn a_tiny_terminal_skips_the_meter_rather_than_breaking_the_border() {
-        // Regression: on an arena too narrow for the power meter, drawing it
-        // would paint over the border chrome. It is skipped instead. (The cup is
-        // now a 3D object, rasterised into the arena interior, so it can't spill
-        // over the border at all — but the meter is still a text overlay.)
+        // Regression: on an arena too narrow for the power meter, drawing it would
+        // paint over the border chrome. It is skipped instead. (The cup is now a 3D
+        // object in the arena interior; only the meter is still a text overlay.)
         let mut app = App::new(String::new());
         let mut terminal = Terminal::new(TestBackend::new(9, 12)).unwrap();
         terminal
@@ -908,12 +901,11 @@ mod tests {
         assert!(has_value, "the die's value should be burned onto the face");
     }
 
-    // The number rides the frontmost face and ducks out when the die turns
-    // edge-on: a cube squared to the eye reads one face clearly (high clarity, the
-    // digit shows), but rotated 45° two faces tie for frontmost (clarity ~0, the
-    // airborne digit blinks off) — so it reads as ink on the tumbling solid, not a
-    // fixed label. One threshold works because clarity is the leader's lead, not
-    // an absolute facing.
+    // The number rides the frontmost face and ducks out when the die turns edge-on:
+    // a cube squared to the eye reads one face clearly (the digit shows), but rotated
+    // 45° two faces tie for frontmost (clarity ~0, the digit blinks off) — so it reads
+    // as ink on the tumbling solid, not a fixed label. One threshold works because
+    // clarity is the leader's lead, not an absolute facing.
     #[test]
     fn the_number_ducks_out_when_the_die_rolls_edge_on() {
         use glam::{Quat, Vec3};
@@ -937,9 +929,9 @@ mod tests {
     }
 
     // The number scales to the die's on-screen size: a small die keeps the crisp
-    // single cell (scale 0), and the digits grow as the die does — so a wide
-    // terminal, which renders the dice large, doesn't leave a speck of a number on
-    // a big die. A wider (two-digit) number needs a wider die for the same scale.
+    // single cell (scale 0), and the digits grow with it — so a wide terminal, which
+    // renders the dice large, doesn't leave a speck of a number on a big die. A wider
+    // (two-digit) number needs a wider die for the same scale.
     #[test]
     fn the_number_scales_with_the_die() {
         // A tiny die can't fit even a scale-1 half-block glyph (3×3 cells) → 0.

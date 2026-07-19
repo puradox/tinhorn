@@ -9,9 +9,9 @@
 //! All six are built by one robust helper, [`polyhedron`], which takes each face
 //! as an *unordered* set of its corner points and does the fiddly parts itself:
 //! finds the outward normal, orders the corners counter-clockwise as seen from
-//! outside, fan-triangulates, and splits vertices per face so each face is
-//! flat-shaded. Every solid is scaled to circumradius 1, so a single world-space
-//! size applies to all of them.
+//! outside, fan-triangulates, and splits vertices per face for flat shading.
+//! Every solid is scaled to circumradius 1, so a single world-space size applies
+//! to all of them.
 
 use std::sync::Arc;
 
@@ -283,10 +283,9 @@ fn d12() -> Mesh {
 /// The dice cup: a hollow, open-mouthed tin tumbler — a flared outer wall with
 /// a **rolled lip**, a visible rim, an inner wall, and a raised inner floor, so
 /// from the arena's raised camera you look into a dark mouth ringed by a bright
-/// metal lip instead of at a solid closed cylinder. Centred on the origin,
-/// ~1.2 tall; the arena scales, sways, and wobbles this single mesh while
-/// shaking. It is the 3D heir to the old ASCII cup — the arena keeps no 2D
-/// furniture. Cached like [`mesh_for`].
+/// metal lip instead of a solid closed cylinder. Centred on the origin, ~1.2
+/// tall; the arena scales, sways, and wobbles this single mesh while shaking.
+/// Cached like [`mesh_for`].
 pub fn cup() -> Arc<Mesh> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Arc<Mesh>> = OnceLock::new();
@@ -431,14 +430,13 @@ pub type FaceGeom = (Vec3, Vec3);
 /// unit (circumradius-1) space — the same space [`mesh_for`] renders in, so
 /// scaling a centroid by the die's world radius and applying its pose lands it
 /// exactly on the rendered face. The arena uses this to sit the number on the
-/// face pointing at the camera and to fade it as that face turns edge-on.
+/// face pointing at the camera and fade it as that face turns edge-on.
 ///
 /// Derived from the built mesh, not a second copy of the face data:
-/// [`polyhedron`] lays each face down as a contiguous run of vertices that all
-/// share that face's flat-shading normal, so consecutive runs of equal normal
-/// recover the faces (a convex origin-centred solid gives every face a distinct
-/// outward normal, and `fit` scales positions but never normals). Cached per
-/// `sides` and falling back to the cube, mirroring [`mesh_for`].
+/// [`polyhedron`] lays each face down as a contiguous run of vertices sharing
+/// that face's flat-shading normal, so consecutive runs of equal normal recover
+/// the faces (`fit` scales positions but never normals). Cached per `sides` and
+/// falling back to the cube, mirroring [`mesh_for`].
 pub fn face_geometry(sides: u32) -> &'static [FaceGeom] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<[(u32, Vec<FaceGeom>); 6]> = OnceLock::new();

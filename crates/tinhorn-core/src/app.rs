@@ -58,11 +58,9 @@ pub struct Die {
     /// Set once a die has had its chance to explode, so it can't spawn twice.
     exploded: bool,
     /// Set once this die's crit ceremony (gold burst + ring) has fired, so it
-    /// can't fire twice. On an exploding term a maxed die celebrates the instant
-    /// it settles — before its sibling drops — instead of waiting for the whole
-    /// chain to come to rest; this flag stops [`App::record_roll`] re-bursting it
-    /// at the end. Plain (non-exploding) pools leave it false and still get the
-    /// one batched chord when everything settles.
+    /// can't fire twice — an exploding term's maxed die celebrates the instant it
+    /// settles, before its sibling drops, so this flag stops [`App::record_roll`]
+    /// re-bursting it at the end.
     celebrated: bool,
     age: f32, // seconds airborne; a hard cap forces a rest so nothing tumbles forever
     /// Handle to this die's Rapier rigid body (invalid until spawned).
@@ -72,8 +70,8 @@ pub struct Die {
 impl Die {
     /// A kept die at rest on its proudest face — [`crit_face`] applied to this
     /// die. The one home for the (kept · settled · max-face) triple, shared by
-    /// [`App::crit_dice`] and the settle-time / end-of-roll burst passes so the
-    /// crit-eligibility rule can't drift between them.
+    /// [`App::crit_dice`] and the burst passes so the crit-eligibility rule can't
+    /// drift between them.
     fn is_crit(&self) -> bool {
         self.kept && self.settled && crit_face(self.sides, self.final_value)
     }
@@ -85,11 +83,10 @@ impl Die {
 /// the comparison, so the rule can only ever change in one place.
 ///
 /// `margin` is "how much you made it by": positive on success, negative on
-/// failure, whichever way the stake runs. Meet-or-beat measures `total −
-/// target`; roll-under measures `target − total`. Either way `success` is
-/// `margin >= 0`, so [`verdict_text`] reads the same for both directions. The
-/// subtraction is done in i64 so an absurd-but-parseable target (i32::MIN)
-/// can't overflow.
+/// failure. Meet-or-beat measures `total − target`, roll-under `target − total`;
+/// either way `success` is `margin >= 0`, so [`verdict_text`] reads the same for
+/// both directions. The subtraction is done in i64 so an absurd-but-parseable
+/// target (i32::MIN) can't overflow.
 pub fn check(total: i32, stake: Stake) -> (bool, i32) {
     let raw = match stake.goal {
         Goal::Over => total as i64 - stake.target as i64,
@@ -109,11 +106,10 @@ pub fn verdict_text(success: bool, margin: i32) -> String {
     }
 }
 
-/// The crit rule, one place: a die of `sides` showing `value` is a crit on
-/// its max face. A d1 is excluded — it is always at its max (and its min)
-/// and deserves neither celebration nor pity. Shared by the animated path
-/// ([`App::crit_dice`]) and the headless evaluator so `--json` consumers see
-/// the same call the arena makes.
+/// The crit rule, one place: a die of `sides` showing `value` is a crit on its
+/// max face. A d1 is excluded — always at its max and its min at once, it earns
+/// neither celebration nor pity. Shared by the animated path ([`App::crit_dice`])
+/// and the headless evaluator so `--json` matches the arena.
 pub fn crit_face(sides: u32, value: u32) -> bool {
     sides >= 2 && value == sides
 }
@@ -125,9 +121,9 @@ pub fn fumble_face(sides: u32, value: u32) -> bool {
 
 /// A cosmetic up-face number for an airborne die, derived from its orientation
 /// so it flickers as the die tumbles and stills as it slows. No RNG is drawn —
-/// the seed-identical roll contract is untouched — and it never counts toward
-/// anything: the value that matters burns in from `final_value` the instant the
-/// die settles. This is what keeps the outcome a secret until the dice stop.
+/// the seed-identical roll contract is untouched — and it never counts: the real
+/// value burns in from `final_value` on settle, keeping the outcome a secret
+/// until the dice stop.
 fn tumbling_face(rot: Quat, sides: u32) -> u32 {
     if sides <= 1 {
         return 1;
@@ -537,10 +533,9 @@ impl App {
             }
         }
         self.particles.clear();
-        // Keep only the climax sounds — and collapse the crit ring to one. The
-        // animated path rings once per explosion wave, spaced across frames; an
-        // insta roll fast-forwards the whole cascade into this single frame, so
-        // every wave's ring would land at once (a bell choir). Voice one chime.
+        // Keep only the climax sounds — and collapse the crit ring to one. An
+        // insta roll fast-forwards the whole cascade into one frame, so every
+        // explosion wave's ring would land at once (a bell choir). Voice one.
         let mut crit_kept = false;
         self.sounds.retain(|s| match s {
             SoundEvent::Crit => !std::mem::replace(&mut crit_kept, true),
@@ -556,9 +551,9 @@ impl App {
     /// multiply are applied here; exploding is deferred to the animation — each
     /// die carries its term's explode condition and spawns a sibling when it
     /// settles on a matching face (see [`Self::settle_supported`]), so the chain
-    /// unfolds on screen instead of all at once. Every die ever thrown stays in
-    /// the pool; `kept`/`mult` decide what reaches the total. `color_idx`
-    /// continues across terms so each die gets its own palette colour.
+    /// unfolds on screen. Every die thrown stays in the pool; `kept`/`mult` decide
+    /// what reaches the total. `color_idx` continues across terms so each die gets
+    /// its own palette colour.
     fn roll_term(&mut self, term_idx: usize, term: &DiceTerm, out: &mut Vec<Die>) {
         let start = out.len();
         let base_color = start;
@@ -872,9 +867,9 @@ impl App {
         self.impact_energy
     }
 
-    /// Camera "reading" focus (0 → 1), keyed to the ceremony: eased toward 1 the
-    /// moment a roll is launched — held through the flight and the settle, the
-    /// lean-in over the felt — and back to 0 while the cup is shaking. Cosmetic.
+    /// Camera "reading" focus (0 → 1), keyed to the ceremony: eased toward 1 when
+    /// a roll launches, held through flight and settle, back to 0 while the cup
+    /// shakes. Cosmetic.
     pub fn focus(&self) -> f32 {
         self.focus
     }
@@ -901,10 +896,10 @@ impl App {
         self.flash = (self.flash - dt * 2.2).max(0.0); // crit flare fades over ~0.45 s
         self.impact_energy = (self.impact_energy - dt * 4.0).max(0.0); // flinch fades fast
 
-        // Ease the reading-focus by ceremony, not by rest: lean IN from the moment a
-        // throw is launched (and hold through the flight and the settle, so you watch
-        // the dice come to a readable stop), and lean back OUT the instant the next
-        // shake begins — the cup coming up is the cue to pull back to the wide view.
+        // Ease the reading-focus by ceremony, not by rest: lean IN when a throw
+        // launches (held through flight and settle, so you watch the dice come to a
+        // readable stop), and back OUT the instant the next shake begins — the cup
+        // coming up is the cue to pull back to the wide view.
         let want_focus = if self.shaking() || self.dice.is_empty() {
             0.0
         } else {
@@ -934,12 +929,11 @@ impl App {
         }
 
         // Advance the physics on a FIXED timestep (physics::STEP, the one true
-        // 1/60 s), accumulating real time. An insta roll (one step per call) and
-        // an animated roll (several steps per frame) run the identical simulation
-        // and settle bit-identically — the seeded-roll contract survives real
-        // physics. Once every die is at rest nothing can move again until the
-        // next launch, so skip the stepping entirely rather than churn Rapier
-        // over a world of sleepers for as long as the result sits on screen.
+        // 1/60 s), accumulating real time. Insta (one step per call) and animated
+        // (several steps per frame) run the identical simulation and settle
+        // bit-identically — the seeded-roll contract survives real physics. Once
+        // everything's at rest, skip the stepping rather than churn Rapier over a
+        // world of sleepers for as long as the result sits on screen.
         if self.all_settled() {
             self.phys_accum = 0.0;
         } else {
@@ -1048,9 +1042,8 @@ impl App {
                 }
 
                 // A kept max on an exploding term celebrates the instant it lands
-                // (a plain pool waits for the batched chord in `record_roll`, so
-                // its non-exploding crits stay one flare — this is what makes an
-                // explosion cascade feel live). Gated on the term, not on whether
+                // (a plain pool waits for the batched chord in `record_roll`) —
+                // what makes a cascade feel live. Gated on the term, not on whether
                 // it actually spawned, so a six that hit the cap still flares.
                 // (`settled` was just set above, so `is_crit` folds in the max-face
                 // check.)
@@ -1093,13 +1086,12 @@ impl App {
     }
 
     /// Fire the crit ceremony for a batch of maxed dice that came to rest
-    /// together: punch the camera, spray gold from each, ring once. Dice that
-    /// settle in the same step are one chord (a fistful of sixes, not a bell
-    /// choir); an exploding cascade lands its sixes in separate steps, so each
-    /// wave earns its own ring. The flash is set *before* projecting so the
-    /// bursts ride the same punched-in camera the next frames render through
-    /// (see [`Self::world_to_cell`]). Each die is marked `celebrated` so the
-    /// end-of-roll pass in [`Self::record_roll`] can never burst it twice.
+    /// together: punch the camera, spray gold from each, ring once. Dice settling
+    /// in the same step are one chord (a fistful of sixes, not a bell choir); an
+    /// exploding cascade lands its sixes in separate steps, so each wave earns its
+    /// own ring. The flash is set *before* projecting so the bursts ride the same
+    /// punched-in camera the next frames render through (see [`Self::world_to_cell`]).
+    /// Each die is marked `celebrated` so [`Self::record_roll`] can't burst it twice.
     fn celebrate_crits(&mut self, dice: &[usize]) {
         if dice.is_empty() {
             return;
@@ -1133,10 +1125,9 @@ impl App {
         }
 
         // Every maxed die bursts gold and every 1 slumps. A plain pool's crits
-        // all flare together here — a fistful of sixes is one chord, not a bell
-        // choir — while an exploding-term crit already rang as it landed
-        // (`celebrate_crits`), so only the un-celebrated ones remain: the whole
-        // of a plain pool, none of a `d6!` cascade. The fumble thud plays once.
+        // all flare together here (one chord, not a bell choir); an exploding-term
+        // crit already rang as it landed (`celebrate_crits`), so only the
+        // un-celebrated ones remain. The fumble thud plays once.
         let crit_idx: Vec<usize> = (0..self.dice.len())
             .filter(|&i| self.dice[i].is_crit() && !self.dice[i].celebrated)
             .collect();
