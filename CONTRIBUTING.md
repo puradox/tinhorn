@@ -62,8 +62,8 @@ a `ScheduleRunnerPlugin` at ~60 fps — the core `App` is the single source of
 truth, and the Bevy entities are a pure view of it.
 
 - **`parse`** (core) — a hand-written parser that turns notation into a `Roll`: a
-  list of **dice terms** (each a count, a side count, and its modifiers — keep/drop,
-  explode, multiply) plus an integer flat modifier and the optional `Stake` (a
+  list of **dice terms** (each a count, a side count, and its modifiers — reroll,
+  keep/drop, explode, multiply) plus an integer flat modifier and the optional `Stake` (a
   target with a `Goal`: meet-or-beat `> N` / `vs N`, or roll-under `< N`). Pure
   and unit-tested.
 - **`app`** (core) — the state, the roll evaluator, and the glue that drives the
@@ -189,8 +189,8 @@ Tests guard most of these, but know them before you lean on a wall:
   goes through `scene::convert` — a stray direct assignment is a compile error,
   not a silent unit bug.
 - **Roll semantics live in two places that must agree**: the animated path in
-  `app` and the instant `evaluate()`. Editing roll rules (explode → keep/drop
-  → multiply order) means editing both together. Cross-cutting rules
+  `app` and the instant `evaluate()`. Editing roll rules (reroll → explode →
+  keep/drop → multiply order) means editing both together. Cross-cutting rules
   (verdict, crit/fumble) live exactly once, in the shared helpers — never
   restate those comparisons inline.
 - **No plain-letter hotkeys.** Bare letters must stay typeable — `kh`/`dh`

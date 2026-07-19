@@ -12,6 +12,8 @@
 //! Per-term modifiers (written immediately after the `dN`, in any order):
 //!   "2d20kh1"    -> keep the highest 1 (advantage); "kl1" keeps the lowest
 //!   "4d6dl1"     -> drop the lowest 1 (classic ability score); "dh1" drops highest
+//!   "4d6r1"      -> reroll any 1 (repeats until it clears); a bare number means '='
+//!   "d20r<3"     -> reroll anything under 3; "ro" rerolls once; chain them, e.g. "6d6r2r4r6"
 //!   "3d6!"       -> exploding: a max face rolls another die (repeats, capped)
 //!   "d10!>8"     -> exploding on >8 instead of just the max face
 //!   "4d6*2"      -> multiply this term's kept sum by 2
@@ -28,6 +30,7 @@
 //!   term  := [count] ('d'|'D') sides termmod*   |   integer
 //!   sides := digits | '%'                       ('%' means 100)
 //!   termmod := ('kh'|'kl'|'dh'|'dl') [n]
+//!            |  ('r'|'ro') [ '>'|'<'|'=' ] n
 //!            |  '!' [ ('>'|'<'|'=') n ]
 //!            |  '*' n
 //!
@@ -52,6 +55,17 @@ impl Compare {
     }
 }
 
+/// A reroll rule: a die whose face matches `cmp` is thrown out and redrawn. A
+/// plain `r` keeps redrawing until the face clears every reroll rule on the term
+/// (capped so it always terminates); the `ro` form (`once`) redraws at most
+/// once. The compare point reuses [`Compare`], so `r1` is `r=1` (bare number
+/// means equality), `r<3` rerolls anything under 3, and `r>4` anything over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reroll {
+    pub cmp: Compare,
+    pub once: bool,
+}
+
 /// One modifier attached to a dice term, applied to that term's pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermMod {
@@ -59,6 +73,9 @@ pub enum TermMod {
     KeepLow(u32),
     DropHigh(u32),
     DropLow(u32),
+    /// Reroll matching dice before anything else touches the pool. Chained rules
+    /// (`r2r4r6`) each become one of these, in written order.
+    Reroll(Reroll),
     /// `None` means "explode on the max face" — resolved against `sides` at roll time.
     Explode(Option<Compare>),
     /// Multiply this term's kept sum by the constant.
@@ -320,6 +337,27 @@ fn parse_term_mods(
             continue;
         }
 
+        // Reroll: `r<CP>` redraws a matching die until it clears; `ro<CP>`
+        // redraws once. `<CP>` is a bare number (equality) or `<`/`>`/`=` and a
+        // number. Chain them (`r2r4r6`) to reroll several faces. Matched before
+        // the outer loop could read the bare `r` as an unexpected character.
+        if matches!(chars.get(*i), Some('r' | 'R')) {
+            let once = matches!(chars.get(*i + 1), Some('o' | 'O'));
+            *i += if once { 2 } else { 1 };
+            let cmp = parse_reroll_compare(chars, i)?;
+            // A recurring reroll whose compare matches *every* face would never
+            // clear; the roll-time cap stops the loop, but reject the
+            // statically-degenerate case with a clear message (as the `d1!`
+            // guard does for exploding). A `ro` always terminates, so it's fine.
+            if !once && (1..=sides).all(|f| cmp.matches(f)) {
+                return Err(format!(
+                    "that reroll never clears — every face of a d{sides} matches (use ro… to reroll once)"
+                ));
+            }
+            mods.push(TermMod::Reroll(Reroll { cmp, once }));
+            continue;
+        }
+
         // Exploding: '!' optionally followed by a comparison.
         if *i < n && chars[*i] == '!' {
             *i += 1;
@@ -380,6 +418,30 @@ fn parse_optional_count(chars: &[char], i: &mut usize) -> Option<u32> {
         return None;
     }
     chars[start..*i].iter().collect::<String>().parse().ok()
+}
+
+/// Parse a reroll compare point: an optional `>`/`<`/`=` then a *required*
+/// number, defaulting to `=` (equality) when the operator is omitted — so `r1`
+/// rerolls 1s, `r<3` rerolls anything under 3, and `r>4` anything over.
+fn parse_reroll_compare(chars: &[char], i: &mut usize) -> Result<Compare, String> {
+    let op: fn(u32) -> Compare = match chars.get(*i) {
+        Some('>') => {
+            *i += 1;
+            Compare::Gt
+        }
+        Some('<') => {
+            *i += 1;
+            Compare::Lt
+        }
+        Some('=') => {
+            *i += 1;
+            Compare::Eq
+        }
+        _ => Compare::Eq,
+    };
+    let n = parse_optional_count(chars, i)
+        .ok_or_else(|| "expected a reroll target (e.g. r1 or r<3)".to_string())?;
+    Ok(op(n))
 }
 
 /// Parse an optional explode comparison: `>N`, `<N`, `=N`, or nothing.
@@ -548,6 +610,76 @@ mod tests {
         let r = parse("3d6*2+d8").unwrap();
         assert_eq!(term(&r, 0).mods, vec![TermMod::Mul(2)]);
         assert!(term(&r, 1).mods.is_empty());
+    }
+
+    #[test]
+    fn reroll() {
+        // A bare number is equality: reroll 1s.
+        let r = parse("4d6r1").unwrap();
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![TermMod::Reroll(Reroll {
+                cmp: Compare::Eq(1),
+                once: false
+            })]
+        );
+
+        // `ro` is reroll-once; comparisons work with or without an operator.
+        let r = parse("d20ro<3").unwrap();
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![TermMod::Reroll(Reroll {
+                cmp: Compare::Lt(3),
+                once: true
+            })]
+        );
+
+        // Chained compare points each become their own rule, in written order.
+        let r = parse("6d6r2r4r6").unwrap();
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![
+                TermMod::Reroll(Reroll {
+                    cmp: Compare::Eq(2),
+                    once: false
+                }),
+                TermMod::Reroll(Reroll {
+                    cmp: Compare::Eq(4),
+                    once: false
+                }),
+                TermMod::Reroll(Reroll {
+                    cmp: Compare::Eq(6),
+                    once: false
+                }),
+            ]
+        );
+
+        // Reroll composes with the other modifiers in one term.
+        let r = parse("4d6r1kh3").unwrap();
+        assert_eq!(
+            term(&r, 0).mods,
+            vec![
+                TermMod::Reroll(Reroll {
+                    cmp: Compare::Eq(1),
+                    once: false
+                }),
+                TermMod::KeepHigh(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn reroll_errors() {
+        assert!(parse("d6r").is_err(), "reroll needs a target");
+        assert!(parse("d6ro").is_err(), "reroll-once still needs a target");
+        assert!(parse("d6r<").is_err(), "a comparison needs a number");
+        // A recurring reroll that matches every face would spin forever.
+        assert!(parse("d6r<7").is_err(), "r<7 rerolls every face of a d6");
+        assert!(parse("d6r>0").is_err(), "r>0 rerolls every face");
+        // …but a reroll-*once* of the same shape is fine — it always stops.
+        assert!(parse("d6ro<7").is_ok(), "ro clears after a single redraw");
+        // A comparison that leaves faces alive is fine as a recurring reroll.
+        assert!(parse("d6r<3").is_ok());
     }
 
     #[test]

@@ -14,6 +14,7 @@ use rapier3d::prelude::RigidBodyHandle;
 const GRAVITY: f32 = 60.0; // 2D particle-burst gravity (cells/s²), not the dice
 const MAX_AIRBORNE: f32 = 8.0; // hard cap: a die tumbling this long is frozen in place
 const MAX_EXPLOSIONS: usize = 40; // cap on dice an exploding term can spawn, so the pool can't run away
+const MAX_REROLLS: usize = 100; // per-die cap so a recurring reroll always terminates (well past any real use)
 
 // The Throw: shake-the-cup tuning. Power rises from 0 the moment the cup is
 // picked up and oscillates forever, so the release timing is the whole game.
@@ -303,6 +304,10 @@ pub struct App {
     /// term. Explosions happen over the course of the animation, so the cap has
     /// to be enforced across frames rather than in one up-front loop.
     explosions: Vec<usize>,
+    /// Each term's reroll rules, indexed by term, so a die spawned mid-animation
+    /// by an explosion can inherit the same rerolls its base pool used. Empty
+    /// vecs for terms without a reroll modifier.
+    term_rerolls: Vec<Vec<parse::Reroll>>,
     rng: StdRng,
     /// The 3D rigid-body world. Physics decides only where dice land, never the
     /// values. Stepped on a fixed timestep so insta and animated rolls settle
@@ -363,6 +368,7 @@ impl App {
             muted: false,
             stats_cache: None,
             explosions: Vec::new(),
+            term_rerolls: Vec::new(),
             rng,
             physics: Physics::new(),
             phys_accum: 0.0,
@@ -476,6 +482,7 @@ impl App {
                 self.modifier = modifier;
                 self.stake = stake;
                 self.explosions = vec![0; terms.len()];
+                self.term_rerolls = terms.iter().map(rerolls_of).collect();
                 let mut dice: Vec<Die> = Vec::new();
                 for (ti, term) in terms.iter().enumerate() {
                     self.roll_term(ti, term, &mut dice);
@@ -535,11 +542,13 @@ impl App {
         let start = out.len();
         let base_color = start;
         let explode = explode_condition(term);
+        let rerolls = rerolls_of(term);
 
-        // Base pool, each tagged with the term's explode condition.
+        // Base pool, each tagged with the term's explode condition. Reroll is
+        // applied inside `new_die` as the value is drawn, before anything else.
         for _ in 0..term.count {
             let color = base_color + (out.len() - start);
-            out.push(self.new_die(term.sides, term_idx, color, explode));
+            out.push(self.new_die(term.sides, term_idx, color, explode, &rerolls));
         }
 
         // Keep/drop flags discarded dice out of the total. It runs on the base
@@ -558,14 +567,18 @@ impl App {
     /// Build one freshly-rolled die (value decided up front; the animation just
     /// reveals it). `kept`/`mult` default to "counts at face value"; `explode`
     /// is the term's condition so the die can spawn a sibling when it settles.
+    /// `rerolls` are applied as the landed value is drawn — the discarded faces
+    /// are thrown away unseen (the arena only ever shows the survivor).
     fn new_die(
         &mut self,
         sides: u32,
         term_idx: usize,
         color_idx: usize,
         explode: Option<parse::Compare>,
+        rerolls: &[parse::Reroll],
     ) -> Die {
-        let final_value = self.rng.gen_range(1..=sides);
+        let mut discarded = Vec::new();
+        let final_value = draw_with_reroll(sides, rerolls, &mut self.rng, &mut discarded);
         Die {
             sides,
             final_value,
@@ -1012,9 +1025,12 @@ impl App {
         }
 
         // Drop the explosion dice from the top, exactly like a fresh throw.
+        // They inherit their term's reroll rules so a spawned die obeys the same
+        // `r`/`ro` as its pool.
         for (sides, term_idx, mult, cmp) in to_explode {
             let color = self.dice.len();
-            let mut die = self.new_die(sides, term_idx, color, Some(cmp));
+            let rerolls = self.term_rerolls[term_idx].clone();
+            let mut die = self.new_die(sides, term_idx, color, Some(cmp), &rerolls);
             die.mult = mult;
             let x = self.rng.gen_range(-physics::HX * 0.6..=physics::HX * 0.6);
             let z = self.rng.gen_range(-physics::HZ * 0.5..=physics::HZ * 0.5);
@@ -1359,18 +1375,24 @@ fn sample_total(roll: &Roll, rng: &mut StdRng) -> i32 {
     for term in &roll.terms {
         let explode = explode_condition(term);
         let mult = term_multiplier(term);
+        let rerolls = rerolls_of(term);
+        // The sampler only needs totals, so discarded faces are drawn into one
+        // reused scratch buffer and thrown away.
+        let mut scratch = Vec::new();
+        let mut draw = |rng: &mut StdRng| {
+            scratch.clear();
+            draw_with_reroll(term.sides, &rerolls, rng, &mut scratch)
+        };
 
         // Base pool: (value, kept). Explosions append more dice, always kept.
-        let mut pool: Vec<(u32, bool)> = (0..term.count)
-            .map(|_| (rng.gen_range(1..=term.sides), true))
-            .collect();
+        let mut pool: Vec<(u32, bool)> = (0..term.count).map(|_| (draw(rng), true)).collect();
 
         if let Some(cmp) = explode {
             let mut spawned = 0usize;
             let mut i = 0;
             while i < pool.len() {
                 if cmp.matches(pool[i].0) && spawned < MAX_EXPLOSIONS {
-                    pool.push((rng.gen_range(1..=term.sides), true));
+                    pool.push((draw(rng), true));
                     spawned += 1;
                 }
                 i += 1;
@@ -1402,7 +1424,7 @@ fn sample_total(roll: &Roll, rng: &mut StdRng) -> i32 {
 }
 
 /// One rolled die in a headless evaluation.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct OutcomeDie {
     pub value: u32,
     /// Whether this die counts toward the total (false ⇒ dropped by keep/drop).
@@ -1414,6 +1436,11 @@ pub struct OutcomeDie {
     pub crit: bool,
     /// A kept die on a 1 ([`fumble_face`]).
     pub fumble: bool,
+    /// Faces rolled and thrown out by a reroll (`r`/`ro`) before this die's
+    /// surviving `value`, in the order rolled. Empty — and omitted from JSON —
+    /// when the die was never rerolled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rerolled: Vec<u32>,
 }
 
 /// The result of evaluating one dice term headlessly: its dice and subtotal.
@@ -1470,31 +1497,33 @@ pub fn evaluate(expression: &str, roll: &Roll, rng: &mut StdRng) -> Outcome {
         let explode = explode_condition(term);
         let mult = term_multiplier(term);
         let base = term.count as usize;
+        let rerolls = rerolls_of(term);
+
+        // One base-pool die: draw its value (rerolling first), flagging none of
+        // the roll-outcome bits yet — keep/drop and crit are judged below.
+        let roll_die = |rng: &mut StdRng, exploded: bool| {
+            let mut discarded = Vec::new();
+            let value = draw_with_reroll(term.sides, &rerolls, rng, &mut discarded);
+            OutcomeDie {
+                value,
+                kept: true,
+                exploded,
+                crit: false,
+                fumble: false,
+                rerolled: discarded,
+            }
+        };
 
         // Base pool, then explosions appended (always kept). Track which dice
         // were spawned by explosions so the output can flag them.
-        let mut dice: Vec<OutcomeDie> = (0..base)
-            .map(|_| OutcomeDie {
-                value: rng.gen_range(1..=term.sides),
-                kept: true,
-                exploded: false,
-                crit: false,
-                fumble: false,
-            })
-            .collect();
+        let mut dice: Vec<OutcomeDie> = (0..base).map(|_| roll_die(rng, false)).collect();
 
         if let Some(cmp) = explode {
             let mut spawned = 0usize;
             let mut i = 0;
             while i < dice.len() {
                 if cmp.matches(dice[i].value) && spawned < MAX_EXPLOSIONS {
-                    dice.push(OutcomeDie {
-                        value: rng.gen_range(1..=term.sides),
-                        kept: true,
-                        exploded: true,
-                        crit: false,
-                        fumble: false,
-                    });
+                    dice.push(roll_die(rng, true));
                     spawned += 1;
                 }
                 i += 1;
@@ -1583,6 +1612,23 @@ fn term_notation(term: &DiceTerm) -> String {
             TermMod::DropLow(n) => {
                 let _ = write!(s, "dl{n}");
             }
+            TermMod::Reroll(r) => {
+                s.push('r');
+                if r.once {
+                    s.push('o');
+                }
+                match r.cmp {
+                    parse::Compare::Eq(n) => {
+                        let _ = write!(s, "{n}");
+                    }
+                    parse::Compare::Gt(n) => {
+                        let _ = write!(s, ">{n}");
+                    }
+                    parse::Compare::Lt(n) => {
+                        let _ = write!(s, "<{n}");
+                    }
+                }
+            }
             TermMod::Explode(None) => s.push('!'),
             TermMod::Explode(Some(parse::Compare::Eq(n))) => {
                 let _ = write!(s, "!={n}");
@@ -1633,6 +1679,51 @@ fn term_multiplier(term: &DiceTerm) -> i32 {
             _ => None,
         })
         .product()
+}
+
+/// The reroll rules on a term, in written order (`r2r4r6` → three rules). Empty
+/// when the term has no reroll modifier — the common case, so callers can skip
+/// the reroll machinery entirely.
+fn rerolls_of(term: &DiceTerm) -> Vec<parse::Reroll> {
+    term.mods
+        .iter()
+        .filter_map(|m| match m {
+            TermMod::Reroll(r) => Some(*r),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Draw one face of a `sides`-sided die, applying the term's reroll rules: a
+/// face matching any rule is thrown out and redrawn — repeatedly for a plain
+/// `r` (until it clears every rule, capped by [`MAX_REROLLS`] so it always
+/// terminates), or exactly once for `ro`. Discarded faces are pushed onto
+/// `discarded` in the order rolled, so the breakdown can show what was thrown
+/// away. Shared by the animated path ([`App::new_die`]) and the headless
+/// [`evaluate`]/[`sample_total`] so the reroll rule can't drift between them.
+pub fn draw_with_reroll(
+    sides: u32,
+    rerolls: &[parse::Reroll],
+    rng: &mut StdRng,
+    discarded: &mut Vec<u32>,
+) -> u32 {
+    let mut v = rng.gen_range(1..=sides);
+    if rerolls.is_empty() {
+        return v;
+    }
+    // A single `ro` allows one redraw; any recurring `r` reopens the loop.
+    let cap = if rerolls.iter().any(|r| !r.once) {
+        MAX_REROLLS
+    } else {
+        1
+    };
+    let mut n = 0;
+    while n < cap && rerolls.iter().any(|r| r.cmp.matches(v)) {
+        discarded.push(v);
+        v = rng.gen_range(1..=sides);
+        n += 1;
+    }
+    v
 }
 
 /// Flag dice out of a term's pool per its keep/drop modifiers. Operates on the
@@ -1711,6 +1802,7 @@ mod tests {
             muted: false,
             stats_cache: None,
             explosions: Vec::new(),
+            term_rerolls: Vec::new(),
             history: Vec::new(),
             pane: Pane::None,
             mode: RollMode::Shake,
@@ -1759,6 +1851,65 @@ mod tests {
         let a: Vec<u32> = animated.dice.iter().map(|d| d.final_value).collect();
         let b: Vec<u32> = insta.dice.iter().map(|d| d.final_value).collect();
         assert_eq!(a, b, "insta must roll exactly the animation's dice");
+    }
+
+    #[test]
+    fn reroll_evaluate_clears_the_matched_faces() {
+        // A recurring `r1` on a big pool: no surviving die — base *or*
+        // exploded — is ever left showing a 1, and every discarded face was
+        // in fact a 1 (the compare it was rerolled for).
+        for seed in 0..40 {
+            let roll = parse::parse("12d6r1").unwrap();
+            let mut rng = StdRng::seed_from_u64(seed);
+            let o = evaluate("12d6r1", &roll, &mut rng);
+            for d in &o.terms[0].dice {
+                assert_ne!(d.value, 1, "seed {seed}: an r1 die kept a 1");
+                assert!(
+                    d.rerolled.iter().all(|&v| v == 1),
+                    "seed {seed}: only 1s should have been rerolled, got {:?}",
+                    d.rerolled
+                );
+            }
+        }
+
+        // Chained compare points reroll every listed face.
+        let roll = parse::parse("20d6r2r4r6").unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let o = evaluate("20d6r2r4r6", &roll, &mut rng);
+        for d in &o.terms[0].dice {
+            assert!(
+                !matches!(d.value, 2 | 4 | 6),
+                "a chained reroll kept a matched face: {}",
+                d.value
+            );
+        }
+    }
+
+    #[test]
+    fn reroll_once_redraws_at_most_once() {
+        // `ro` gives each die a single redraw, so it can still land on a
+        // matched face — but never discards more than one.
+        let roll = parse::parse("20d6ro1").unwrap();
+        let mut rng = StdRng::seed_from_u64(3);
+        let o = evaluate("20d6ro1", &roll, &mut rng);
+        for d in &o.terms[0].dice {
+            assert!(d.rerolled.len() <= 1, "ro rerolled twice: {:?}", d.rerolled);
+        }
+    }
+
+    #[test]
+    fn animated_reroll_follows_the_same_rule_as_evaluate() {
+        // The bouncing path decides values up front through the same
+        // `draw_with_reroll`, so an insta roll of `r1` also never keeps a 1 —
+        // in the base pool or in an explosion spawn.
+        let mut app = seeded("", 11);
+        app.input = "10d6r1!".to_string();
+        app.insta_roll();
+        assert!(app.all_settled());
+        assert!(
+            app.dice.iter().all(|d| d.final_value != 1),
+            "an animated r1 die landed on a 1"
+        );
     }
 
     #[test]

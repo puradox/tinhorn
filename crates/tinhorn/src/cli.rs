@@ -123,7 +123,13 @@ pub fn format_verbose(o: &Outcome) -> String {
             .dice
             .iter()
             .map(|d| {
-                let mut f = d.value.to_string();
+                // Faces thrown out by a reroll lead the die, each tagged `r`:
+                // `1r4` rolled a 1, rerolled, and kept the 4.
+                let mut f = String::new();
+                for prev in &d.rerolled {
+                    let _ = write!(f, "{prev}r");
+                }
+                let _ = write!(f, "{}", d.value);
                 if d.exploded {
                     f.push('!'); // spawned by an explosion
                 }
@@ -267,6 +273,48 @@ mod tests {
             }
         }
         panic!("no seed dropped a 20 under disadvantage");
+    }
+
+    #[test]
+    fn reroll_shows_discarded_faces_in_verbose_and_json() {
+        // Find a seed whose 12d6r1 actually rerolled at least one die, then
+        // check the discard shows up in both surfaces.
+        for seed in 0..80 {
+            let o = outcome("12d6r1", seed);
+            let Some(die) = o.terms[0].dice.iter().find(|d| !d.rerolled.is_empty()) else {
+                continue;
+            };
+            // Every discarded face was a 1, and the surviving value is not.
+            assert!(die.rerolled.iter().all(|&v| v == 1));
+            assert_ne!(die.value, 1);
+
+            // JSON carries the discard list; verbose tags it with `r`.
+            let v: serde_json::Value = serde_json::to_value(&o).unwrap();
+            let dice = v["terms"][0]["dice"].as_array().unwrap();
+            assert!(
+                dice.iter().any(|d| d.get("rerolled").is_some()),
+                "JSON did not carry the rerolled faces"
+            );
+            let text = format_verbose(&o);
+            assert!(
+                text.contains("1r"),
+                "verbose did not tag a rerolled face:\n{text}"
+            );
+            return;
+        }
+        panic!("no seed rerolled a die");
+    }
+
+    #[test]
+    fn unrerolled_dice_omit_the_rerolled_key() {
+        // A die that never rerolled carries no `rerolled` field in JSON.
+        let v: serde_json::Value = serde_json::to_value(outcome("4d6", 1)).unwrap();
+        for d in v["terms"][0]["dice"].as_array().unwrap() {
+            assert!(
+                d.get("rerolled").is_none(),
+                "empty reroll list leaked to JSON"
+            );
+        }
     }
 
     #[test]

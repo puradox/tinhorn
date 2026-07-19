@@ -110,9 +110,9 @@ the call with `--graphics kitty` or `--graphics blocks`.
 
 A roll is a sequence of **dice terms** and optional **flat modifiers**,
 separated by `+`, `,`, whitespace, or simply written next to each other. A term
-can carry **modifiers** (keep/drop, explode, multiply) written right after its
-`dN`; these apply in pool order — **explode → keep/drop → multiply** — and
-stack. Add **stakes** to check the total against a target.
+can carry **modifiers** (reroll, keep/drop, explode, multiply) written right
+after its `dN`; these apply in pool order — **reroll → explode → keep/drop →
+multiply** — and stack. Add **stakes** to check the total against a target.
 
 ### The basics
 
@@ -139,6 +139,21 @@ wedge the renderer.
 `kh`/`kl`/`dh`/`dl` default to 1 (`2d20kh` = `2d20kh1`) and clamp to the pool
 size. Dropped dice are still thrown and bounce around — you watch advantage
 discard the lower d20 — but they're rendered dimmed and left out of the total.
+
+### Reroll
+
+| Input      | Meaning                                                 |
+| ---------- | ------------------------------------------------------- |
+| `4d6r1`    | reroll any 1, repeating until it clears                 |
+| `d20ro1`   | `ro` rerolls **once** — one redraw, then live with it   |
+| `d20r<3`   | a compare point works too (`<`, `>`, `=`); bare `N` = `=N` |
+| `6d6r2r4r6`| chain compare points to reroll several faces            |
+
+A reroll throws the old face out before anything else touches the pool, so a
+die you'd have dropped or exploded is settled first. The die lands on its
+kept face in the arena; a `-v` breakdown shows what was tossed (`1r4` = rolled
+a 1, rerolled, kept the 4). A plain `r` whose compare would match *every* face
+is rejected (it could never clear); use `ro` if you really mean one redraw.
 
 ### Stakes
 
