@@ -5,7 +5,7 @@ members = ["crates/tinhorn-core", "crates/tinhorn"]
 # Shared dependency pins, referenced by each crate with `{ workspace = true }`.
 # One place to bump a version, and the two crates can never drift apart.
 [workspace.dependencies]
-tinhorn-core = { path = "crates/tinhorn-core", version = "0.1.4" }
+tinhorn-core = { path = "crates/tinhorn-core", version = "0.1.5" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/puradox/tinhorn/compare/tinhorn-core-v0.1.4...tinhorn-core-v0.1.5) - 2026-07-19
+
+### Other
+
+- release ([#20](https://github.com/puradox/tinhorn/pull/20))
+
 ## [0.1.4](https://github.com/puradox/tinhorn/releases/tag/tinhorn-core-v0.1.4) - 2026-07-17
 
 ### Added
