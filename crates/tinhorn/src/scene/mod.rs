@@ -152,8 +152,14 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
         })
         .add_systems(PreUpdate, input_system)
         .add_systems(Update, (draw_ui, drain_sounds).chain().after(choreograph))
-        .add_systems(PostUpdate, kitty_cleanup)
-        .run();
+        .add_systems(PostUpdate, kitty_cleanup);
+    // In kitty mode, chain a teardown onto `term`'s restore panic hook so a crash
+    // mid-roll cleans up the arena image + scratch file too (the graceful path is
+    // `kitty_cleanup`). PostStartup, so `term`'s Startup hook is already installed.
+    if let GraphicsMode::Kitty { .. } = mode {
+        app.add_systems(PostStartup, install_kitty_panic_hook);
+    }
+    app.run();
 }
 
 /// The validation path: render until the roll settles, dump a full-frame PNG.
@@ -228,16 +234,20 @@ struct StageMs {
     wr: f32,
 }
 
+/// The overlay's exponential moving average: 0.9/0.1 smoothing, seeded on the
+/// first sample so a stat isn't dragged up from zero. Shared by the fps readout
+/// and every per-stage transmit time.
+fn ema(old: f32, new: f32) -> f32 {
+    if old > 0.0 {
+        old * 0.9 + new * 0.1
+    } else {
+        new
+    }
+}
+
 impl FrameStats {
     /// Fold this frame's stage times into the EMAs.
     fn record(&mut self, prep: f32, zip: f32, b64: f32, wr: f32) {
-        let ema = |old: f32, new: f32| {
-            if old > 0.0 {
-                old * 0.9 + new * 0.1
-            } else {
-                new
-            }
-        };
         self.stage.prep = ema(self.stage.prep, prep);
         self.stage.zip = ema(self.stage.zip, zip);
         self.stage.b64 = ema(self.stage.b64, b64);
@@ -581,12 +591,7 @@ fn draw_ui(
     // the number falls, which is the whole point.
     let dt = time.delta_secs();
     if dt > 0.0 {
-        let inst = 1.0 / dt;
-        stats.fps = if stats.fps > 0.0 {
-            stats.fps * 0.9 + inst * 0.1
-        } else {
-            inst
-        };
+        stats.fps = ema(stats.fps, 1.0 / dt);
     }
     // The overlay shows the *previous* frame's stage times (emit runs after this
     // draw); one frame stale is invisible against the EMA.
@@ -618,6 +623,23 @@ fn draw_ui(
         emit_kitty(&panel, &arena, pane_open, &mut kitty, &mut stats);
     }
     Ok(())
+}
+
+/// The scratch sibling a `t=f` frame is staged in before being renamed over the
+/// terminal-referenced path. Same directory ⇒ same filesystem ⇒ the rename is
+/// atomic. Also removed on cleanup, in case a write died between stage and rename.
+fn scratch_tmp(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// Write `data` to `path` atomically: stage it in a sibling `.tmp`, then rename that
+/// over `path`. The terminal, reading `path` for a `t=f` transmit, then always sees
+/// one whole frame (the old inode or the new) — never the truncate-in-progress a
+/// plain `std::fs::write` to the reused path would expose to a concurrent read.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = scratch_tmp(path);
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Place — or, while a pane covers the arena, remove — the kitty image for this
@@ -664,7 +686,7 @@ fn emit_kitty(
     // file write and `b64` the (tiny) path-APC build.
     let (zip, b64, apc) = if let Some(path) = &state.file {
         let t1 = Instant::now();
-        let wrote = std::fs::write(path, &rgb).is_ok();
+        let wrote = write_atomic(path, &rgb).is_ok();
         let zip = ms(t1);
         let t2 = Instant::now();
         let apc = if wrote {
@@ -742,23 +764,49 @@ fn draw_fps_overlay(
     );
 }
 
+/// Tear down the kitty image and its scratch files: delete our `i=1` image from the
+/// terminal (so it isn't stranded in the scrollback) and remove the `t=f` scratch
+/// frame plus its `.tmp` sibling. Shared by the graceful `kitty_cleanup` and the
+/// panic hook, so an abnormal exit leaves the terminal as clean as a normal one.
+/// Targeted to `i=1`, so it can't disturb anything else on screen; idempotent, so
+/// running it twice (a panic after a partial cleanup) is harmless.
+fn kitty_teardown(file: &Option<PathBuf>) {
+    let _ = graphics::emit_raw(&graphics::delete_all_apc());
+    if let Some(path) = file {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(scratch_tmp(path));
+    }
+}
+
 /// On quit, delete our kitty image so nothing is left behind in the scrollback.
 /// Runs in PostUpdate — after `input_system` writes `AppExit` in PreUpdate, but
 /// before `CleanupPlugin` drops `RatatuiContext` in `Last` and leaves the alt
 /// screen — so the escape lands while the session is still live. A no-op outside
-/// kitty mode, and targeted to `i=1` so it can't disturb anything else on screen.
+/// kitty mode. The panic path is covered separately by [`install_kitty_panic_hook`].
 fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>, state: Res<KittyState>) {
     if exits.is_empty() {
         return;
     }
     exits.clear();
     if let GraphicsMode::Kitty { .. } = gfx.0 {
-        let _ = graphics::emit_raw(&graphics::delete_all_apc());
-        // Remove the file-transfer scratch frame, if we used one.
-        if let Some(path) = &state.file {
-            let _ = std::fs::remove_file(path);
-        }
+        kitty_teardown(&state.file);
     }
+}
+
+/// Chain the kitty teardown onto the terminal-restore panic hook the vendored `term`
+/// installs in `Startup`. Runs in `PostStartup` (once that hook is in place, so
+/// `take_hook` captures it) and only in kitty mode: on a panic we delete the image
+/// and remove the scratch file *before* deferring to `term`'s restore — so a crash
+/// mid-roll doesn't strand the arena image in the scrollback the way the graceful
+/// `kitty_cleanup` avoids. Hooks fire even under `panic = "abort"`, where a Drop
+/// guard would not.
+fn install_kitty_panic_hook(state: Res<KittyState>) {
+    let file = state.file.clone();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        kitty_teardown(&file);
+        prev(info);
+    }));
 }
 
 /// Drain the sim's queued sounds into the lazily-spawned player (capping the
@@ -1011,5 +1059,30 @@ mod tests {
             !top_row(&tiny).contains("fps"),
             "should skip when too narrow"
         );
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_scratch() {
+        // The `t=f` frame is staged in a `.tmp` and renamed over the reused path, so a
+        // concurrent terminal read never catches a truncated file. Assert the whole
+        // frame lands, a rewrite fully replaces it, and no `.tmp` is left behind.
+        let path = std::env::temp_dir().join(format!("tinhorn-test-{}.rgb", std::process::id()));
+        let tmp = scratch_tmp(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+
+        write_atomic(&path, &[1, 2, 3]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [1, 2, 3]);
+        assert!(
+            !tmp.exists(),
+            "the .tmp sibling is renamed away, not left behind"
+        );
+
+        // A rewrite (the every-frame case) atomically swaps in the whole new frame.
+        write_atomic(&path, &[9, 9]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [9, 9]);
+        assert!(!tmp.exists());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

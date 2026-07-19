@@ -524,8 +524,8 @@ pub(crate) fn number_scale(die_w: f32, die_h: f32, n_digits: i32) -> i32 {
 /// cell painter and the pixel rasteriser can place from it); `scale` is the shared
 /// [`number_scale`] size (0 = the crisp single-cell overlay, ≥1 = the block glyph);
 /// `ink`/`mods` come from [`face_ink`] (the airborne dim decoy, the settled burn);
-/// `outline` is the die-tinted glyph surround; `plate` the dark inset the scale-0
-/// overlay sits on.
+/// `outline` is the die-tinted glyph surround. The scale-0 overlay's dark inset is
+/// the shared [`NUMBER_PLATE`] constant, applied at paint time by both paths.
 pub(crate) struct NumberBurn {
     pub(crate) label: String,
     pub(crate) center: (f32, f32),
@@ -533,7 +533,6 @@ pub(crate) struct NumberBurn {
     pub(crate) ink: Color,
     pub(crate) mods: Modifier,
     pub(crate) outline: Color,
-    pub(crate) plate: Color,
 }
 
 /// Resolve one die's number for the frame's shared `scale` (computed once for the
@@ -591,7 +590,6 @@ pub(crate) fn plan_die_number(
         ink,
         mods,
         outline,
-        plate: NUMBER_PLATE,
     })
 }
 
@@ -604,7 +602,7 @@ fn paint_die_number(frame: &mut Frame, inner: Rect, burn: &NumberBurn) {
     if burn.scale < 1 {
         let label = &burn.label;
         let style = Style::default()
-            .bg(burn.plate)
+            .bg(NUMBER_PLATE)
             .fg(burn.ink)
             .add_modifier(burn.mods);
         let x = (inner.x as f32 + cx - label.len() as f32 / 2.0).round() as i32;
@@ -845,11 +843,16 @@ pub(crate) fn burn_numbers(
                     glyph_w + 2.0 * sub_w,
                     glyph_h + 2.0 * sub_h,
                 ),
-                ink_rgb(burn.plate),
+                ink_rgb(NUMBER_PLATE),
             );
         }
-        for s in 0..h_sub {
-            for c in 0..gw {
+        // Iterate one sub-pixel *beyond* the glyph box on every side, exactly as the
+        // half-block path does: the outline dilates one sub-pixel outward from the
+        // strokes, so its top/left/right/bottom ring lives outside the box and would
+        // go unburned if the loop stopped at the edge — leaving kitty digits without
+        // the dark separation halo the cell path draws (they must never differ).
+        for s in -1..=h_sub {
+            for c in -1..=gw {
                 let color = match raster.px(c, s) {
                     GlyphPx::Ink => ink,
                     GlyphPx::Outline => outline,
@@ -1191,7 +1194,7 @@ fn blit_bevy_arena(
     img_w: u32,
     img_h: u32,
 ) {
-    let stride = (img_w as usize * 4).div_ceil(256) * 256; // wgpu 256-byte row pad
+    let stride = crate::graphics::readback_stride(img_w); // wgpu 256-byte row pad
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
         return;
     }
@@ -1908,7 +1911,6 @@ mod tests {
             ink: Color::White,
             mods: Modifier::BOLD,
             outline: Color::Rgb(10, 20, 30),
-            plate: NUMBER_PLATE,
         };
         burn_numbers(
             &mut rgb,
@@ -1927,6 +1929,21 @@ mod tests {
         assert!(
             has_sentinel,
             "clear sub-pixels must leave the die (sentinel) showing through"
+        );
+        // The outline halo dilates one sub-pixel *beyond* the glyph box (matching the
+        // half-block path). The box top sits at y=10 (center.1·2·sy − glyph_h/2), so an
+        // outline pixel must appear in the rows above it — this fails if the raster loop
+        // stops at the box edge instead of `-1..=`, leaving kitty digits haloless.
+        let outline = ink_rgb(Color::Rgb(10, 20, 30));
+        let top_ring_has_outline = (0..10u32).any(|y| {
+            (0..img_w).any(|x| {
+                let i = ((y * img_w + x) * 3) as usize;
+                rgb[i] == outline.0 && rgb[i + 1] == outline.1 && rgb[i + 2] == outline.2
+            })
+        });
+        assert!(
+            top_ring_has_outline,
+            "the outline halo must burn above the glyph box, as the cell path draws it"
         );
         // A zero-size image (stale/mid-resize) is a no-op, not a panic.
         let mut empty: Vec<u8> = Vec::new();

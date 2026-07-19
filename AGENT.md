@@ -182,7 +182,9 @@ and `drain_sounds` plays whatever the physics queued.
     gated by a `KittyState` that deletes/re-places while a pane covers the arena;
     `drain_sounds` feeds `app.take_sounds()` to the lazily-spawned `Foley` (capping
     the per-frame click storm). `kitty_cleanup` (PostUpdate) deletes the image on
-    quit, before `CleanupPlugin` leaves the alt screen.
+    quit, before `CleanupPlugin` leaves the alt screen; a panic instead runs the
+    same teardown (`install_kitty_panic_hook` chains it onto `term`'s restore hook),
+    so a crash mid-roll doesn't strand the image in the scrollback.
   - Rendering: a headless `Camera3d` draws into an offscreen render-target
     `Image`, which is **read back to the CPU each frame via Bevy 0.19's built-in
     `bevy_render::gpu_readback`** (`Readback` + a `ReadbackComplete` observer);

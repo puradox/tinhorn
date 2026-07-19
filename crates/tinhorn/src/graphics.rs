@@ -48,6 +48,27 @@ pub const MAX_IMG_W: u32 = 1600;
 /// bytes (the protocol's documented 4096-byte limit).
 const CHUNK: usize = 4096;
 
+/// The machine's core count, cached: [`pack_rgb`] splits its row-band work across
+/// it every frame, but it can't change during a run, so the `available_parallelism`
+/// syscall runs once rather than on the hot path.
+fn core_count() -> usize {
+    use std::sync::OnceLock;
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
+
+/// The byte stride of one row in a wgpu render readback: `img_w` RGBA pixels
+/// padded up to wgpu's 256-byte row alignment. The single source of the readback
+/// layout contract, shared by the kitty pack ([`pack_rgb`]) and the half-block
+/// blit (`ui::blit_bevy_arena`), which read the same buffer.
+pub(crate) fn readback_stride(img_w: u32) -> usize {
+    (img_w as usize * 4).div_ceil(256) * 256
+}
+
 /// Does this terminal speak the kitty graphics protocol? A hermetic env sniff (no
 /// escape probing in v1 — the flag is the override): kitty and Ghostty set a
 /// telltale `TERM`/`TERM_PROGRAM`, kitty also exports `KITTY_WINDOW_ID`, and
@@ -131,7 +152,7 @@ pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     if img_w == 0 || img_h == 0 {
         return None;
     }
-    let stride = (img_w as usize * 4).div_ceil(256) * 256; // wgpu 256-byte row pad
+    let stride = readback_stride(img_w); // wgpu 256-byte row pad
     if pixels.len() < stride * img_h as usize {
         return None; // short / stale readback
     }
@@ -139,10 +160,7 @@ pub fn pack_rgb(pixels: &[u8], img_w: u32, img_h: u32) -> Option<Vec<u8>> {
     let row_out = img_w as usize * 3;
     let mut out = vec![0u8; img_h as usize * row_out];
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, img_h as usize);
+    let threads = core_count().clamp(1, img_h as usize);
     let band = (img_h as usize).div_ceil(threads);
     std::thread::scope(|s| {
         for (t, chunk) in out.chunks_mut(band * row_out).enumerate() {
@@ -318,7 +336,7 @@ mod tests {
     /// the pixels and sentinel `0xAB` bytes filling the row padding, so a test can
     /// prove `pack_rgb` never reads the pad.
     fn padded_rgba(img_w: u32, img_h: u32) -> Vec<u8> {
-        let stride = (img_w as usize * 4).div_ceil(256) * 256;
+        let stride = readback_stride(img_w);
         let mut buf = vec![0xABu8; stride * img_h as usize]; // pad sentinel everywhere
         for y in 0..img_h as usize {
             for x in 0..img_w as usize {
@@ -335,7 +353,7 @@ mod tests {
     #[test]
     fn pack_rgb_strips_padding_and_alpha() {
         let (w, h) = (70u32, 4u32); // 70*4 = 280 > 256, so the row is padded to 512
-        let stride = (w as usize * 4).div_ceil(256) * 256;
+        let stride = readback_stride(w);
         assert!(stride > w as usize * 4, "test needs a genuinely padded row");
         let rgba = padded_rgba(w, h);
         let rgb = pack_rgb(&rgba, w, h).expect("a full-size buffer packs");
