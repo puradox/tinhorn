@@ -79,8 +79,9 @@ and `drain_sounds` plays whatever the physics queued.
 
 - **`parse`** (core) — hand-written parser: notation → `Roll` (a `Vec<DiceTerm>`
   + flat `i32` modifier + optional `Stake` for staked rolls). Each `DiceTerm` is
-  count, sides, and modifiers (`TermMod`: keep/drop, explode with a `Compare`,
-  multiply). Pure and unit-tested. Sizes are capped (≤ 60 dice, ≤ 1000 sides) so
+  count, sides, and modifiers (`TermMod`: reroll (`r`/`ro`, each a `Reroll` —
+  a `Compare` plus a once flag), keep/drop, explode with a `Compare`, multiply).
+  Pure and unit-tested. Sizes are capped (≤ 60 dice, ≤ 1000 sides) so
   a huge expression can't wedge the renderer; the `vs` target must come last and
   is range-checked into `i32`. A `Stake` bundles that target with a `Goal`
   (`Over` for `>` and its word alias `vs`, `Under` for the roll-under `<`) so a
@@ -116,10 +117,15 @@ and `drain_sounds` plays whatever the physics queued.
     so it always converges).
   - `evaluate(expr, &Roll, &mut StdRng) -> Outcome` resolves a roll *instantly*
     into a full breakdown (`Outcome`/`OutcomeTerm`/`OutcomeDie`, all `serde`). It
-    **mirrors the animation's semantics exactly** — explode → keep/drop on the
-    base pool → per-term multiply → flat modifier. This is the shared contract:
-    the one-shot CLI and the TUI must agree, so changes to roll rules belong here
-    and in the animated path together.
+    **mirrors the animation's semantics exactly** — reroll → explode → keep/drop
+    on the base pool → per-term multiply → flat modifier. This is the shared
+    contract: the one-shot CLI and the TUI must agree, so changes to roll rules
+    belong here and in the animated path together.
+  - Reroll (`r`/`ro`) is decided *up front* like the value it replaces:
+    `draw_with_reroll()` is the single source both paths draw every face
+    through, so a `r1` die simply never lands on a 1 — no arena timeline, unlike
+    exploding. Discarded faces ride along in `OutcomeDie.rerolled` for the `-v`
+    breakdown; the arena only ever shows the survivor.
   - Single-source rule helpers back both paths: `check()` (the `vs` verdict for
     either `Goal` — meet-or-beat or roll-under — returning a direction-aware
     margin, also used by the stats pane's success odds), `Stake::label()` (the
@@ -313,7 +319,7 @@ and `drain_sounds` plays whatever the physics queued.
   the codebase.
 - **Roll semantics live in two places that must stay in lockstep**: the animated
   path in `app` and `evaluate`. A test would fail if they diverge, but keep them
-  together when editing rules (explode/keep-drop/multiply order). Cross-cutting
+  together when editing rules (reroll/explode/keep-drop/multiply order). Cross-cutting
   rules (verdict, crit/fumble) live once in the shared helpers listed above.
 - **The RNG stays untouched**: throw power, verdicts, particles, and sound are
   all downstream of the same seedable RNG; a test asserts the same seed rolls

@@ -1616,13 +1616,14 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, scroll: u16) -> u16 {
         syntax_row("4d6dl1", "drop the lowest 1 (ability scores)"),
         syntax_row("4d6dh1", "drop the highest 1"),
         Line::raw(""),
+        heading("Explode & reroll"),
+        syntax_row("3d6!", "a max face rolls another die"),
+        syntax_row("d10!>8", "explode on any face over 8 (also !=N, !<N)"),
+        syntax_row("4d6r1", "reroll 1s until they clear (ro1 = once)"),
+        Line::raw(""),
         heading("Stakes & multiply"),
         syntax_row("d20 > 15", "beat a target (or 'vs'); < N rolls under"),
         syntax_row("4d6*2", "double this term's sum (modifiers stack)"),
-        Line::raw(""),
-        heading("Exploding"),
-        syntax_row("3d6!", "a max face rolls another die"),
-        syntax_row("d10!>8", "explode on any face over 8 (also !=N, !<N)"),
         Line::raw(""),
         heading("The Throw"),
         syntax_row(
@@ -1631,10 +1632,6 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, scroll: u16) -> u16 {
         ),
         syntax_row("Tab", "cycle Enter's mode: shake → roll → insta"),
         syntax_row("Esc", "put them down. Power never touches the values."),
-        Line::from(Span::styled(
-            "  Separators: +  -  ,  space  or just write dice next to each other.",
-            Style::default().fg(Color::DarkGray),
-        )),
         close_hint(),
     ];
     overlay_panel(frame, area, " 🎲  dice notation ", lines, scroll)
