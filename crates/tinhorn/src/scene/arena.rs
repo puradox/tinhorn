@@ -22,7 +22,7 @@ fn col(c: Rgb) -> Color {
 
 /// Wrap a baked procedural texture (RGBA, row-major) as a Bevy sRGB image — the
 /// same procedural generators the software renderer uses, straight onto Bevy
-/// materials (the plan's "wrap as `Image::new`" path).
+/// materials.
 fn tex_image(t: &crate::paint::Texture) -> Image {
     Image::new(
         Extent3d {
@@ -122,10 +122,10 @@ pub fn spawn(
         Transform::from_xyz(0.0, FELT_TOP - 0.125, 0.0),
     ));
 
-    // --- Mahogany tray walls (back + two sides; front open). Real wood grain
-    //     (not a flat single tone) on the body, plus a distinctly lighter, fatter
-    //     top rail proud of the wall and a lit inner face flaring up from the felt
-    //     edge — so a wall reads as a solid framed lip, not a coloured slab. ---
+    // --- Mahogany tray walls (back + two sides; front open). Real wood grain on
+    //     the body, plus a lighter, fatter top rail proud of the wall and a lit
+    //     inner face flaring up from the felt edge — so a wall reads as a solid
+    //     framed lip, not a coloured slab. ---
     let wall = textured_tiled(
         materials,
         images,
@@ -215,11 +215,10 @@ pub fn spawn(
         Transform::from_xyz(0.0, rug_y + 0.01, 1.0),
     ));
 
-    // --- Broad room floor of oak floorboards, well below the rug. Unlit (like
-    //     the software floor's pure-ambient treatment) so it stays a genuinely
-    //     bright oak at every angle. The plank texture is *tiled* (narrow planks
-    //     running front-to-back) with a repeat sampler + a UV scale — not
-    //     stretched once across the whole floor, which made each plank huge. ---
+    // --- Broad room floor of oak floorboards, well below the rug. Unlit so it
+    //     stays a genuinely bright oak at every angle. The plank texture is *tiled*
+    //     (narrow planks front-to-back) with a repeat sampler + UV scale — not
+    //     stretched once across the floor, which made each plank huge. ---
     let mut floor_img = tex_image(&crate::ui::floor_texture(OAK));
     floor_img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
@@ -242,11 +241,10 @@ pub fn spawn(
     ));
 
     // --- Textured room back wall: the software renderer's baked backdrop (a warm
-    // vertical gradient — bright at the floor seam → dim ceiling — with a
-    // wainscot/chair-rail band and a panelled tone below it). Big enough to fill
-    // the flight framing so a rolling die isn't tumbling in a black void; unlit so
-    // it glows regardless of the key light's reach. Tiled a couple of times across
-    // so the wainscot panels read at a sensible width on the wide wall. ---
+    // vertical gradient with a wainscot/chair-rail band and a panelled tone below).
+    // Big enough to fill the flight framing so a rolling die isn't tumbling in a
+    // black void; unlit so it glows regardless of the key light's reach. Tiled a
+    // couple of times across so the wainscot panels read at a sensible width. ---
     let mut wall_img = repeat(tex_image(&crate::ui::backdrop_texture()));
     wall_img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
@@ -282,11 +280,10 @@ pub fn spawn(
         ));
     }
 
-    // --- Overhead saloon pendant: a warm tin shade hung over the tray on a
-    //     chain, with the key light living just inside its mouth (see `scene`), so
-    //     the felt sits in a pool of lamplight and the room falls to shadow. Hung
-    //     high and a touch back so the shade rides the top of the frame instead of
-    //     covering the felt at the overhead read. ---
+    // --- Overhead saloon pendant: a warm tin shade hung over the tray on a chain,
+    //     with the key light living just inside its mouth (see `scene`), so the felt
+    //     sits in a pool of lamplight and the room falls to shadow. Hung high and a
+    //     touch back so the shade rides the top of the frame, not the felt. ---
     let lamp_y = FELT_TOP + 4.4;
     let lamp_z = -0.6;
     let shade = materials.add(StandardMaterial {
@@ -358,12 +355,11 @@ fn chip_color(materials: &mut Assets<StandardMaterial>, idx: usize) -> Handle<St
 
 /// A free-hanging stage-curtain panel: a heavy velvet drape `w` wide × `h` tall,
 /// facing +Z. A single clean cosine corrugation reads as a machined washboard, so
-/// the fold profile layers three *incommensurate* waves — the pleats never line
-/// up into a regular pattern, varying in width and depth like gathered fabric —
-/// and the amplitude swells toward the floor so the drape splays as it falls, with
-/// a gentle forward belly. Normals come from the profile's own slope (finite
-/// differences in both directions), so the key/rim light pools in the valleys and
-/// catches the crests instead of flat-shading a slab.
+/// the fold profile layers three *incommensurate* waves — the pleats never line up
+/// into a regular pattern — and the amplitude swells toward the floor so the drape
+/// splays as it falls, with a gentle forward belly. Normals come from the profile's
+/// own slope, so the key/rim light pools in the valleys and catches the crests
+/// instead of flat-shading a slab.
 fn curtain_mesh(w: f32, h: f32, folds: u32) -> Mesh {
     let cols = folds * 8; // facets across the width — enough to round each pleat
     let rows = 24u32; // segments down the drop, for a smooth swell

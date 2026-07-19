@@ -56,10 +56,10 @@ impl Compare {
 }
 
 /// A reroll rule: a die whose face matches `cmp` is thrown out and redrawn. A
-/// plain `r` keeps redrawing until the face clears every reroll rule on the term
+/// plain `r` keeps redrawing until the face clears every rule on the term
 /// (capped so it always terminates); the `ro` form (`once`) redraws at most
-/// once. The compare point reuses [`Compare`], so `r1` is `r=1` (bare number
-/// means equality), `r<3` rerolls anything under 3, and `r>4` anything over.
+/// once. The compare point reuses [`Compare`], so `r1` is `r=1` (a bare number
+/// means equality), `r<3` rerolls under 3, `r>4` over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reroll {
     pub cmp: Compare,
@@ -90,10 +90,10 @@ pub struct DiceTerm {
     pub mods: Vec<TermMod>,
 }
 
-/// Which way a staked roll is won: reach the target from below or from above.
-/// `> N` (and its word alias `vs N`) is meet-or-beat; `< N` flips it to
-/// roll-under. Serialized in `--json` (`"goal": "over"` / `"under"`) so
-/// consumers read the direction rather than re-derive it. See [`super::app::check`].
+/// Which way a staked roll is won. `> N` (and its word alias `vs N`) is
+/// meet-or-beat; `< N` flips it to roll-under. Serialized in `--json`
+/// (`"goal": "over"` / `"under"`) so consumers read the direction rather than
+/// re-derive it. See [`super::app::check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Goal {
@@ -114,9 +114,8 @@ pub struct Stake {
 
 impl Stake {
     /// The compact chip text, e.g. `vs 15` or `vs ≤10`. Shared by the arena
-    /// verdict chip, the stats pane, and the CLI breakdown so the three can
-    /// never disagree about how a stake is spelled, and so the roll-under `≤`
-    /// is always shown next to its target.
+    /// verdict chip, the stats pane, and the CLI breakdown so they can never
+    /// disagree about how a stake is spelled.
     pub fn label(&self) -> String {
         match self.goal {
             Goal::Over => format!("vs {}", self.target),
@@ -163,9 +162,9 @@ pub fn parse(input: &str) -> Result<Roll, String> {
         // Stakes: name a target the total is checked against. `>` (and its
         // word alias `vs`) is meet-or-beat; `<` is roll-under. Matched before
         // term parsing so the introducer can't fall through to "unexpected
-        // character". The target must end the roll: allowing dice after it
-        // would make a contested-roll attempt like `d20 vs 4d6` silently parse
-        // as "target 4, plus a d6 for me" — an error beats a misparse.
+        // character". The target must end the roll — else `d20 vs 4d6` would
+        // silently parse as "target 4, plus a d6 for me", and an error beats a
+        // misparse.
         if let Some(goal) = stake_goal(&chars, &mut i) {
             if stake.is_some() {
                 return Err("only one target per roll".to_string());
@@ -284,10 +283,9 @@ fn vs_keyword(chars: &[char], pos: usize) -> bool {
 
 /// Detect a stake introducer at `i` and, on a match, consume it and name the
 /// direction: `>` (and its word alias `vs`) is meet-or-beat ([`Goal::Over`]),
-/// `<` is roll-under ([`Goal::Under`]). Both are inclusive — a total equal to
-/// the target wins either way — so there is no separate `>=`/`<=`. Returns
-/// `None` and leaves `i` untouched when no introducer is present, so the
-/// character falls through to the rest of the parse.
+/// `<` is roll-under ([`Goal::Under`]). Both are inclusive, so there is no
+/// separate `>=`/`<=`. Returns `None` and leaves `i` untouched when no
+/// introducer is present, so the character falls through to the rest of the parse.
 fn stake_goal(chars: &[char], i: &mut usize) -> Option<Goal> {
     if vs_keyword(chars, *i) {
         *i += 2;
@@ -339,16 +337,16 @@ fn parse_term_mods(
 
         // Reroll: `r<CP>` redraws a matching die until it clears; `ro<CP>`
         // redraws once. `<CP>` is a bare number (equality) or `<`/`>`/`=` and a
-        // number. Chain them (`r2r4r6`) to reroll several faces. Matched before
-        // the outer loop could read the bare `r` as an unexpected character.
+        // number; chain them (`r2r4r6`). Matched before the outer loop could
+        // read the bare `r` as an unexpected character.
         if matches!(chars.get(*i), Some('r' | 'R')) {
             let once = matches!(chars.get(*i + 1), Some('o' | 'O'));
             *i += if once { 2 } else { 1 };
             let cmp = parse_reroll_compare(chars, i)?;
             // A recurring reroll whose compare matches *every* face would never
             // clear; the roll-time cap stops the loop, but reject the
-            // statically-degenerate case with a clear message (as the `d1!`
-            // guard does for exploding). A `ro` always terminates, so it's fine.
+            // statically-degenerate case with a clear message (like the `d1!`
+            // explode guard). A `ro` always terminates, so it's fine.
             if !once && (1..=sides).all(|f| cmp.matches(f)) {
                 return Err(format!(
                     "that reroll never clears — every face of a d{sides} matches (use ro… to reroll once)"
@@ -422,7 +420,7 @@ fn parse_optional_count(chars: &[char], i: &mut usize) -> Option<u32> {
 
 /// Parse a reroll compare point: an optional `>`/`<`/`=` then a *required*
 /// number, defaulting to `=` (equality) when the operator is omitted — so `r1`
-/// rerolls 1s, `r<3` rerolls anything under 3, and `r>4` anything over.
+/// rerolls 1s, `r<3` under 3, `r>4` over.
 fn parse_reroll_compare(chars: &[char], i: &mut usize) -> Result<Compare, String> {
     let op: fn(u32) -> Compare = match chars.get(*i) {
         Some('>') => {
@@ -458,10 +456,10 @@ fn parse_optional_compare(chars: &[char], i: &mut usize) -> Result<Option<Compar
     Ok(Some(op(n)))
 }
 
-/// Parse a required signed integer at `i` (used by `*` and `vs`). Advances
+/// Parse a required signed integer at `i` (used by `*` and `vs`), advancing
 /// past it. Range-checked: a magnitude that fits u32 but not i32 must error
-/// rather than wrap negative (a `vs 3000000000` that silently becomes a huge
-/// negative target would succeed on every roll).
+/// rather than wrap negative — a `vs 3000000000` that silently became a huge
+/// negative target would succeed on every roll.
 fn parse_required_int(chars: &[char], i: &mut usize, msg: &str) -> Result<i32, String> {
     let neg = matches!(chars.get(*i), Some('-'));
     if neg || matches!(chars.get(*i), Some('+')) {
@@ -699,7 +697,7 @@ mod tests {
     #[test]
     fn stakes_target() {
         // Meet-or-beat: `vs` and `>` are the same, with or without spaces, any
-        // case. `vs` is just the word alias for `>`.
+        // case.
         for expr in [
             "d20+5 vs 15",
             "d20+5vs15",

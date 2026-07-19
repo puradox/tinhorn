@@ -55,11 +55,9 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// The colour-keyed bake cache all the procedural textures share. Each texture
-/// fn owns a static slot list and passes it here with its base colour and its
-/// baker; the textures are asked for every frame but the palette rarely
-/// changes, so each look is baked at most once. Bounded, and one
-/// implementation, so the lookup/evict policy can't drift between textures.
+/// The colour-keyed bake cache all the procedural textures share. Textures are
+/// asked for every frame but the palette rarely changes, so each look is baked at
+/// most once. Bounded, and one implementation so the evict policy can't drift.
 type TexCache =
     std::sync::OnceLock<std::sync::Mutex<Vec<([u8; 3], std::sync::Arc<crate::paint::Texture>)>>>;
 fn cached_texture(
@@ -110,15 +108,12 @@ pub(crate) fn grain_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> 
     })
 }
 
-/// The felt of the tray floor, baked as a texture. Real trays recess a plush
-/// felt into the wooden sides, so the fabric sits sunk below the lip: it reads as
-/// velvet, not a painted plane, and it falls into shadow where it meets the walls.
-/// So we bake two things a flat grain can't give: a soft, low-frequency **pile
-/// mottle** (plush unevenness) and an **ambient-occlusion band** darkening the
-/// felt toward the three walls (left, right, back — the open front is left lit).
-/// Cached by colour; `wall_dist` is the UV distance at which the recess shadow
-/// fades out. UVs run `u` across the width, `v` from the back wall (0) to the
-/// open front (1).
+/// The felt of the tray floor, baked as a texture. Real trays recess plush felt
+/// below the lip, so it reads as velvet and falls into shadow at the walls — so we
+/// bake two things a flat grain can't: a soft **pile mottle** and an
+/// **ambient-occlusion band** darkening the felt toward the three walls (the open
+/// front stays lit). Cached by colour. UVs run `u` across the width, `v` from the
+/// back wall (0) to the open front (1).
 pub(crate) fn felt_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> {
     use crate::paint::Texture;
 
@@ -159,10 +154,9 @@ pub(crate) fn felt_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> {
     })
 }
 
-/// The stage curtains' velvet, baked as a texture: soft vertical streak
-/// variation (pile catching light differently streak to streak — varies across
-/// `u`, smeared down `v`) under a subtle darkening toward the top header. Kept
-/// subtle on purpose: the drape's *geometry* (free-hanging scalloped edge +
+/// The stage curtains' velvet, baked as a texture: soft vertical streak variation
+/// (varies across `u`, smeared down `v`) under a subtle darkening toward the top
+/// header. Kept subtle on purpose — the drape's *geometry* (scalloped edge +
 /// corrugated folds) does the talking; this only keeps the cloth from reading
 /// flat. Cached by colour.
 pub(crate) fn velvet_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> {
@@ -193,12 +187,10 @@ pub(crate) fn velvet_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture>
     })
 }
 
-/// The room floor, baked as **wooden floorboards**: long planks (seams running
-/// one way, so they converge into the distance like real boards) with a dark
-/// groove between them and a little shade variation plank to plank. At this tiny
-/// frame the bold seam lines are what actually read as "a floor" rather than a
-/// flat brown field. Planks run along the texture's `v`; seams sit at regular `u`.
-/// Cached by colour.
+/// The room floor, baked as **wooden floorboards**: long planks with a dark groove
+/// between them and a little shade variation plank to plank. At this tiny frame the
+/// bold seam lines are what read as "a floor" rather than a flat brown field.
+/// Planks run along the texture's `v`; seams sit at regular `u`. Cached by colour.
 pub(crate) fn floor_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> {
     use crate::paint::Texture;
 
@@ -238,10 +230,9 @@ pub(crate) fn floor_texture(base: Rgb) -> std::sync::Arc<crate::paint::Texture> 
 }
 
 /// The far room, baked as a texture: a warm vertical haze with a scatter of soft,
-/// out-of-focus glowing **light blobs** (warm + a few neons) — a defocused casino
-/// floor of signage and lights, impressionistic rather than a hard row of
-/// machines. Emissive; the 3D bokeh add nearer, crisper glows in front. Cached
-/// once; it never changes.
+/// out-of-focus glowing **light blobs** — a defocused casino floor, impressionistic
+/// rather than a hard row of machines. Emissive; the 3D bokeh add crisper glows in
+/// front. Cached once; it never changes.
 pub(crate) fn backdrop_texture() -> std::sync::Arc<crate::paint::Texture> {
     use crate::paint::Texture;
     use std::sync::{Arc, OnceLock};
@@ -258,10 +249,9 @@ pub(crate) fn backdrop_texture() -> std::sync::Arc<crate::paint::Texture> {
                 (x % 100_000) as f32 / 100_000.0
             }
             // The far wall is a vertical gradient: **bright at the bottom**, matched
-            // to the lit floorboards so the floor→wall horizon is seamless and there
-            // is no dark band reading as "missing floor", fading up to a **dark
-            // ceiling** where the bokeh hang as lights. `horizon` is the floor's own
-            // rendered tone divided back out through the emissive factor.
+            // to the lit floorboards so the floor→wall horizon is seamless (no dark
+            // band reading as "missing floor"), fading up to a **dark ceiling** where
+            // the bokeh hang as lights. `horizon` is the floor's own rendered tone.
             let horizon = [134.0, 100.0, 69.0]; // warm, == the lit floor at the seam
             let ceiling = 0.12; // ceiling brightness as a fraction of `horizon`
             let cols: [[f32; 3]; 8] = [
@@ -293,12 +283,11 @@ pub(crate) fn backdrop_texture() -> std::sync::Arc<crate::paint::Texture> {
             for y in 0..H {
                 let v = y as f32 / (H - 1) as f32; // 0 = ceiling, 1 = floor seam
                 let base_bri = ceiling + (1.0 - ceiling) * smoothstep(0.0, 0.6, v);
-                // Wainscoting: a thick dark chair-rail band across the wall, set well
-                // above the floor seam (which sits near v≈0.8), with a subtly deeper,
-                // warmer panelled paint on the wall just below the rail. Both fade to
-                // nothing before the seam, so the wall's bottom tone still equals the
-                // lit floorboards there — the horizon invariant below stays intact.
-                // Band only — a thin line would shimmer at this frame.
+                // Wainscoting: a thick dark chair-rail band across the wall, above the
+                // floor seam (near v≈0.8), with subtly deeper, warmer panelled paint
+                // just below the rail. Both fade out before the seam, so the wall's
+                // bottom tone still equals the lit floorboards — the horizon invariant
+                // stays intact. Band only — a thin line would shimmer at this frame.
                 let vb = 0.6; // chair-rail centre
                 let half = 0.045; // band half-height — thick, not a line
                 let rail = 1.0 - 0.4 * (1.0 - smoothstep(half, half * 2.2, (v - vb).abs()));
@@ -396,14 +385,12 @@ const FACE_FRAC_H: f32 = 0.78;
 /// it this frame. Size-agnostic, so the single-cell overlay and the scaled
 /// block-digit both style the digits the same way.
 ///
-/// While the die is still tumbling the number is dim and colourless — nothing
-/// decided to the eye yet — and it **ducks out** whenever no face squarely fronts
-/// the camera: `clarity` is how far the read-face's facing leads the runner-up's,
-/// dropping toward zero as the die rolls edge- or corner-on (two faces tie), so
-/// the digit blinks off there and reads as ink on the tumbling solid rather than
-/// a fixed label. Once the die settles the burned value always shows in full —
-/// hot on a crit, red on a fumble, grey if the die was dropped by keep/drop,
-/// white otherwise.
+/// While tumbling the number is dim and colourless, and **ducks out** whenever no
+/// face squarely fronts the camera: `clarity` is how far the read-face's facing
+/// leads the runner-up's, dropping toward zero edge- or corner-on (two faces tie),
+/// so the digit blinks off and reads as ink on the tumbling solid. On settle the
+/// burned value shows in full — hot on a crit, red on a fumble, grey if dropped by
+/// keep/drop, white otherwise.
 fn face_ink(die: &Die, clarity: f32) -> Option<(Color, Modifier)> {
     /// Below this read-face dominance no single face clearly fronts the camera,
     /// so the airborne decoy hides — a brief wink at each edge/corner crossing.
@@ -427,13 +414,12 @@ fn face_ink(die: &Die, clarity: f32) -> Option<(Color, Modifier)> {
 }
 
 /// The face of a die that points most at the eye, for placing its number: the
-/// face's `centroid` (in unit-mesh space, to anchor the digit on) and its
-/// `clarity` — how far that face's facing leads the runner-up's. Clarity nears
-/// zero when two faces tie for frontmost (the die rolled edge- or corner-on),
-/// which is where the airborne number ducks out, and is large when a single face
-/// squarely presents; that holds for a cube or a d20 alike, so one threshold
-/// fits every die. `to_cam` is the unit eye direction in world space (from the
-/// die toward the camera), `rot` the die's orientation.
+/// face's `centroid` (unit-mesh space, to anchor the digit on) and its `clarity` —
+/// how far that face's facing leads the runner-up's. Clarity nears zero when two
+/// faces tie for frontmost (die rolled edge- or corner-on), where the airborne
+/// number ducks out; it's large when one face squarely presents, and that holds for
+/// a cube or a d20 alike, so one threshold fits every die. `to_cam` is the unit eye
+/// direction in world space (die → camera), `rot` the die's orientation.
 pub(crate) fn read_face(
     faces: &[tinhorn_core::dice_geom::FaceGeom],
     rot: glam::Quat,
@@ -519,13 +505,11 @@ pub(crate) fn number_scale(die_w: f32, die_h: f32, n_digits: i32) -> i32 {
 
 /// One die's number, resolved to everything the two render paths need to place a
 /// digit — computed once by [`plan_die_number`] so the cell overlay and the kitty
-/// pixel burn can never disagree. `center` is in arena *cell* coordinates (`0..cols`
-/// wide, `0..rows` tall — the arena's inner origin is NOT folded in, so both the
-/// cell painter and the pixel rasteriser can place from it); `scale` is the shared
-/// [`number_scale`] size (0 = the crisp single-cell overlay, ≥1 = the block glyph);
-/// `ink`/`mods` come from [`face_ink`] (the airborne dim decoy, the settled burn);
-/// `outline` is the die-tinted glyph surround. The scale-0 overlay's dark inset is
-/// the shared [`NUMBER_PLATE`] constant, applied at paint time by both paths.
+/// pixel burn can never disagree. `center` is in arena *cell* coordinates with the
+/// inner origin NOT folded in (so both painters place from it); `scale` is the
+/// shared [`number_scale`] size (0 = single-cell overlay, ≥1 = block glyph);
+/// `ink`/`mods` come from [`face_ink`]; `outline` is the die-tinted glyph surround.
+/// The scale-0 overlay's dark inset is the shared [`NUMBER_PLATE`].
 pub(crate) struct NumberBurn {
     pub(crate) label: String,
     pub(crate) center: (f32, f32),
@@ -535,15 +519,13 @@ pub(crate) struct NumberBurn {
     pub(crate) outline: Color,
 }
 
-/// Resolve one die's number for the frame's shared `scale` (computed once for the
-/// whole roll so every die reads the same size). Carries the front half of the
-/// overlay — [`read_face`] → [`face_ink`] (the decoy/settle/duck-out rules) → the
-/// anchor projected through [`project_to_cell`] — so both render paths share it
-/// verbatim. `None` when the number ducks out (edge-on) or projects behind the eye.
-/// Scale 0 anchors on the read-face centroid (a small label rides the top face);
-/// ≥1 anchors on the die centre (from the near-overhead read the silhouette *is*
-/// the top face, so centring keeps the digits contained rather than sliding off a
-/// small top facet on a d20).
+/// Resolve one die's number for the frame's shared `scale`. Carries the front half
+/// of the overlay — [`read_face`] → [`face_ink`] → the anchor projected through
+/// [`project_to_cell`] — so both render paths share it verbatim. `None` when the
+/// number ducks out (edge-on) or projects behind the eye. Scale 0 anchors on the
+/// read-face centroid (a small label rides the top face); ≥1 anchors on the die
+/// centre (near-overhead the silhouette *is* the top face, so centring keeps the
+/// digits contained rather than sliding off a small facet on a d20).
 pub(crate) fn plan_die_number(
     camera: &tinhorn_core::view_math::Camera,
     die: &Die,
@@ -568,10 +550,9 @@ pub(crate) fn plan_die_number(
         project_to_cell(camera, die.pos, cols, rows)?
     };
 
-    // Outline the number in a dark tint of *this die's* colour rather than a
-    // generic black, so on a small die (where the digits cover most of it) the
-    // number's surround still carries the die's hue — that's how you read which
-    // number belongs to which die when the die itself is mostly hidden.
+    // Outline the number in a dark tint of *this die's* colour rather than generic
+    // black, so on a small die the surround still carries the die's hue — that's how
+    // you tell which number belongs to which die when the die is mostly hidden.
     let base = if die.kept {
         die_rgb(die.color_idx)
     } else {
@@ -706,9 +687,9 @@ impl GlyphRaster {
     }
 
     /// Classify sub-pixel `(x, sub)`. The outline is a *tight* one-sub-pixel
-    /// dilation of the strokes on every side — enough to separate the number from
-    /// any die colour, but thin so the die still shows around and between the digits
-    /// (that colour is how you tell dice apart), not a solid tile blotting it out.
+    /// dilation of the strokes on every side — enough to separate the number from any
+    /// die colour, but thin so the die still shows around and between the digits (that
+    /// colour is how you tell dice apart), not a solid tile.
     pub(crate) fn px(&self, x: i32, sub: i32) -> GlyphPx {
         if self.lit(x, sub) {
             GlyphPx::Ink
@@ -722,13 +703,12 @@ impl GlyphRaster {
 
 /// Blit `label` as [`DIGIT_FONT`] glyphs centred on cell `center`, scaled `scale`×
 /// and drawn in **half-blocks** (two sub-rows per cell) so it stays compact on a
-/// short die. Each lit stroke sub-pixel is `ink`, every sub-pixel *touching* a
-/// stroke gets the `outline` colour (a dark tint of the die, so the number stays
-/// tied to its die), and everything else is left transparent — so the die shows
-/// through and the number reads as ink *on the face* rather than a plate covering
-/// it. Compositing is per sub-pixel via [`GlyphRaster`]: a cell becomes `▀` with
-/// its upper and lower halves coloured independently (ink, outline, or the die
-/// pixel already in the buffer). Cells outside `area` clip cleanly.
+/// short die. Lit strokes are `ink`, sub-pixels *touching* a stroke get `outline`,
+/// everything else stays transparent — so the die shows through and the number
+/// reads as ink *on the face* rather than a plate over it. Compositing is per
+/// sub-pixel via [`GlyphRaster`]: a cell becomes `▀` with its halves coloured
+/// independently (ink, outline, or the die pixel already in the buffer). Cells
+/// outside `area` clip cleanly.
 fn draw_big_number(
     frame: &mut Frame,
     area: Rect,
@@ -750,9 +730,8 @@ fn draw_big_number(
     let y0 = (cy - gh as f32 / 2.0).round() as i32;
     let buf = frame.buffer_mut();
     // Iterate one cell *beyond* the glyph box on every side: the outline dilates
-    // outward from the strokes, so its top / left / right border lives outside the
-    // glyph's own bounds and would go undrawn if the loop stopped at the box edge
-    // (only the bottom border, which has a spare half-cell, would show).
+    // outward, so its top/left/right border lives outside the glyph's own bounds and
+    // would go undrawn if the loop stopped at the box edge.
     for row in -1..=gh {
         for col in -1..=gw {
             let (x, y) = (x0 + col, y0 + row);
@@ -788,14 +767,12 @@ fn draw_big_number(
 
 /// Rasterise the resolved [`NumberBurn`]s into the packed RGB frame — the kitty
 /// path's equivalent of [`draw_big_number`]'s half-block compositing. One glyph
-/// sub-pixel maps to `sx × sy` image pixels, where `sx = img_w/inner_w` and
-/// `sy = img_h/(inner_h*2)` are derived from the **actual** image dims (like the
-/// blit's `ss`), so a resize-transition frame — image not yet the requested size —
-/// still burns each digit in the right spot. Ink and outline sub-pixels fill a
-/// rect; clear sub-pixels leave the die pixels showing through. Scale 0 (the tiny
-/// single-cell overlay) has no half-block glyph, so it rasters at scale 1 with a
-/// half-size sub-pixel over a dark [`NUMBER_PLATE`] backing rect. `rgb` is tight
-/// (three bytes/pixel, no row padding); everything clips to the image bounds.
+/// sub-pixel maps to `sx × sy` image pixels, derived from the **actual** image dims
+/// so a mid-resize frame still burns each digit in the right spot. Ink/outline
+/// sub-pixels fill a rect; clear ones leave the die pixels showing through. Scale 0
+/// has no half-block glyph, so it rasters at scale 1 with a half-size sub-pixel over
+/// a dark [`NUMBER_PLATE`] backing rect. `rgb` is tight (3 bytes/pixel, no row
+/// padding); everything clips to the image bounds.
 pub(crate) fn burn_numbers(
     rgb: &mut [u8],
     img_w: u32,
@@ -847,10 +824,9 @@ pub(crate) fn burn_numbers(
             );
         }
         // Iterate one sub-pixel *beyond* the glyph box on every side, exactly as the
-        // half-block path does: the outline dilates one sub-pixel outward from the
-        // strokes, so its top/left/right/bottom ring lives outside the box and would
-        // go unburned if the loop stopped at the edge — leaving kitty digits without
-        // the dark separation halo the cell path draws (they must never differ).
+        // half-block path does: the outline dilates outward, so its ring lives outside
+        // the box and would go unburned if the loop stopped at the edge — leaving kitty
+        // digits without the halo the cell path draws (they must never differ).
         for s in -1..=h_sub {
             for c in -1..=gw {
                 let color = match raster.px(c, s) {
@@ -904,8 +880,7 @@ fn fill_px_rect(
 
 /// The RGB a number's ink / outline / plate colour burns as: the named colours
 /// [`face_ink`] produces mapped to vivid tones (the kitty image is real colour, not
-/// a 16-colour cell), and `Rgb` passed straight through (the outline, the plate, and
-/// the airborne decoy are already `Rgb`).
+/// a 16-colour cell), and `Rgb` passed straight through.
 fn ink_rgb(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
@@ -917,11 +892,10 @@ fn ink_rgb(c: Color) -> (u8, u8, u8) {
     }
 }
 
-/// The arena: the actual roll as tumbling polyhedra, rendered from the Bevy
-/// scene. Each die spins while airborne and freezes when it
-/// settles; the instant it does, its RNG-decided value is "burned" onto the face
-/// pointing at you. Position comes from the sim; the RNG-decided values and total
-/// are untouched — the renderer only shows them off.
+/// The arena: the actual roll as tumbling polyhedra, rendered from the Bevy scene.
+/// Each die spins airborne and freezes on settle, when its RNG-decided value is
+/// "burned" onto the face pointing at you. Position comes from the sim; the values
+/// and total are untouched — the renderer only shows them off.
 fn arena_title(app: &App) -> String {
     if app.shaking() {
         " 🎲  tinhorn — shaking… ".to_string()
@@ -943,17 +917,16 @@ fn arena_title(app: &App) -> String {
 }
 
 /// The 2D ceremony that rides on top of the rendered arena: a burned number on
-/// every die (riding the face that points at us — anchored to that face, faded
-/// edge-on, burned to the RNG value on settle; skipped while shaking, dice in the
+/// every die (riding the face that points at us; skipped while shaking, dice in the
 /// cup), crit/fumble particles, the shake power meter, the release echo, and the
 /// idle hint.
 ///
 /// The die numbers are the one overlay coupled to the render model: in **Blocks**
 /// mode they composite into the cell buffer here; in **Kitty** mode they're planned
-/// and *returned* (empty otherwise) for the scene to burn into the pixels. The
-/// shake gate and the shared `number_scale` sizing live here, so both modes size
-/// the digits identically. Everything else — particles, meter, echo, hint — is
-/// pure cell chrome and draws the same in both.
+/// and *returned* for the scene to burn into the pixels. The shake gate and shared
+/// `number_scale` sizing live here so both modes size the digits identically.
+/// Everything else — particles, meter, echo, hint — is pure cell chrome, the same
+/// in both.
 fn draw_arena_overlays(
     frame: &mut Frame,
     app: &App,
@@ -964,11 +937,11 @@ fn draw_arena_overlays(
     let mut burns = Vec::new();
     if !app.shaking() {
         let (cols, rows) = (inner.width as f32, inner.height as f32);
-        // One number size for the whole roll, so the dice read the same — never a
-        // big number on the nearest die and single cells on the rest. Size it from a
-        // reference die at the felt centre, fit it within the read-face (not the
-        // whole die box), and reserve room for the widest value any die here can
-        // show, so a two-digit d20 lands at the same scale a one-digit d6 uses.
+        // One number size for the whole roll, so the dice read the same — never a big
+        // number on the nearest die and single cells on the rest. Size it from a
+        // reference die at the felt centre, fit within the read-face, and reserve room
+        // for the widest value any die can show, so a two-digit d20 lands at the same
+        // scale a one-digit d6 uses.
         let ref_center = glam::Vec3::new(0.0, -crate::physics::HY + crate::physics::DIE_R, 0.0);
         let (ref_w, ref_h) = die_screen_extent(camera, ref_center, cols, rows);
         let max_digits = app
@@ -1039,14 +1012,13 @@ pub struct KittyPanel {
 /// layout (arena, result panel, input line, help bar) with all of tinhorn's
 /// chrome. The arena panel is the only branch between modes:
 ///
-/// - **Blocks** — the CPU-read Bevy render blitted as half-blocks (fg = upper
-///   pixel, bg = lower), supersampled `ARENA_SS×` and box-downsampled; the die
-///   numbers composite straight into the buffer. `pixels` is the row-padded RGBA8
-///   readback of an `img_w`×`img_h` image sized to this grid.
+/// - **Blocks** — the CPU-read Bevy render blitted as half-blocks, supersampled
+///   `ARENA_SS×` and box-downsampled; the die numbers composite straight into the
+///   buffer. `pixels` is the row-padded RGBA8 readback of an `img_w`×`img_h` image.
 /// - **Kitty** — the arena cells are cleared to default-bg (the scene places a real
-///   image behind them, at native `scale`× resolution — no SSAA, 4× MSAA already
-///   smooths edges) and the die numbers are returned as burns for the scene to
-///   rasterise into the pixels. `pixels` is unused (the scene owns the readback).
+///   image behind them at native `scale`× — no SSAA, 4× MSAA already smooths edges)
+///   and the die numbers are returned as burns for the scene to rasterise. `pixels`
+///   is unused (the scene owns the readback).
 ///
 /// The cell-space overlays (particles, meter, echo, hint) draw identically either
 /// way. Returns the render-target size and, in kitty mode, the panel + burns.
@@ -1181,12 +1153,11 @@ pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
     (f * 1.04, f, f * 0.95)
 }
 
-/// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg =
-/// upper pixel, bg = lower). The render is supersampled — `img_w`/`img_h` are
-/// `ARENA_SS×` the `inner.width`/`inner.height*2` grid — so each output subpixel
-/// box-averages an `ss`×`ss` block, smoothing the boxy edges. Then a warm-graded
-/// radial vignette (the old software renderer's vignette) pulls the eye in. A
-/// no-op until the first readback of the right size lands.
+/// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg = upper
+/// pixel, bg = lower). The render is supersampled (`img_w`/`img_h` are `ARENA_SS×`
+/// the grid), so each output subpixel box-averages an `ss`×`ss` block, smoothing the
+/// boxy edges; then a warm-graded radial vignette pulls the eye in. A no-op until
+/// the first readback of the right size lands.
 fn blit_bevy_arena(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
@@ -1307,10 +1278,10 @@ fn draw_particle(buf: &mut ratatui::buffer::Buffer, inner: Rect, p: &Particle) {
     buf.set_string(x as u16, y as u16, p.glyph.to_string(), style);
 }
 
-/// The throw's power meter, drawn while shaking (the Throw). The cup itself is
-/// now a real 3D tumbler in the arena scene (`tinhorn_core::dice_geom::cup`);
-/// this is just the instrument read-out above it — fixed and centred so your eye
-/// can time the release against it, colour-coding the power you'd catch right now.
+/// The throw's power meter, drawn while shaking (the Throw). The cup is a real 3D
+/// tumbler in the arena scene (`tinhorn_core::dice_geom::cup`); this is just the
+/// read-out above it — fixed and centred so your eye can time the release against
+/// it, colour-coding the power you'd catch right now.
 fn draw_power_meter(buf: &mut ratatui::buffer::Buffer, inner: Rect, app: &App) {
     let power = app.power();
 
@@ -1364,9 +1335,8 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
     let settled = app.all_settled();
 
     // Line 1: one chip per die. Each locks in when *its* die comes to rest —
-    // colourless and dim while the die is still tumbling (the face on show is a
-    // flickering decoy, not the outcome), then bold in the die's colour once it
-    // settles. A dropped die stays greyed whatever it lands on.
+    // colourless and dim while tumbling (the face on show is a flickering decoy),
+    // then bold in the die's colour once it settles. A dropped die stays greyed.
     let mut chips: Vec<Span> = Vec::new();
     for (i, die) in app.dice.iter().enumerate() {
         if i > 0 {
@@ -1568,11 +1538,10 @@ fn close_hint() -> Line<'static> {
 }
 
 /// Draw a centred, bordered panel of `lines` titled `title` over the UI. Sizes
-/// itself to its content (capped to the frame), blanks what's behind it, and
-/// scrolls by `scroll` lines when the content is taller than the frame allows.
-/// Returns the scroll offset actually used — clamped so the last line can just
-/// reach the bottom and no further — so the caller can store the corrected
-/// value back. Shared by all three pop-out panes.
+/// itself to its content (capped to the frame), blanks what's behind it, and scrolls
+/// by `scroll` lines when the content overflows. Returns the scroll offset actually
+/// used — clamped so the last line can just reach the bottom — so the caller can
+/// store the corrected value back. Shared by all three pop-out panes.
 fn overlay_panel(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>, scroll: u16) -> u16 {
     let content_h = lines.len() as u16;
     let inner_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -1801,11 +1770,11 @@ fn centered(w: u16, h: u16, area: Rect) -> Rect {
     cell
 }
 
-/// The editable dice expression: a fixed prompt, then the expression with a
-/// block caret (reverse-video over the character it covers, a solid block at the
-/// end of the line). The expression scrolls horizontally to keep the caret in
-/// view when it's wider than the row, so mid-line editing never runs off-screen.
-/// Every span borrows `app.input`, so drawing the line allocates nothing.
+/// The editable dice expression: a fixed prompt, then the expression with a block
+/// caret (reverse-video over the character it covers, a solid block at line end).
+/// The expression scrolls horizontally to keep the caret in view, so mid-line
+/// editing never runs off-screen. Every span borrows `app.input`, so drawing
+/// allocates nothing.
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     const PROMPT: &str = "dice ▸ ";
     let [prompt_area, text_area] = Layout::horizontal([

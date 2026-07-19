@@ -1,17 +1,15 @@
 //! Command-line interface and the one-shot (non-animated) output path.
 //!
-//! When `tinhorn` is given an expression together with an output flag — or when
-//! its stdout isn't a terminal — it skips the bouncing-dice TUI entirely,
-//! evaluates the roll once, prints a result, and exits. This is what makes
-//! `tinhorn` usable in scripts and pipelines. Three output shapes: a bare total
-//! (default), a verbose breakdown (`-v`), and machine-readable JSON (`--json`).
+//! Given an expression together with an output flag — or when stdout isn't a
+//! terminal — `tinhorn` skips the bouncing-dice TUI, evaluates the roll once,
+//! prints, and exits, so it drops into scripts and pipelines. Three output
+//! shapes: a bare total (default), a verbose breakdown (`-v`), and JSON (`--json`).
 //!
 //! A staked roll (`d20+5 vs 15`) under an explicit `-p`/`-v` also *exits* with
-//! the verdict — 0 on success, 1 on failure — so a shell script can branch on
-//! a saving throw: `tinhorn -p d20+4 vs 14 && echo "the potion works"`. The
-//! implicit piped-stdout mode and `--json` always exit 0 on clean output:
-//! `tinhorn d20 vs 15 | tee log` in a `set -e` script must not abort just
-//! because the die came up short, and JSON consumers read `success` instead.
+//! the verdict — 0 on success, 1 on failure — so a script can branch on a saving
+//! throw. The implicit piped-stdout mode and `--json` always exit 0 on clean
+//! output, so piping in a `set -e` script never aborts on a short roll (JSON
+//! consumers read `success` instead).
 
 use std::io::{self, Write};
 
@@ -101,10 +99,9 @@ pub fn run_one_shot(cli: &Cli, expr: &str) -> io::Result<()> {
     }
 
     // A staked roll reports its verdict through the exit code (0 = success,
-    // 1 = failure) so scripts can branch on the check itself — but only when
-    // the caller explicitly asked for `-p`/`-v`. The automatic non-tty
-    // one-shot (`tinhorn d20 vs 15 | tee`) and `--json` keep exit 0, so piping
-    // output can never read as the program failing.
+    // 1 = failure) so scripts can branch on the check — but only under an
+    // explicit `-p`/`-v`. The automatic non-tty one-shot and `--json` keep
+    // exit 0, so piping output can never read as the program failing.
     if (cli.print || cli.verbose) && outcome.success == Some(false) {
         out.flush()?;
         std::process::exit(1);

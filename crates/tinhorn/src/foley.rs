@@ -10,14 +10,13 @@
 //! On macOS with a duplex default output (a USB interface with mic inputs),
 //! the OS raises a one-time *microphone* prompt for any process that starts
 //! playback — even Apple's `afplay`. That's the OS, not this code (no input
-//! path exists here); the README's Sound section documents it, and the lazy
-//! spawn in `main.rs::run` (the audio thread only starts on the first audible
-//! event) keeps `--mute` sessions from ever asking.
+//! path exists here); the lazy spawn in `main.rs::run` (audio thread starts
+//! only on the first audible event) keeps `--mute` sessions from ever asking.
 //!
 //! The device lives on its own thread ([`Foley::spawn`]): opening it blocks for
-//! tens of milliseconds while the OS audio stack wakes up, and on the ~60 fps
-//! render loop that shows up as a one-frame hitch on the first sound. The
-//! thread absorbs that cost; the render loop only posts [`SoundEvent`]s to it.
+//! tens of milliseconds while the OS audio stack wakes up, which on the ~60 fps
+//! render loop would be a one-frame hitch. The thread absorbs that cost; the
+//! render loop only posts [`SoundEvent`]s to it.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
@@ -46,12 +45,10 @@ pub struct Foley {
 impl Foley {
     /// Start the audio thread and return immediately.
     ///
-    /// Opening the output device blocks for tens of milliseconds while the OS
-    /// audio stack starts up; doing it on this thread keeps that cost off the
-    /// render loop (otherwise a visible hitch on the first sound). The caller
-    /// decides *when* to spawn — on the first audible, unmuted event — so a
-    /// muted session never starts the thread and never touches the audio APIs
-    /// (see the module docs on the macOS microphone prompt).
+    /// Opening the device blocks for tens of ms; doing it here keeps that cost
+    /// off the render loop. The caller decides *when* to spawn — on the first
+    /// audible, unmuted event — so a muted session never starts the thread and
+    /// never touches the audio APIs (see the module docs on the macOS mic prompt).
     pub fn spawn() -> Foley {
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -87,9 +84,9 @@ fn audio_thread(rx: Receiver<SoundEvent>) {
         return;
     };
 
-    // Discard whatever piled up while the device was opening — those impacts
-    // are already in the past on screen, so playing them now would be a stale
-    // burst rather than foley. Sound simply catches up from the next event on.
+    // Discard whatever piled up while the device was opening — those impacts are
+    // already in the past on screen, so playing them now would be a stale burst.
+    // Sound just catches up from the next event on.
     while rx.try_recv().is_ok() {}
 
     let mono = std::num::NonZero::<u16>::MIN; // 1 channel

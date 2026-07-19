@@ -51,9 +51,9 @@ const SNAP_COLS: u16 = 100;
 const SNAP_ROWS: u16 = 38;
 
 /// A tracing span for a hot block, compiled only under the `profiling` /
-/// `profiling-tracy` features (see Cargo.toml), so ordinary builds pay nothing. It
-/// gives our non-system work — the compose and the kitty emit inside the one
-/// `draw_ui` system — its own bars in the trace, next to Bevy's per-system spans.
+/// `profiling-tracy` features so ordinary builds pay nothing — it gives our
+/// non-system work (compose, kitty emit) its own bars next to Bevy's per-system
+/// spans.
 macro_rules! profile_span {
     ($name:expr) => {
         #[cfg(any(feature = "profiling", feature = "profiling-tracy"))]
@@ -63,8 +63,8 @@ macro_rules! profile_span {
 
 /// Entry point (interactive or headless snapshot). Only called off the
 /// interactive CLI path, never one-shot. `arg` is the `--graphics` flag; the
-/// snapshot path forces half-blocks (it composes to a `TestBackend`/PNG and has no
-/// TTY to resolve against), the interactive path resolves it against the terminal.
+/// snapshot path forces half-blocks (no TTY to resolve against), the interactive
+/// path resolves it against the terminal.
 pub fn run(expr: String, seed: Option<u64>, muted: bool, arg: GraphicsArg) {
     if let Some(path) = std::env::var_os("TINHORN_BEVY_SNAPSHOT") {
         run_snapshot(&expr, seed, muted, PathBuf::from(path));
@@ -84,9 +84,9 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) -> A
         None => DiceApp::new(expr.to_string()),
     };
     sim.muted = muted;
-    // `App::with_seed`/`new` already roll a non-empty expression on construction
-    // (exactly as the legacy TUI's `-- 3d6` does), consuming the seed once — so we
-    // must NOT roll again here, or the Bevy path would diverge from `evaluate`.
+    // `App::with_seed`/`new` already roll a non-empty expression on construction,
+    // consuming the seed once — so we must NOT roll again here, or the Bevy path
+    // would diverge from `evaluate`.
     // A sensible arena size until the first frame reports the real one.
     sim.arena_w = 64.0;
     sim.arena_h = 20.0;
@@ -121,9 +121,9 @@ fn base_app(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMode) -> A
 }
 
 /// Are we running over SSH? A file-transmitted kitty image (`t=f`) can't work then —
-/// the file is written on this (remote) host but the terminal reads it on the local
-/// one, so the emitter must fall back to base64 through the pty (the only medium an
-/// SSH hop forwards). `SSH_CONNECTION`/`SSH_TTY` are set by sshd on the session.
+/// the file is written on the remote host but read on the local one, so the emitter
+/// falls back to base64 through the pty (the only medium an SSH hop forwards).
+/// `SSH_CONNECTION`/`SSH_TTY` are set by sshd on the session.
 fn over_ssh() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
@@ -136,12 +136,10 @@ fn run_interactive(expr: &str, seed: Option<u64>, muted: bool, mode: GraphicsMod
     app.add_plugins(RatatuiPlugins::default())
         .insert_resource(Sound(None))
         .insert_resource(KittyState {
-            // File transmission (`t=f`) is used whenever it *can* be — always, on a
-            // local session. It can't cross an SSH hop (the file lands on this remote
-            // host, but the terminal reads it on the local one, different
-            // filesystems), so fall back to base64-through-the-pty there, the only
-            // medium SSH forwards. `TINHORN_KITTY_DIRECT` forces base64 too — a manual
-            // override for a local terminal that restricts which files it will read.
+            // File transmission (`t=f`) is used whenever it can be. It can't cross an
+            // SSH hop (see `over_ssh`), so fall back to base64-through-the-pty there;
+            // `TINHORN_KITTY_DIRECT` forces base64 too, for a local terminal that
+            // restricts which files it will read.
             file: (!over_ssh() && std::env::var_os("TINHORN_KITTY_DIRECT").is_none())
                 .then(|| std::env::temp_dir().join(format!("tinhorn-{}.rgb", std::process::id()))),
             ..default()
@@ -198,12 +196,10 @@ struct Sim(DiceApp);
 struct Graphics(GraphicsMode);
 
 /// Kitty emission state. `placed` gates the delete / re-place when a pane opens over
-/// the arena (the pane's `Clear` + default-bg text would show a placed image through
-/// at any z). `file` selects the transmit path: `Some(temp path)` sends each frame as
-/// a `t=f` file reference (raw pixels on disk, a tiny pty write) — the fix for the
-/// stdout-write bottleneck, and the default whenever it can work; `None` falls back to
-/// base64-in-escape, used automatically over SSH (a file can't cross the hop) or when
-/// `TINHORN_KITTY_DIRECT` forces it.
+/// the arena (its `Clear` + default-bg text would show a placed image through at any
+/// z). `file` selects the transmit path: `Some(temp path)` sends each frame as a
+/// `t=f` file reference (raw pixels on disk, a tiny pty write) — the default whenever
+/// it can work; `None` falls back to base64-in-escape (SSH, or `TINHORN_KITTY_DIRECT`).
 #[derive(Resource, Default)]
 struct KittyState {
     placed: bool,
@@ -351,10 +347,10 @@ fn setup(
             brightness: 70.0,
             ..default()
         },
-        // A warm, smoky haze that thickens with distance so the room dissolves
-        // into an amber murk beyond the lit tray — the cigar-smoke air of a
-        // saloon back room. Exponential falloff reads softer and smokier than a
-        // hard linear band; the near tray and dice stay crisp.
+        // A warm, smoky haze thickening with distance so the room dissolves into
+        // amber murk beyond the lit tray — the cigar-smoke air of a saloon back
+        // room. Exponential falloff reads softer than a hard linear band; the near
+        // tray and dice stay crisp.
         DistanceFog {
             color: Color::srgb_u8(50, 33, 20),
             falloff: FogFalloff::Exponential { density: 0.06 },
@@ -507,10 +503,10 @@ fn sync_dice_scene(
             continue;
         }
         let mesh = meshes.add(convert::dice_mesh(&dice_geom::mesh_for(die.sides)));
-        // Glossy resin: a low roughness + lifted reflectance so each die catches a
-        // crisp specular highlight from the warm key, reading as moulded plastic.
-        // A faint colour-matched emissive keeps the dice vivid even in the dim
-        // edges of the lamp-pool, so they never dull to mud in the shadow.
+        // Glossy resin: low roughness + lifted reflectance so each die catches a
+        // crisp specular highlight, reading as moulded plastic. A faint
+        // colour-matched emissive keeps the dice vivid in the dim edges of the
+        // lamp-pool instead of dulling to mud in the shadow.
         let material = materials.add(StandardMaterial {
             base_color: die_color(die),
             emissive: die_emissive(die),
@@ -585,10 +581,9 @@ fn draw_ui(
 ) -> Result {
     let mode = gfx.0;
 
-    // Smooth the real frame rate for the debug overlay: 1/dt, EMA-filtered so it
-    // isn't a jittery blur. `dt` is the wall-clock gap between Update runs, so this
-    // is the *actual* loop rate — if the encode/readback overruns the 1/60 s budget,
-    // the number falls, which is the whole point.
+    // Smooth the real frame rate for the debug overlay: 1/dt, EMA-filtered. `dt` is
+    // the wall-clock gap between Update runs, so this is the *actual* loop rate — if
+    // the encode/readback overruns the 1/60 s budget, the number falls.
     let dt = time.delta_secs();
     if dt > 0.0 {
         stats.fps = ema(stats.fps, 1.0 / dt);
@@ -646,8 +641,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// frame. A pane renders with `Clear` + default-bg text, so a placed image would
 /// show through it at any z; delete the placement once and re-place on close. An
 /// empty/stale readback (startup, or just after `resize_arena` clears `pixels`) is
-/// skipped, leaving the previous placement up, since the readback lags the size
-/// request by a frame or two.
+/// skipped, leaving the previous placement up.
 fn emit_kitty(
     panel: &ui::KittyPanel,
     arena: &ArenaImage,
@@ -767,9 +761,8 @@ fn draw_fps_overlay(
 /// Tear down the kitty image and its scratch files: delete our `i=1` image from the
 /// terminal (so it isn't stranded in the scrollback) and remove the `t=f` scratch
 /// frame plus its `.tmp` sibling. Shared by the graceful `kitty_cleanup` and the
-/// panic hook, so an abnormal exit leaves the terminal as clean as a normal one.
-/// Targeted to `i=1`, so it can't disturb anything else on screen; idempotent, so
-/// running it twice (a panic after a partial cleanup) is harmless.
+/// panic hook. Targeted to `i=1` so it can't disturb anything else on screen, and
+/// idempotent, so running it twice is harmless.
 fn kitty_teardown(file: &Option<PathBuf>) {
     let _ = graphics::emit_raw(&graphics::delete_all_apc());
     if let Some(path) = file {
@@ -796,10 +789,9 @@ fn kitty_cleanup(mut exits: MessageReader<AppExit>, gfx: Res<Graphics>, state: R
 /// Chain the kitty teardown onto the terminal-restore panic hook the vendored `term`
 /// installs in `Startup`. Runs in `PostStartup` (once that hook is in place, so
 /// `take_hook` captures it) and only in kitty mode: on a panic we delete the image
-/// and remove the scratch file *before* deferring to `term`'s restore — so a crash
-/// mid-roll doesn't strand the arena image in the scrollback the way the graceful
-/// `kitty_cleanup` avoids. Hooks fire even under `panic = "abort"`, where a Drop
-/// guard would not.
+/// and remove the scratch file *before* deferring to `term`'s restore, so a crash
+/// mid-roll doesn't strand the image in the scrollback. Hooks fire even under
+/// `panic = "abort"`, where a Drop guard would not.
 fn install_kitty_panic_hook(state: Res<KittyState>) {
     let file = state.file.clone();
     let prev = std::panic::take_hook();
@@ -838,10 +830,10 @@ fn die_transform(die: &Die) -> Transform {
 }
 
 /// Die colour: the SAME per-die palette (`ui::die_rgb`) the number overlay tints
-/// its outline with, so a die and its burned value read as the same colour and
-/// you can tell which number belongs to which die when several land at once.
-/// Dropped dice grey out; crit/fumble are signalled by the number's ink (gold /
-/// red), not the die, exactly as the software renderer does.
+/// its outline with, so a die and its burned value read as the same colour — you
+/// can tell which number belongs to which die when several land at once. Dropped
+/// dice grey out; crit/fumble are signalled by the number's ink (gold / red), not
+/// the die.
 fn die_color(die: &Die) -> Color {
     if !die.kept {
         return Color::srgb_u8(90, 90, 90);

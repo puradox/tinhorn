@@ -1,11 +1,10 @@
 //! Real 3D rigid-body physics for the dice, on top of Rapier.
 //!
-//! The arena is a fixed-size box in world units (a shallow tray): a floor, four
-//! walls, and a ceiling, all static. Each die is a dynamic body with a convex
-//! collider built from its polyhedron, so it tumbles, bounces, collides with the
-//! others, and comes to rest like a real die. Everything the rest of the app
-//! needs is behind this small API — pose, sleeping, launch, step — so the
-//! renderer and `app` never touch Rapier directly.
+//! The arena is a fixed-size box (a shallow tray): a static floor, four walls,
+//! and a ceiling. Each die is a dynamic body with a convex collider from its
+//! polyhedron, so it tumbles, bounces, and comes to rest like a real die. The
+//! small API — pose, sleeping, launch, step — keeps the renderer and `app` off
+//! Rapier directly.
 //!
 //! Physics decides *nothing* about the dice values (those are the seeded RNG's,
 //! drawn in `app`); it only decides where the dice land and how they lie.
@@ -19,9 +18,8 @@ use rapier3d::prelude::*;
 pub const HX: f32 = 3.2;
 pub const HY: f32 = 1.9;
 /// Tray depth. 2.0 gives the felt a 1.6:1 width:depth read — a real dice tray's
-/// proportions (the reference tray is ~4:3), not the letterbox slot 1.1 made.
-/// Deeper still reads even more tray-like, but the overhead camera must back out
-/// to fit the felt's depth and the dice shrink with it; 2.0 is the tradeoff.
+/// proportions, not the letterbox slot 1.1 made. Deeper reads more tray-like but
+/// the overhead camera must back out and the dice shrink; 2.0 is the tradeoff.
 /// The launch lattice, camera framing, and furniture all derive from this —
 /// see `app::launch_pool`, `view_math::arena_camera`, and `ui::render_arena`.
 pub const HZ: f32 = 2.0;
@@ -110,9 +108,9 @@ impl Physics {
             .build();
         let handle = self.bodies.insert(body);
 
-        // Sleep fast once a die is still, so its value burns in promptly. Rapier's
-        // default is a sleepy 2 s; a fifth of that (with slightly looser velocity
-        // thresholds) makes the roll feel *done* the instant the dice stop.
+        // Sleep fast once a die is still, so its value burns in promptly: a fifth
+        // of Rapier's sleepy 2 s default (with looser velocity thresholds) makes
+        // the roll feel *done* the instant the dice stop.
         if let Some(b) = self.bodies.get_mut(handle) {
             let act = b.activation_mut();
             act.time_until_sleep = 0.2;
@@ -144,8 +142,8 @@ impl Physics {
     /// Advance the simulation one fixed [`STEP`], returning impacts (for foley).
     /// An impact is a die whose speed dropped sharply this step — i.e. it hit
     /// something. `dice` carries each die's handle, `sides`, and its speed
-    /// *before* the step; include settled dice too, so a strike against a
-    /// resting die is still recognised as die-vs-die.
+    /// *before* the step; include settled dice too, so a strike against a resting
+    /// die still reads as die-vs-die.
     pub fn step(&mut self, dice: &[(RigidBodyHandle, u32, f32)]) -> Vec<Impact> {
         self.pipeline.step(
             self.gravity,

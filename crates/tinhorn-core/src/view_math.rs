@@ -77,10 +77,9 @@ pub fn arena_aspect(cols: f32, rows: f32) -> f32 {
 /// on a table. `shake` offsets both eye and target for the hard-throw shudder.
 ///
 /// The distance is **derived from `aspect`** so the tray's full width always just
-/// fills the frame: a wide terminal (more horizontal room) pulls the camera in
-/// for chunkier dice instead of wasting the space, and a narrow one backs off so
-/// a die resting against a wall is never clipped. `aspect` is `cols/(rows*2)`,
-/// exactly what [`project_to_cell`] computes, so both agree on the framing.
+/// fills the frame: a wide terminal pulls the camera in for chunkier dice, a
+/// narrow one backs off so a die against a wall is never clipped. `aspect` is
+/// `cols/(rows*2)`, exactly what [`project_to_cell`] computes, so both agree.
 ///
 /// One definition, shared by the live renderer (the terminal `ui`) and the
 /// particle placement in [`crate::app`], so the dice, their burned numbers, and
@@ -88,22 +87,18 @@ pub fn arena_aspect(cols: f32, rows: f32) -> f32 {
 pub fn arena_camera(shake: Vec3, aspect: f32, focus: f32) -> Camera {
     let focus = focus.clamp(0.0, 1.0);
     let tan = (ARENA_FOV_Y * 0.5).tan();
-    // Frame the whole tray: fit its full width AND its height — the floor, the
-    // walls, and up past the height a die launches from — taking whichever needs
-    // more distance, so the cup, the throw's arc, and the tray are never clipped.
-    // As the dice settle (`focus`→1) there's no launch arc left to frame, so the
-    // vertical framing tightens a touch and the camera leans in over the felt.
+    // Frame the whole tray: fit its full width AND its height, taking whichever
+    // needs more distance, so the cup, the throw's arc, and the tray are never
+    // clipped. As the dice settle (`focus`→1) there's no launch arc left, so the
+    // vertical framing tightens and the camera leans in over the felt.
     let want_half_w = crate::physics::HX + crate::physics::DIE_R + 0.02;
-    // The vertical framing follows the tray's depth (`physics::HZ`) rather than a
-    // magic number, so a deeper tray automatically frames correctly at both ends
-    // of the ceremony. Settled (`focus`→1) the camera looks near-straight down
-    // (~68°, sin ≈ 0.93): the vertical frame maps almost directly to the felt's
-    // depth, so cover HZ at that projection plus a whisker of rail margin.
-    // Rolling (`focus`→0) the tilt is shallow (~31°, sin ≈ 0.52): depth
-    // foreshortens to half, and the launch arc's *height* is what needs the
+    // The vertical framing follows the tray's depth (`physics::HZ`), not a magic
+    // number, so a deeper tray frames correctly at both ends of the ceremony.
+    // Settled (`focus`→1) the camera looks near-straight down (~68°, sin ≈ 0.93):
+    // the vertical frame maps almost directly to felt depth, so cover HZ plus a
+    // whisker of rail margin. Rolling (`focus`→0) the tilt is shallow (~31°, sin ≈
+    // 0.52): depth foreshortens to half and the launch arc's *height* needs the
     // frame — a fixed headroom term, since HY and the throw are depth-agnostic.
-    // Margins are kept thin so the felt fills the frame — a dice tray you lean
-    // over, not a small table across the room.
     let hz = crate::physics::HZ;
     let overhead = 0.93 * hz + 0.15; // felt depth at ~68° + a thin rail margin
     let establishing = 0.52 * hz + 1.45; // tray front at ~31° + launch-arc headroom
@@ -112,10 +107,9 @@ pub fn arena_camera(shake: Vec3, aspect: f32, focus: f32) -> Camera {
     let dist_h = want_half_h / tan;
     let dist = dist_w.max(dist_h).clamp(3.5, 8.0);
 
-    // Aim at the tray's mid-low centre; sit up-and-back. While rolling the tilt is
-    // a shallow ~31° "tray on a table"; as the dice come to rest the camera pitches
-    // up and over to ~68°, looking down the way you'd lean over the felt to read
-    // the numbers on top — which is also the angle the floorboards read best from.
+    // Aim at the tray's mid-low centre; sit up-and-back. Rolling, the tilt is a
+    // shallow ~31° "tray on a table"; as the dice rest it pitches up to ~68°, the
+    // way you'd lean over the felt to read the numbers on top.
     let target = Vec3::new(0.0, -0.35, 0.0);
     let pitch = 0.55 + 0.63 * focus; // radians: ~31° rolling → ~68° overhead read
     let (pitch_sin, pitch_cos) = (pitch.sin(), pitch.cos());
@@ -134,11 +128,10 @@ pub fn arena_camera(shake: Vec3, aspect: f32, focus: f32) -> Camera {
 }
 
 /// THE live arena camera: [`arena_camera`] plus every per-frame modifier — the
-/// idle drift, and the crit flash's punch-in toward the tray. Both the renderer
+/// idle drift and the crit flash's punch-in toward the tray. Both the renderer
 /// (the terminal `ui`) and the particle placement ([`crate::app`]) build their
-/// camera here, so a new modifier added for the scene automatically moves the
-/// burned numbers and the crit/fumble bursts with it — the two projections can
-/// never drift out of register.
+/// camera here, so a new modifier moves the burned numbers and the crit/fumble
+/// bursts with it — the two projections can never drift out of register.
 pub fn live_camera(shake: Vec3, aspect: f32, focus: f32, clock: f32, flash: f32) -> Camera {
     let mut camera = arena_camera(shake, aspect, focus);
     // A slow idle drift of the eye (target fixed) so the view floats with life.
@@ -153,13 +146,12 @@ pub fn live_camera(shake: Vec3, aspect: f32, focus: f32, clock: f32, flash: f32)
 
 /// A gentle idle drift for the camera *eye* (not the target), so the view floats
 /// like a slow handheld shot — near tray against far lights gives a little
-/// parallax and life. Cosmetic and slow; applied to `Camera::position` after
-/// [`arena_camera`] (via [`live_camera`]).
+/// parallax. Cosmetic; applied to `Camera::position` via [`live_camera`].
 pub fn idle_orbit(time: f32) -> Vec3 {
-    // A slow top-to-bottom pan of the eye (target fixed), like someone leaning in
-    // to read the dice and easing back: the eye rises while dollying gently forward
-    // so the view pitches down over the top faces, then settles — a vertical drift
-    // with only a whisper of sideways sway. Zero at t=0 so it eases in from rest.
+    // A slow top-to-bottom pan of the eye (target fixed), like leaning in to read
+    // the dice and easing back: the eye rises while dollying forward so the view
+    // pitches down over the top faces — a vertical drift with only a whisper of
+    // sideways sway. Zero at t=0 so it eases in from rest.
     let p = (time * 0.16).sin(); // ~39 s per loop
     Vec3::new(
         (time * 0.11).sin() * 0.06, // barely any sideways
