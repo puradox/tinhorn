@@ -2407,7 +2407,7 @@ mod tests {
             let mut rang_while_live = None;
             for _ in 0..20000 {
                 app.update(1.0 / 60.0);
-                if app.sounds.iter().any(|s| *s == SoundEvent::Crit) {
+                if app.sounds.contains(&SoundEvent::Crit) {
                     // The first ring: the six that just landed spawned a sibling
                     // in the same step, so the arena must still be in motion.
                     rang_while_live = Some(!app.all_settled());
