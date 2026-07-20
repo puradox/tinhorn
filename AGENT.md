@@ -197,9 +197,7 @@ and `drain_sounds` plays whatever the physics queued.
     in the `blocks` path `ui::quadrant_blit` blits the RGBA into **quadrant glyphs**
     (2×2 sub-pixels per cell, `quad_cell` fitting each to two colours — twice a
     half-block's resolution), while the `kitty` path in `graphics` transmits the
-    same readback as a real image instead. On a terminal that seams the 2×2 glyphs
-    (macOS Terminal.app — `graphics::quadrants_tile_cleanly`), the blit falls back to
-    seam-free half-blocks (`half_cell`), so `GraphicsMode::Blocks { half_block }`.
+    same readback as a real image instead.
     Realism the old CPU
     rasterizer never had: **HDR + filmic tonemapping** (TonyMcMapface),
     **4× MSAA**, **screen-space ambient occlusion**, **shadow maps** (the key
@@ -251,8 +249,7 @@ and `drain_sounds` plays whatever the physics queued.
   picks a `GraphicsMode`: `auto` env-sniffs the terminal (`kitty_capable`: kitty /
   Ghostty / WezTerm via `TERM`/`TERM_PROGRAM`/`KITTY_WINDOW_ID`, **never under
   tmux/screen**, which inherit `KITTY_WINDOW_ID` yet eat the graphics APC), else
-  `blocks` (with `half_block` set on a terminal that seams the quadrants —
-  `quadrants_tile_cleanly`); `kitty`/`blocks` force it. The per-frame payload pipeline: `pack_rgb`
+  `blocks`; `kitty`/`blocks` force it. The per-frame payload pipeline: `pack_rgb`
   strips wgpu's 256-byte row padding, drops alpha (`f=24`), and applies the shared
   `ui::vignette`; `compress` runs zlib-fast (`o=z`) and `encode_apc` does base64 →
   4096-byte APC chunks (`a=T`, a **fixed** `i=1,p=1` so a same-id retransmit is kitty's

@@ -171,13 +171,8 @@ fn run_snapshot(expr: &str, seed: Option<u64>, muted: bool, path: PathBuf) {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
     };
-    // The snapshot path always composes to a TestBackend/PNG: force half-blocks.
-    let mut app = base_app(
-        expr,
-        seed,
-        muted,
-        GraphicsMode::Blocks { half_block: false },
-    );
+    // The snapshot path always composes to a TestBackend/PNG: force blocks.
+    let mut app = base_app(expr, seed, muted, GraphicsMode::Blocks);
     app.insert_resource(Snapshot {
         path,
         frames: 0,
@@ -731,8 +726,7 @@ fn draw_fps_overlay(
     let area = frame.area();
     let short = |tag: &str| format!(" {fps:>4.0} fps · {tag} {img_w}×{img_h} ");
     let label = match mode {
-        // "quad" vs "half" makes the seam-avoiding fallback visible in the overlay.
-        GraphicsMode::Blocks { half_block } => short(if half_block { "half" } else { "quad" }),
+        GraphicsMode::Blocks => short("blocks"),
         GraphicsMode::Kitty { .. } => {
             let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 0.0 };
             let sum = stage.prep + stage.zip + stage.b64 + stage.wr;
@@ -897,7 +891,7 @@ fn save_snapshot(
         eprintln!("tinhorn: roll didn't settle in 600 frames; snapshotting anyway");
     }
 
-    // The PNG shows the arena visuals; a text dump (arena half-blocks blanked so
+    // The PNG shows the arena visuals; a text dump (arena quadrant glyphs blanked so
     // the burned numbers and chrome stand out) makes the whole UI readable in a
     // non-interactive shell.
     print_frame_text(terminal.backend().buffer());
@@ -1057,14 +1051,17 @@ mod tests {
     fn fps_overlay_falls_back_and_skips() {
         // Blocks short form fits a modest width…
         let mut wide = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        let blocks = GraphicsMode::Blocks { half_block: false };
-        wide.draw(|f| draw_fps_overlay(f, 60.0, StageMs::default(), blocks, 240, 180))
-            .unwrap();
+        wide.draw(|f| {
+            draw_fps_overlay(f, 60.0, StageMs::default(), GraphicsMode::Blocks, 240, 180)
+        })
+        .unwrap();
         assert!(top_row(&wide).contains("60 fps"), "{:?}", top_row(&wide));
         // …but a tiny frame is skipped, not panicking or corrupting the row.
         let mut tiny = Terminal::new(TestBackend::new(10, 6)).unwrap();
-        tiny.draw(|f| draw_fps_overlay(f, 30.0, StageMs::default(), blocks, 200, 160))
-            .unwrap();
+        tiny.draw(|f| {
+            draw_fps_overlay(f, 30.0, StageMs::default(), GraphicsMode::Blocks, 200, 160)
+        })
+        .unwrap();
         assert!(
             !top_row(&tiny).contains("fps"),
             "should skip when too narrow"
