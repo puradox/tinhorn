@@ -12,7 +12,7 @@ two modes from a single binary:
 
 - **Interactive TUI** (default): the bouncing-dice animation. The arena is a
   **headless Bevy** scene rendered on the GPU, read back to the CPU, and blitted
-  into a ratatui frame as half-blocks; ratatui paints the chrome (result panel,
+  into a ratatui frame as quadrant block glyphs; ratatui paints the chrome (result panel,
   input line, help, panes) around it.
 - **One-shot CLI**: given an expression plus an output flag — or whenever stdout
   isn't a terminal — it skips the TUI, evaluates once, prints, and exits, so it
@@ -33,7 +33,7 @@ cargo test <name>              # run a single test by substring, e.g. `cargo tes
 cargo test -p tinhorn-core     # the ~64 GPU-free sim/ceremony tests, no Bevy
 
 # Validate the Bevy arena without a TTY: render it headless to a PNG + a readable
-# text dump of the composed frame (the arena half-blocks blanked so the burned
+# text dump of the composed frame (the arena quadrant glyphs blanked so the burned
 # numbers and chrome stand out). wgpu runs headless, so this works in CI / ssh.
 TINHORN_BEVY_SNAPSHOT=/tmp/arena.png cargo run -- 4d6!kh3
 TINHORN_SNAP_COLS=120 TINHORN_SNAP_ROWS=44 TINHORN_BEVY_SNAPSHOT=/tmp/a.png cargo run -- d20
@@ -182,7 +182,7 @@ and `drain_sounds` plays whatever the physics queued.
     `view_math::live_camera` (so the overlays stay in register) and flinches the
     key light on hard impacts / a crit flare; `draw_ui` composes the frame via
     `ui::render_bevy_mode` (the resolved `Graphics(mode)` resource selects
-    half-blocks vs kitty) and reports the arena panel size back — and in **kitty
+    blocks vs kitty) and reports the arena panel size back — and in **kitty
     mode**, *strictly after* the draw (ratatui owns stdout during it), emits the
     arena image as kitty-graphics APCs (`graphics::emit`) over the panel origin,
     gated by a `KittyState` that deletes/re-places while a pane covers the arena;
@@ -194,8 +194,10 @@ and `drain_sounds` plays whatever the physics queued.
   - Rendering: a headless `Camera3d` draws into an offscreen render-target
     `Image`, which is **read back to the CPU each frame via Bevy 0.19's built-in
     `bevy_render::gpu_readback`** (`Readback` + a `ReadbackComplete` observer);
-    in the `blocks` path `ui::blit_bevy_arena` blits the RGBA into half-blocks (the
-    `kitty` path in `graphics` transmits the same readback as a real image instead).
+    in the `blocks` path `ui::quadrant_blit` blits the RGBA into **quadrant glyphs**
+    (2×2 sub-pixels per cell, `quad_cell` fitting each to two colours — twice a
+    half-block's resolution), while the `kitty` path in `graphics` transmits the
+    same readback as a real image instead.
     Realism the old CPU
     rasterizer never had: **HDR + filmic tonemapping** (TonyMcMapface),
     **4× MSAA**, **screen-space ambient occlusion**, **shadow maps** (the key

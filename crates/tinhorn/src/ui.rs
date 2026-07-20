@@ -1012,9 +1012,10 @@ pub struct KittyPanel {
 /// layout (arena, result panel, input line, help bar) with all of tinhorn's
 /// chrome. The arena panel is the only branch between modes:
 ///
-/// - **Blocks** — the CPU-read Bevy render blitted as half-blocks, supersampled
-///   `ARENA_SS×` and box-downsampled; the die numbers composite straight into the
-///   buffer. `pixels` is the row-padded RGBA8 readback of an `img_w`×`img_h` image.
+/// - **Blocks** — the CPU-read Bevy render blitted as **quadrant** glyphs (2×2
+///   sub-pixels per cell, twice a half-block's resolution), supersampled `QUAD_SS×`
+///   and box-downsampled; the die numbers composite on top. `pixels` is the
+///   row-padded RGBA8 readback of an `img_w`×`img_h` image.
 /// - **Kitty** — the arena cells are cleared to default-bg (the scene places a real
 ///   image behind them at native `scale`× — no SSAA, 4× MSAA already smooths edges)
 ///   and the die numbers are returned as burns for the scene to rasterise. `pixels`
@@ -1061,13 +1062,14 @@ pub fn render_bevy_mode(
         // single source of the framing.
         match mode {
             GraphicsMode::Blocks => {
-                // Supersample (ARENA_SS× the half-block grid); the blit
-                // box-downsamples it, so dice and wall edges come out smooth.
+                // Supersample (QUAD_SS× the quadrant sub-pixel grid); the blit
+                // box-downsamples it into 2×2-per-cell quadrant glyphs — twice the
+                // resolution of half-blocks, and the same "cols × 2·rows" aspect.
                 view = (
-                    inner.width * ARENA_SS as u16,
-                    inner.height * 2 * ARENA_SS as u16,
+                    inner.width * QUAD_SS as u16,
+                    inner.height * 2 * QUAD_SS as u16,
                 );
-                blit_bevy_arena(frame.buffer_mut(), inner, pixels, img_w, img_h);
+                quadrant_blit(frame.buffer_mut(), inner, pixels, img_w, img_h);
             }
             GraphicsMode::Kitty { scale } => {
                 let s = kitty_scale(scale, inner.width);
@@ -1105,9 +1107,9 @@ pub fn render_bevy_mode(
     ArenaReport { view, kitty }
 }
 
-/// Compose the interactive frame in half-block mode (the universal fallback). Kept
-/// at its exact original signature so the ≈30 chrome tests and the three `#[ignore]`
-/// GPU tests compile untouched; returns just the render-target size.
+/// Compose the interactive frame in blocks mode (the universal quadrant-glyph
+/// fallback). Kept at its exact original signature so the ≈30 chrome tests and the
+/// three `#[ignore]` GPU tests compile untouched; returns just the render size.
 pub fn render_bevy(
     frame: &mut Frame,
     app: &mut App,
@@ -1138,14 +1140,78 @@ fn clear_arena(buf: &mut ratatui::buffer::Buffer, inner: Rect) {
     }
 }
 
-/// Supersample factor: the Bevy arena is rendered at this multiple of the
-/// half-block grid and box-downsampled in the blit, for cheap anti-aliasing.
-const ARENA_SS: u32 = 2;
+/// Supersample factor: the Bevy arena is rendered at this multiple of the arena's
+/// **quadrant** sub-pixel grid (`cols*2 × rows*2`) and box-downsampled in the blit,
+/// for cheap anti-aliasing. 4 gives a 2×4 render block per sub-pixel — square-ish,
+/// since a quadrant sub-pixel is ~1:2 (tall).
+const QUAD_SS: u32 = 4;
+
+/// The sixteen Unicode quadrant block glyphs, indexed by a 4-bit sub-pixel mask
+/// (bit 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right) of which
+/// sub-pixels are the foreground colour. These carve each cell into a 2×2 grid —
+/// **double the resolution of a half-block** — and live in Unicode's block-elements
+/// range, so every monospace font has them (unlike the newer sextants).
+const QUAD_GLYPHS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛', '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// The 4-bit sub-pixel mask of a quadrant glyph (see [`QUAD_GLYPHS`]), or `None` if
+/// `ch` isn't one — lets the headless snapshot re-expand each arena cell back into
+/// its 2×2 pixels. A plain space maps to `0` (all background), so blank cells count
+/// as arena glyphs and get blanked in the text dump.
+pub(crate) fn quad_pattern(ch: char) -> Option<u8> {
+    QUAD_GLYPHS.iter().position(|&g| g == ch).map(|i| i as u8)
+}
+
+/// Fit a cell's four sub-pixels (`[TL, TR, BL, BR]`) to a 2-colour quadrant glyph:
+/// split them on the colour channel with the widest spread, average each side into
+/// `fg`/`bg`, and pick the glyph whose lit quadrants are the `fg` side. This is how
+/// `chafa`/`notcurses` pack more than two colours into a cell — 2× a half-block's
+/// resolution, on glyphs every monospace font carries.
+fn quad_cell(sub: [(u8, u8, u8); 4]) -> (char, Color, Color) {
+    let chan = |c: (u8, u8, u8), k: usize| [c.0, c.1, c.2][k] as i32;
+    // Split on the channel with the widest spread across the four sub-pixels.
+    let (mut axis, mut spread, mut thresh) = (0usize, -1i32, 0i32);
+    for k in 0..3 {
+        let (mut lo, mut hi) = (255i32, 0i32);
+        for &c in &sub {
+            lo = lo.min(chan(c, k));
+            hi = hi.max(chan(c, k));
+        }
+        if hi - lo > spread {
+            (spread, axis, thresh) = (hi - lo, k, (lo + hi) / 2);
+        }
+    }
+    let (mut mask, mut f, mut fg_n, mut b, mut bg_n) = (0u8, [0u32; 3], 0u32, [0u32; 3], 0u32);
+    for (i, &c) in sub.iter().enumerate() {
+        if chan(c, axis) >= thresh {
+            mask |= 1 << i;
+            (f[0], f[1], f[2], fg_n) = (
+                f[0] + c.0 as u32,
+                f[1] + c.1 as u32,
+                f[2] + c.2 as u32,
+                fg_n + 1,
+            );
+        } else {
+            (b[0], b[1], b[2], bg_n) = (
+                b[0] + c.0 as u32,
+                b[1] + c.1 as u32,
+                b[2] + c.2 as u32,
+                bg_n + 1,
+            );
+        }
+    }
+    let avg =
+        |s: [u32; 3], n: u32| Color::Rgb((s[0] / n) as u8, (s[1] / n) as u8, (s[2] / n) as u8);
+    let fg = if fg_n > 0 { avg(f, fg_n) } else { Color::Reset };
+    let bg = if bg_n > 0 { avg(b, bg_n) } else { fg };
+    (QUAD_GLYPHS[mask as usize], fg, bg)
+}
 
 /// The warm radial vignette applied to the arena: darkens toward the corners and
 /// warms the tint a touch (a whisper more red, a whisper less blue). Returns the
 /// per-channel multipliers `(fr, fg, fb)` for a normalised offset-from-centre
-/// `(nx, ny)` in `[-0.5, 0.5]`. Shared by the half-block blit and the kitty pixel
+/// `(nx, ny)` in `[-0.5, 0.5]`. Shared by the quadrant blit and the kitty pixel
 /// pack (`graphics::pack_rgb`) so both paths grade the picture identically.
 pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
     let d2 = ((nx * nx + ny * ny) / 0.5).min(1.0);
@@ -1153,12 +1219,12 @@ pub(crate) fn vignette(nx: f32, ny: f32) -> (f32, f32, f32) {
     (f * 1.04, f, f * 0.95)
 }
 
-/// Blit a row-padded RGBA8 Bevy render into `inner` as half-block cells (fg = upper
-/// pixel, bg = lower). The render is supersampled (`img_w`/`img_h` are `ARENA_SS×`
-/// the grid), so each output subpixel box-averages an `ss`×`ss` block, smoothing the
-/// boxy edges; then a warm-graded radial vignette pulls the eye in. A no-op until
-/// the first readback of the right size lands.
-fn blit_bevy_arena(
+/// Blit a row-padded RGBA8 Bevy render into `inner` as **quadrant** cells: each
+/// cell is a 2×2 grid of sub-pixels (`cols*2 × rows*2` overall — double a
+/// half-block's resolution), box-downsampled from the `QUAD_SS×` supersampled
+/// render, warm-graded by the radial vignette, and fitted to a 2-colour quadrant
+/// glyph ([`quad_cell`]). A no-op until the first readback of the right size lands.
+fn quadrant_blit(
     buf: &mut ratatui::buffer::Buffer,
     inner: Rect,
     pixels: &[u8],
@@ -1169,45 +1235,74 @@ fn blit_bevy_arena(
     if img_w == 0 || img_h == 0 || pixels.len() < stride * img_h as usize {
         return;
     }
-    // How many render pixels per output subpixel, in each axis (usually ARENA_SS).
-    let ss = (img_w / (inner.width as u32).max(1)).max(1);
-    // Box-average the `ss`×`ss` render block for output subpixel cell `(cx, cy)`.
-    let block = |cx: u32, cy: u32| -> (u8, u8, u8) {
-        let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-        for dy in 0..ss {
-            for dx in 0..ss {
-                let px = (cx * ss + dx).min(img_w - 1) as usize;
-                let py = (cy * ss + dy).min(img_h - 1) as usize;
-                let i = py * stride + px * 4;
-                r += pixels[i] as u32;
-                g += pixels[i + 1] as u32;
-                b += pixels[i + 2] as u32;
-            }
+    let (w, h) = (inner.width as usize, inner.height as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    // Render pixels per sub-pixel in each axis: the sub-pixel grid is 2× the cell
+    // grid on both axes, so `ssx`/`ssy` are `QUAD_SS/2` and `QUAD_SS` respectively.
+    let (subw, subh) = (inner.width as u32 * 2, inner.height as u32 * 2);
+    let ssx = (img_w / subw.max(1)).max(1);
+    let ssy = (img_h / subh.max(1)).max(1);
+    let (fw, fh) = (subw as f32, subh as f32);
+    // Fit every cell to its `(glyph, fg, bg)` **in parallel by row band** — the box-
+    // average over the supersampled render plus the 2-colour fit is the per-frame cost
+    // (the buffer write below is trivial), and it scales with the arena area, so at a
+    // full-screen size the serial version bottlenecks the blocks path. Rows are
+    // independent and the output chunks disjoint, so the result is byte-identical to a
+    // serial pass with no synchronization — the same split `graphics::pack_rgb` uses.
+    let mut out = vec![(' ', Color::Reset, Color::Reset); w * h];
+    let threads = crate::graphics::core_count().clamp(1, h);
+    let band = h.div_ceil(threads);
+    std::thread::scope(|s| {
+        for (t, chunk) in out.chunks_mut(band * w).enumerate() {
+            let row0 = t * band;
+            s.spawn(move || {
+                // Box-average the `ssx`×`ssy` render block for sub-pixel `(sx, sy)`, warm-graded.
+                let subpx = |sx: u32, sy: u32| -> (u8, u8, u8) {
+                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                    for dy in 0..ssy {
+                        for dx in 0..ssx {
+                            let px = (sx * ssx + dx).min(img_w - 1) as usize;
+                            let py = (sy * ssy + dy).min(img_h - 1) as usize;
+                            let i = py * stride + px * 4;
+                            r += pixels[i] as u32;
+                            g += pixels[i + 1] as u32;
+                            b += pixels[i + 2] as u32;
+                        }
+                    }
+                    let n = (ssx * ssy).max(1);
+                    let (fr, fg, fb) =
+                        vignette((sx as f32 + 0.5) / fw - 0.5, (sy as f32 + 0.5) / fh - 0.5);
+                    (
+                        ((r / n) as f32 * fr).min(255.0) as u8,
+                        ((g / n) as f32 * fg).min(255.0) as u8,
+                        ((b / n) as f32 * fb).min(255.0) as u8,
+                    )
+                };
+                for (r_local, slot_row) in chunk.chunks_exact_mut(w).enumerate() {
+                    let sy = (row0 + r_local) as u32 * 2;
+                    for (col, slot) in slot_row.iter_mut().enumerate() {
+                        let sx = col as u32 * 2;
+                        *slot = quad_cell([
+                            subpx(sx, sy),         // TL
+                            subpx(sx + 1, sy),     // TR
+                            subpx(sx, sy + 1),     // BL
+                            subpx(sx + 1, sy + 1), // BR
+                        ]);
+                    }
+                }
+            });
         }
-        let n = (ss * ss).max(1);
-        ((r / n) as u8, (g / n) as u8, (b / n) as u8)
-    };
-    let (fw, fh) = (inner.width as f32, inner.height as f32 * 2.0);
-    let graded = |c: (u8, u8, u8), nx: f32, ny: f32| -> Color {
-        let (fr, fg, fb) = vignette(nx, ny);
-        Color::Rgb(
-            (c.0 as f32 * fr).min(255.0) as u8,
-            (c.1 as f32 * fg).min(255.0) as u8,
-            (c.2 as f32 * fb) as u8,
-        )
-    };
-    for row in 0..inner.height {
-        for col in 0..inner.width {
-            let up = block(col as u32, row as u32 * 2);
-            let lo = block(col as u32, row as u32 * 2 + 1);
-            let nx = (col as f32 + 0.5) / fw - 0.5;
-            let cell = &mut buf[(inner.x + col, inner.y + row)];
-            cell.set_char('▀');
-            cell.set_style(
-                Style::default()
-                    .fg(graded(up, nx, (row as f32 * 2.0 + 0.5) / fh - 0.5))
-                    .bg(graded(lo, nx, (row as f32 * 2.0 + 1.5) / fh - 0.5)),
-            );
+    });
+
+    // Trivial serial write of the fitted cells into the ratatui buffer.
+    for row in 0..h {
+        for col in 0..w {
+            let (ch, fg, bg) = out[row * w + col];
+            let cell = &mut buf[(inner.x + col as u16, inner.y + row as u16)];
+            cell.set_char(ch);
+            cell.set_style(Style::default().fg(fg).bg(bg));
         }
     }
 }
@@ -1844,6 +1939,36 @@ mod tests {
     }
 
     #[test]
+    fn quad_pattern_round_trips_the_glyph_table() {
+        // Every quadrant glyph maps back to its 4-bit mask (the snapshot relies on
+        // this to re-expand arena cells to pixels); non-block chars map to None.
+        for (i, &g) in QUAD_GLYPHS.iter().enumerate() {
+            assert_eq!(quad_pattern(g), Some(i as u8), "glyph {g:?}");
+        }
+        assert_eq!(quad_pattern('X'), None);
+        assert_eq!(quad_pattern('│'), None);
+    }
+
+    #[test]
+    fn quad_cell_fits_two_colours_and_the_matching_glyph() {
+        let w = (240, 240, 240);
+        let k = (10, 10, 10);
+        // Top row light, bottom row dark → upper-half block, fg=light, bg=dark.
+        let (ch, fg, bg) = quad_cell([w, w, k, k]);
+        assert_eq!(
+            (ch, fg, bg),
+            ('▀', Color::Rgb(240, 240, 240), Color::Rgb(10, 10, 10))
+        );
+        // A uniform cell has no second colour to split on → a full block.
+        let (ch, fg, _) = quad_cell([w, w, w, w]);
+        assert_eq!((ch, fg), ('█', Color::Rgb(240, 240, 240)));
+        // One bright sub-pixel (top-left) → the upper-left quadrant.
+        assert_eq!(quad_cell([w, k, k, k]).0, '▘');
+        // Bright bottom-right only → the lower-right quadrant.
+        assert_eq!(quad_cell([k, k, k, w]).0, '▗');
+    }
+
+    #[test]
     fn glyph_raster_matches_the_font() {
         // At scale 1, GlyphRaster marks Ink exactly where DIGIT_FONT lights a bit,
         // and never Ink where it doesn't (a hole is outline or clear, not a stroke).
@@ -1990,8 +2115,11 @@ mod tests {
         let buf = terminal.backend().buffer();
         let arena_has_block = (panel.inner.left()..panel.inner.right())
             .flat_map(|x| (panel.inner.top()..panel.inner.bottom()).map(move |y| (x, y)))
-            .any(|(x, y)| buf[(x, y)].symbol() == "▀");
-        assert!(!arena_has_block, "kitty mode must not blit half-blocks");
+            .any(|(x, y)| {
+                let ch = buf[(x, y)].symbol().chars().next().unwrap_or(' ');
+                quad_pattern(ch).is_some_and(|mask| mask > 0) // any lit quadrant glyph
+            });
+        assert!(!arena_has_block, "kitty mode must not blit block glyphs");
         assert!(
             flatten(&terminal).contains("result"),
             "the chrome still renders around the image"

@@ -1,9 +1,9 @@
 //! The kitty graphics protocol arena — the pixel-perfect output path.
 //!
 //! In a terminal that speaks the kitty graphics protocol (kitty, Ghostty), the
-//! same GPU frame the half-block blit downsamples is instead handed to the
+//! same GPU frame the quadrant blit downsamples is instead handed to the
 //! terminal as a *real image* over the arena panel, while ratatui paints the
-//! chrome around it. Everywhere else the `▀` half-block blit in [`crate::ui`]
+//! chrome around it. Everywhere else the quadrant-glyph blit in [`crate::ui`]
 //! stays the fallback. This module owns the mode decision and the payload
 //! pipeline; the compose lives in [`crate::ui`], the emission in [`crate::scene`].
 //!
@@ -18,9 +18,9 @@ use base64::prelude::{BASE64_STANDARD, Engine};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
-/// The chosen output path for the arena. `Blocks` is the universal `▀` half-block
-/// blit; `Kitty` places the GPU frame as a real image, at `scale` render pixels
-/// per half-block sub-pixel (so the image is `cols*scale` × `rows*2*scale`).
+/// The chosen output path for the arena. `Blocks` is the universal quadrant-glyph
+/// blit (2×2 sub-pixels per cell); `Kitty` places the GPU frame as a real image, at
+/// `scale` render pixels per sub-pixel (so the image is `cols*scale` × `rows*2*scale`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphicsMode {
     Blocks,
@@ -46,10 +46,10 @@ pub const MAX_IMG_W: u32 = 1600;
 /// bytes (the protocol's documented 4096-byte limit).
 const CHUNK: usize = 4096;
 
-/// The machine's core count, cached: [`pack_rgb`] splits its row-band work across
-/// it every frame, but it can't change during a run, so `available_parallelism`
-/// runs once, not on the hot path.
-fn core_count() -> usize {
+/// The machine's core count, cached: the per-frame readback passes ([`pack_rgb`]
+/// and `ui::quadrant_blit`) split their row-band work across it, but it can't change
+/// during a run, so `available_parallelism` runs once, not on the hot path.
+pub(crate) fn core_count() -> usize {
     use std::sync::OnceLock;
     static CORES: OnceLock<usize> = OnceLock::new();
     *CORES.get_or_init(|| {
@@ -61,8 +61,8 @@ fn core_count() -> usize {
 
 /// The byte stride of one row in a wgpu render readback: `img_w` RGBA pixels
 /// padded up to wgpu's 256-byte row alignment. The single source of the readback
-/// layout contract, shared by the kitty pack ([`pack_rgb`]) and the half-block
-/// blit (`ui::blit_bevy_arena`), which read the same buffer.
+/// layout contract, shared by the kitty pack ([`pack_rgb`]) and the quadrant
+/// blit (`ui::quadrant_blit`), which read the same buffer.
 pub(crate) fn readback_stride(img_w: u32) -> usize {
     (img_w as usize * 4).div_ceil(256) * 256
 }
@@ -137,7 +137,7 @@ fn detect_scale() -> u32 {
 /// Strip a wgpu render readback into tightly-packed, graded RGB ready to transmit:
 /// drop the 256-byte row padding wgpu adds to each row, drop the alpha channel
 /// (kitty's `f=24`), and apply the same warm radial [`vignette`](crate::ui::vignette)
-/// the half-block blit uses, so the two paths grade the picture identically.
+/// the quadrant blit uses, so the two paths grade the picture identically.
 /// `None` when the buffer is empty or shorter than a full frame (a stale readback
 /// mid-resize, or before the first frame lands).
 ///
