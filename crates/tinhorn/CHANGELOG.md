@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/puradox/tinhorn/compare/v0.2.1...v0.2.2) - 2026-07-19
+
+### Added
+
+- *(parse)* reroll modifiers (r/ro) with chained compare points ([#25](https://github.com/puradox/tinhorn/pull/25))
+
+### Other
+
+- trim verbose comments to their essential point ([#29](https://github.com/puradox/tinhorn/pull/29))
+
 ## [0.2.1](https://github.com/puradox/tinhorn/compare/v0.2.0...v0.2.1) - 2026-07-19
 
 ### Added
